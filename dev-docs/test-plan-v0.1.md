@@ -1,6 +1,6 @@
 # Arachne 集成测试方案（test-plan v0.1）
 
-> 上游文档：`propsol-v0.2.6.md`（§9 为其策略大纲，本文是其**可执行展开**；两处冲突时以本文为准并回改上游）。
+> 上游文档：`propsol-v0.2.7.md`（§9 为其策略大纲，本文是其**可执行展开**；两处冲突时以本文为准并回改上游）。
 > 工具调研基线：2026-09，所引版本已核验（turmoil 0.7.2、loom 0.7.2、shuttle 0.9.3、cargo-fuzz 0.13.2、libfuzzer-sys 0.4.13、arbitrary 1.4.2、proptest 1.11.0、stateright 0.31.0、`raft` crate 0.7.0、madsim 0.2.34）。
 > 设计前提沿用上游：共识内核复用 `raft` crate（tikv/raft-rs）、tonic 传输、WAL+快照存储、全内存状态机+会话表、§2 一致性语义、§4.2 不变量 I1–I4、§5.5.3 恢复算法。
 > 修订记录：v0.1.1 新增决策记录表（D-T1/D-T2/D-L4/D-S1 评审锁定）与 **§3.2 工件/工作区布局、§3.3 进程级 harness（D-ART）**——补齐 L3/L4 所预设的可执行载体；v0.1.2 锁定 D-ART 四项子决策（crate 名、默认 feature、TOML 配置、test-observability 特性门禁）；**v0.1.3 D-ART-rev1：抽出无依赖叶 crate `arachne-seam`（接缝 trait + 核心类型）**——`arachne-transport-tonic` 改依赖 `arachne-seam`（不再 `→ arachne`）以消除 `transport-tonic → arachne` 与 D-ART-feature `arachne → transport-tonic` 构成的 **cargo 包循环**；`arachne` 重导出接缝保持嵌入者公共 API 不变；并澄清 sim/testsupport 精简构建（对 `arachne` 一律 `default-features = false`，testsupport 永不含 tonic，sim 的 tonic 仅 L2 落地时显式启用）。
@@ -283,7 +283,7 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 
 ## 11. 覆盖矩阵与缺口
 
-**设计保证 → 测试追溯**（§ 编号指 propsol-v0.2.6，节号与 v0.2.2 相同）：
+**设计保证 → 测试追溯**（§ 编号指 propsol-v0.2.7，节号与 v0.2.2 相同）：
 
 | 设计保证 | 覆盖测试 |
 |---|---|
@@ -340,4 +340,4 @@ S2–S5 为待核验 API 事实：M0 第一周以最小 spike 钉死，每项附
 
 ---
 
-*test-plan v0.1 完（v0.1.1 新增决策记录表 D-T1/T2/L4/S1 锁定 + §3.2 工件布局、§3.3 进程级 harness（D-ART）；v0.1.2 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、test-observability 门禁；**v0.1.3 D-ART-rev1：抽出无依赖叶 crate `arachne-seam` 消除包循环**——`arachne-transport-tonic → arachne-seam` 而非 `→ arachne`、`arachne` 重导出接缝保持公共 API 不变、sim/testsupport 对 `arachne` 一律 `default-features = false`）。上游 `propsol-v0.2.6.md` §9 已改为本方案的摘要并指向本文；工具选型修订（madsim→turmoil、porcupine→自建检查器+stateright 参照）记录于上游变更日志 E 条，评审锁定的决策（D-T1/D-T2/D-L4/D-S1/D-ART 及其四项子决策）记录于上游变更日志 F/G/H 条与本文顶部决策记录表。*
+*test-plan v0.1 完（v0.1.1 新增决策记录表 D-T1/T2/L4/S1 锁定 + §3.2 工件布局、§3.3 进程级 harness（D-ART）；v0.1.2 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、test-observability 门禁；**v0.1.3 D-ART-rev1：抽出无依赖叶 crate `arachne-seam` 消除包循环**——`arachne-transport-tonic → arachne-seam` 而非 `→ arachne`、`arachne` 重导出接缝保持公共 API 不变、sim/testsupport 对 `arachne` 一律 `default-features = false`）。上游 `propsol-v0.2.7.md` §9 已改为本方案的摘要并指向本文；工具选型修订（madsim→turmoil、porcupine→自建检查器+stateright 参照）记录于上游变更日志 E 条，评审锁定的决策（D-T1/D-T2/D-L4/D-S1/D-ART 及其四项子决策）记录于上游变更日志 F/G/H 条与本文顶部决策记录表。*

@@ -1,11 +1,11 @@
-# Arachne 设计文档（v0.2.6 RFC）
+# Arachne 设计文档（v0.2.7 RFC）
 
 > 上游文档：`propsol.md`（v0.1）。本文件在其基础上做需求/设计精化，**不包含实现代码**。
 > 设计基线不变：复用成熟共识内核（`tikv/raft-rs`，备选 `openraft`）、CP 语义、不自研共识、失去多数派不自动接管、不基于 ACK 超时自动剔除节点。
 
 ---
 
-## 变更日志（v0.1 → v0.2.6）
+## 变更日志（v0.1 → v0.2.7）
 
 ### A. 三项待决策项已决议（见 §11）
 
@@ -102,6 +102,19 @@
 | 工件布局 | 五工件 | **六工件**：新增叶 crate `arachne-seam`（接缝 trait + 核心类型，无依赖） | 原 §3.2 的 `transport-tonic → arachne` 与 D-ART-feature 的 `arachne → transport-tonic` 构成 cargo **包循环**（实测硬拒绝）；叶 crate 使"接缝归核心、实现归传输 crate"的原意可落地 |
 | 传输 crate 依赖 | `arachne-transport-tonic → arachne` | `arachne-transport-tonic → arachne-seam` | 断环；公共 API 经 `arachne` 重导出保持不变 |
 | sim/testsupport 构建 | 默认 feature 隐含拉 tonic | `default-features = false`；testsupport 永不含 tonic，sim 的 tonic 由 L2 harness 显式启用 | 落实 D-ART ④"sim 构建不编译 tonic"，消除文档内部矛盾 |
+
+### J. v0.2.7：§5.5.3 恢复算法安全收紧（E-rev）
+
+P2 崩溃安全门禁评审发现 §5.5.3 的恢复算法**按原文实现不安全**：它靠嗅探记录类型字节分类坏记录，但该字节在 CRC 保护体内、损坏时不可信——类型字节翻成 `0x01` 的损坏 HardState 会被误读为 Entry 而自动截断，丢 `term`/`vote`（同 term 双投票破 INV7、commit 回退破 INV12）；结构性撕裂分支绕过 commit-window 检查；新段未目录 fsync（I2 漏洞）；重开每次重启新建命名错乱的段。
+
+| 修订点 | v0.2.6 原文 | v0.2.7 修订 | 理由 |
+|---|---|---|---|
+| 坏记录分类 | 嗅探类型字节判定 HardState/Entry | **不再嗅探**：CRC/解码失败且记录在磁盘上完整存在 → **无条件 fail-start** | 类型字节在 CRC 覆盖范围内，损坏时不可信；误判可丢 term/vote |
+| 可截断范围 | 首个坏记录且 i>commit+1 即自动截断 | **仅最后段的结构性撕裂**可自动截断（头不足 8 字节 / `record_end>file_len` / `len` 非法）；且撕裂仍过 commit-window 检查（`estimated_index ≤ commit+1` → fail-start） | 撕裂只可能是未 fsync 的尾部；其余损坏是真损坏 |
+| 非最后段坏记录 | 未明确 | **一律 fail-start** | 撕裂只可能出现在最后写入的段 |
+| 恢复后校验 | 无 | 增加 **`hard_state.commit ≤ last_index` 断言**，否则 fail-start | 关闭"损坏 len 伪装撕裂"导致已提交数据静默丢失 |
+| 新段持久化 | 未提 | 新建段文件后 **fsync 数据目录** | 目录项不持久化会使已 fsync 的条目在掉电后消失（I2） |
+| 段命名/滚动 | 段名=段首 log index；未明确重开行为 | 滚动在超 `segment_bytes` 时新建段；**重开续写最高编号既有段**，仅无段时建 `wal-1.log` | 避免每次重启新建空段、破坏"段名=首 index"不变式 |
 
 ---
 
@@ -351,8 +364,9 @@ Lease Read 留 v2，显式记录其前提：配置化的时钟偏移上限 + 安
 
 #### 5.5.1 WAL 格式
 
-- 分段文件：`wal-%020d.log`（段首 log index 命名），默认 128 MB 滚动。
+- 分段文件：`wal-%020d.log`（**段名 = 该段首条记录的 log index**），默认 `segment_bytes`（128 MB）超限时滚动新建段；**重开时续写最高编号的既有段**（仅当无任何段时才建 `wal-1.log`），避免每次重启新建空段、破坏"段名=首 index"不变式。
 - 记录布局：`[u32 len][u32 crc32c][u8 type][payload]`；`type ∈ {Entry, HardState, Meta}`。
+- **新建段文件后须 fsync 数据目录**（持久化目录项），否则已 fsync 的条目在掉电后可能随目录项一并丢失（I2 漏洞）。
 - `META` 文件（data_dir 下，独立于段）：`cluster_id, node_id, format_version, created_at`；写入 = 写临时文件 → fsync → rename → **fsync 目录**。
 - 记录类型集合在 **protocol major 版本内冻结**（§5.6），保证同 major 内可回滚。
 
@@ -374,21 +388,24 @@ Lease Read 留 v2，显式记录其前提：配置化的时钟偏移上限 + 安
 2. 读 META：cluster_id/node_id/format_version 与配置比对，不一致 → fail-start
 3. 加载最新合法快照 S（CRC 校验）：
    - S 损坏 → 回退上一份快照；无更早快照 → 若 WAL 可从更早完整回放则继续，否则 fail-start
-4. 顺序回放 WAL 段：逐记录校验 CRC，取最后一条合法 HardState 得 H = {term, vote, commit}
-   - HardState 记录本身损坏 → fail-start（term/vote 不可重建，绝不允许臆造）
-   - 段缺失/序号断档 → fail-start
-   - 在 log index i 处遇第一条坏记录：
-       若 i ≤ H.commit + 1（可能覆盖已提交区间）→ fail-start(Unrecoverable)，
-           运维可用 --repair=truncate 显式截断（安全前提：多数派在别处存活，本机以 Learner 重加追赶），
-           或走 force-recovery（§6）
-       若 i > H.commit + 1 → 自动截断到最后一条合法记录，计 metric wal_truncated_records_total，WARN
-       （截断只丢弃未确认提交的尾部条目，Raft 会从 leader 重取，安全）
+4. 顺序回放 WAL 段：逐记录校验 CRC/解码，取最后一条合法 HardState 得 H = {term, vote, commit}
+    **（v0.2.7 收紧）坏记录一律不得靠类型字节分类**——类型字节在 CRC 保护体内，损坏时不可信：
+    - 记录在磁盘上**完整存在**但 CRC/解码失败（真损坏，含损坏的 HardState）→ **无条件 fail-start(Unrecoverable)**，
+        运维可用 --repair=truncate 显式截断（安全前提：多数派在别处存活，本机以 Learner 重加追赶），或走 force-recovery（§6）
+    - 段缺失/序号断档 → fail-start
+    - **仅最后一段的结构性撕裂**（头不足 8 字节 / `record_end > file_len` / `len` 非法，即未 fsync 的尾部截断）可自动截断，
+        且撕裂仍过 commit-window 检查：`estimated_index ≤ H.commit + 1` → fail-start（可能触及已提交区间）；
+        否则截断到最后一条合法记录，计 metric wal_truncated_records_total，WARN（只丢弃未 fsync 的未提交尾部，Raft 会从 leader 重取，安全）
+    - **非最后一段**出现坏记录 → 一律 fail-start（撕裂只可能出现在最后写入的段）
+    **恢复后校验**：断言 **`H.commit ≤ last_index`**（last_index = 回放得到的最后合法条目 index），否则 fail-start——关闭"损坏 len 伪装成撕裂"导致已提交数据静默丢失
 5. 从 S.index+1 起重建内存日志缓存，校验连续性
 6. 以 {H, ConfState(来自快照/日志中的 ConfChange)} 初始化 raft-rs
 7. 重放条目至状态机（apply 幂等：跳过 ≤ applied 的条目）
 ```
 
 > **（v0.2 修正）** v0.1 的"损坏则截断"无条件表述在此收紧：**任何可能触及已提交区间的损坏一律 fail-start**，宁可拒绝服务也不静默丢已提交数据——这是 CP 承诺的一部分。
+
+> **（v0.2.7 收紧，E-rev）** 本次收紧仍落在 INV6 的两个象限内——"合法前缀截断 或 fail-start"：唯一允许自动截断的是最后段的结构性撕裂（未 fsync 的尾部），其余一律 fail-start；`--repair=truncate` 仍是运维显式截断的逃生口。
 
 #### 5.5.4 快照与保留
 
@@ -651,8 +668,8 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 | Q6 | `wal_trailing_keep` 是否与 `snapshot_threshold` 解耦 | 绑定同值简化运维，出现慢 follower 快照风暴证据再解耦 | §5.5.4、§7 | M2 追赶测试 |
 | Q7 | 提案队列按字节还是按条数计 | 按字节（64MB），对大值更稳 | §4.1、§7 | M1 压测 |
 
-**截至 v0.2.6 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
+**截至 v0.2.7 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
 
 ---
 
-*v0.2.6 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；**v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.7 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*

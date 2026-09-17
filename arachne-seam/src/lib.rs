@@ -8,6 +8,9 @@
 //! * [`seam`] — the injectable seam traits (`Clock`, `Rng`, `Transport`,
 //!   `TransportRx`, `TransportFactory`, `StateMachine`) that isolate all
 //!   environment interaction behind swappable interfaces.
+//! * [`storage`] — the storage value types (`LogEntry`, `HardState`,
+//!   `ConfState`, `Snapshot`, …) and the [`Storage`](storage::Storage) seam
+//!   trait for durable log/state.
 //!
 //! Every other crate (the `arachne` core, `arachne-transport-tonic`,
 //! `arachne-testsupport`, …) depends on **this** crate. Because it is a leaf
@@ -18,10 +21,15 @@
 //! otherwise create.
 
 pub mod seam;
+pub mod storage;
 pub mod types;
 
 pub use seam::{
     ApplyOutcome, Clock, Rng, StateMachine, Transport, TransportFactory, TransportMessage,
     TransportRx,
+};
+pub use storage::{
+    ConfState, EntryType, HardState, LogEntry, RaftId, RaftState, Snapshot, SnapshotMeta,
+    Storage, StorageError,
 };
 pub use types::{LogIndex, NodeId, NodeIdError, Term, Timestamp};

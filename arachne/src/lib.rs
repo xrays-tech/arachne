@@ -21,11 +21,14 @@
 //!
 //! [`arachne_seam`]: https://docs.rs/arachne-seam
 
+pub mod storage;
+
 pub use arachne_seam::seam;
 pub use arachne_seam::types;
 pub use arachne_seam::{
-    ApplyOutcome, Clock, LogIndex, NodeId, NodeIdError, Rng, StateMachine, Term, Timestamp,
-    Transport, TransportFactory, TransportMessage, TransportRx,
+    ApplyOutcome, Clock, ConfState, EntryType, HardState, LogIndex, LogEntry, NodeId,
+    NodeIdError, RaftId, RaftState, Rng, Snapshot, SnapshotMeta, StateMachine, Storage,
+    StorageError, Term, Timestamp, Transport, TransportFactory, TransportMessage, TransportRx,
 };
 
 /// Return the current crate version (from `CARGO_PKG_VERSION`).
