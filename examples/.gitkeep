@@ -1,0 +1,4 @@
+# Placeholder: runnable examples live here.
+#
+# Example content lands in a later phase. Until then `cargo build --examples`
+# is a no-op (no `examples/` targets defined), so it is not yet a CI gate.

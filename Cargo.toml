@@ -1,0 +1,41 @@
+# Arachne workspace
+#
+# Virtual (root-less) workspace: there is no root package. The members below
+# are the only crates built as part of the workspace.
+#
+# NOTE: `fuzz/` and `model-check/` are intentionally NOT workspace members.
+# They are standalone harnesses (each gets its own toolchain / build config)
+# and will be wired up in later phases.
+
+[workspace]
+members = [
+    "arachne-seam",
+    "arachne",
+    "arachne-transport-tonic",
+    "arachne-node",
+    "arachne-testsupport",
+    "arachne-sim",
+]
+# Edition 2024 => resolver v3 (feature-resolver semantics for the 2024 edition).
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.93"
+
+# Intra-workspace path dependencies. These are the ONLY dependencies any member
+# may use — there are ZERO external (crates.io) crates in this phase, so the
+# workspace builds fully offline.
+[workspace.dependencies]
+arachne-seam = { path = "arachne-seam" }
+# The workspace-wide default for `arachne` is the LEAN core (no transport).
+# `default-features = false` is the single source of truth here (cargo does not
+# let a member override it). Crates that want the tonic transport opt in
+# explicitly with `features = ["transport-tonic"]` (see arachne-node).
+arachne = { path = "arachne", default-features = false }
+arachne-transport-tonic = { path = "arachne-transport-tonic" }
+arachne-node = { path = "arachne-node" }
+arachne-testsupport = { path = "arachne-testsupport" }
+arachne-sim = { path = "arachne-sim" }

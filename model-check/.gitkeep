@@ -1,0 +1,5 @@
+# Placeholder: model-checking harness lives here.
+#
+# `model-check/` is intentionally NOT a workspace member (see root Cargo.toml).
+# Each model-check target will get its own toolchain/build config in a later
+# phase.

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The workspace pins its toolchain in rust-toolchain.toml (channel = "1.93.1").
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install exactly the toolchain pinned in rust-toolchain.toml so CI is
+      # reproducible regardless of the runner's preinstalled Rust.
+      - name: Install Rust toolchain pinned by rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          [ -n "${channel}" ] || { echo "error: could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "Installing Rust toolchain ${channel} (pinned by rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal
+          rustup default "${channel}"
+          cargo --version
+          rustc --version
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Build lean core (no default features)
+        run: cargo build -p arachne --no-default-features
+
+      - name: Dependency-boundary gate
+        run: bash scripts/check-deps.sh
+
+      - name: Entropy gate
+        run: bash scripts/check-entropy.sh
+
+      # ---------------------------------------------------------------------
+      # Future gates (land in a later phase — do NOT enable yet):
+      #
+      #   - `cargo build --examples`
+      #       examples/ is currently empty (no example targets exist in this
+      #       phase); the real examples arrive later. Building now would be a
+      #       no-op, so it is deferred until example content exists.
+      #
+      #   - `cargo clippy --workspace --all-targets -- -D warnings`
+      #       The minimal install profile above does not include the clippy
+      #       component; add `--component clippy` to the toolchain step when
+      #       this gate is enabled.
+      #
+      # Enable both once the corresponding content/logic is in place.
+      # ---------------------------------------------------------------------
+      # - name: Build examples
+      #   run: cargo build --examples
+      #
+      # - name: Lint (clippy, deny warnings)
+      #   run: cargo clippy --workspace --all-targets -- -D warnings

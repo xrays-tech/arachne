@@ -1,0 +1,25 @@
+[package]
+name = "arachne"
+description = "Arachne: transport-agnostic product core (no consensus/storage/networking yet)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# The default build pulls the tonic transport through an optional dependency.
+# Build with `--no-default-features` for a "lean" core with no transport at all.
+default = ["transport-tonic"]
+transport-tonic = ["dep:arachne-transport-tonic"]
+
+[dependencies]
+# The seam traits and shared value types live in the leaf `arachne-seam` crate.
+# This is a normal (always-on) dependency: the core re-exports those items so
+# its public API is unchanged. `arachne-seam` is a leaf (no deps), so it adds
+# nothing to the dependency tree beyond itself.
+arachne-seam = { workspace = true }
+
+# Optional: only compiled when the `transport-tonic` feature is enabled.
+# This is the sole edge from the core to a concrete transport, and it is the
+# only crate allowed to reference tonic/rustls types.
+arachne-transport-tonic = { workspace = true, optional = true }

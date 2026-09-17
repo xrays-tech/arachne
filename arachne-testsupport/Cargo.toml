@@ -1,0 +1,18 @@
+[package]
+name = "arachne-testsupport"
+description = "Test-only support crate (never a normal dependency of production crates)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Test-only: never published.
+publish = false
+
+[dependencies]
+# This test-only crate depends on the SEAM crate (`arachne-seam`), NOT on
+# `arachne`. Depending only on the leaf `arachne-seam` (and never on `arachne`)
+# guarantees this crate's normal dependency tree can never pull in the tonic
+# transport, even transitively (enforced by scripts/check-deps.sh Gate C).
+# Production crates may only pull in this crate via their [dev-dependencies]
+# (enforced by scripts/check-deps.sh Gate A).
+arachne-seam = { workspace = true }

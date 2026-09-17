@@ -1,0 +1,14 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Test / run artifacts
+/artifacts/
+
+# Deepwork session state (git-local)
+.slim/deepwork/
+
+# macOS
+.DS_Store

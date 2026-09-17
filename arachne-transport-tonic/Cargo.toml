@@ -1,0 +1,19 @@
+[package]
+name = "arachne-transport-tonic"
+description = "Arachne tonic/rustls transport — the ONLY crate allowed to reference tonic/rustls types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# This crate depends on the SEAM crate (`arachne-seam`), NOT on `arachne`.
+# That is what makes its future `impl Transport` (and friends) implementable
+# without creating a `arachne` -> arachne-transport-tonic -> arachne cycle:
+# `arachne` feature-gatedly depends on THIS crate, and this crate depends only
+# on the leaf `arachne-seam`, which depends on nothing.
+#
+# No external crates yet: `tonic` / `rustls` (the only crates this crate may
+# reference) land in a later phase. Until then it is dependency-free (besides
+# `arachne-seam`) so the whole workspace builds offline.
+arachne-seam = { workspace = true }

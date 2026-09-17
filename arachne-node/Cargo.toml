@@ -1,0 +1,14 @@
+[package]
+name = "arachne-node"
+description = "Arachne node binary (scaffold: prints version + transport; no consensus/storage yet)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Depends only on the core. The workspace default for `arachne` is the LEAN
+# core (`default-features = false`), so this binary opts in explicitly to the
+# tonic transport with `features = ["transport-tonic"]`. The transport is
+# surfaced through `arachne`'s re-export of `transport_name`.
+arachne = { workspace = true, features = ["transport-tonic"] }

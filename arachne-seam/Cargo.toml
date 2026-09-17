@@ -1,0 +1,14 @@
+[package]
+name = "arachne-seam"
+description = "Arachne seam: the leaf crate holding the core value types and the injectable seam traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Leaf crate: ZERO dependencies. Every other crate that needs the seam
+# vocabulary or the seam traits depends on this crate directly. Keeping it a
+# leaf (it depends on nothing) is what breaks the potential cargo cycle between
+# `arachne` (feature-gated -> arachne-transport-tonic) and
+# `arachne-transport-tonic` (-> arachne-seam, NOT arachne).

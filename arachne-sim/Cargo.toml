@@ -1,0 +1,27 @@
+[package]
+name = "arachne-sim"
+description = "Arachne simulation binary (scaffold; no real time/network — see check-entropy.sh Gate C)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Simulation: never published.
+publish = false
+
+[dependencies]
+# The sim drives the core deterministically with the test doubles.
+#
+# - `arachne` is pulled with `default-features = false` so the sim does NOT
+#   silently pull in the tonic transport (enforced by scripts/check-deps.sh
+#   Gate C).
+# - `arachne-seam` gives the sim the seam vocabulary/types directly.
+# - `arachne-testsupport` supplies the deterministic doubles (manual clock,
+#   seeded RNG, in-memory transport, in-memory state machine).
+#
+# NOTE (L2): arachne-sim's *deliberate* tonic enablement — exercising the real
+# transport in the L2 integration harness — lands with the L2 harness in a
+# later phase. It is intentionally NOT wired here yet: enabling it would
+# re-add the tonic edge to the sim's default tree and break Gate C.
+arachne = { workspace = true, default-features = false }
+arachne-seam = { workspace = true }
+arachne-testsupport = { workspace = true }

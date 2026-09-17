@@ -1,0 +1,4 @@
+# Placeholder: fuzzing harness lives here.
+#
+# `fuzz/` is intentionally NOT a workspace member (see root Cargo.toml). Each
+# fuzz target will get its own toolchain/build config in a later phase.
