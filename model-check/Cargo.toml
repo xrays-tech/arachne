@@ -1,0 +1,26 @@
+# model-check — standalone stateright model-checking harness (T3 / D-T2).
+#
+# Intentionally NOT a member of the root workspace: it is a standalone test
+# harness with its own dependency tree (stateright must never leak into the
+# main workspace's dependency tree). The trailing `[workspace]` table keeps it
+# a standalone package root.
+[package]
+name = "model-check"
+description = "Standalone stateright model-checking harness for Arachne (T3)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+# The bounded model-checking engine (decision D-T2: pinned stateright).
+stateright = "0.31"
+# The Arachne core (lean: no transport). The model itself is an abstraction of
+# the design, but it is checked against the real crate so the harness is
+# guaranteed to build against the shipped API.
+arachne = { path = "../arachne", default-features = false }
+
+# Standalone package root: this crate is deliberately not part of the root
+# workspace (see the note above).
+[workspace]

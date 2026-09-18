@@ -53,24 +53,22 @@ jobs:
       - name: Entropy gate
         run: bash scripts/check-entropy.sh
 
+      - name: Build examples
+        # The examples are the consumer-facing demo and the compile gate for
+        # the embedder API (D-ART): `arachne/examples/single_node.rs` is a
+        # complete, runnable program that only the public API can build.
+        run: cargo build --examples
+
       # ---------------------------------------------------------------------
-      # Future gates (land in a later phase — do NOT enable yet):
-      #
-      #   - `cargo build --examples`
-      #       examples/ is currently empty (no example targets exist in this
-      #       phase); the real examples arrive later. Building now would be a
-      #       no-op, so it is deferred until example content exists.
+      # Future gate (land in a later phase — do NOT enable yet):
       #
       #   - `cargo clippy --workspace --all-targets -- -D warnings`
-      #       The minimal install profile above does not include the clippy
-      #       component; add `--component clippy` to the toolchain step when
-      #       this gate is enabled.
-      #
-      # Enable both once the corresponding content/logic is in place.
+      #       The toolchain install above uses `--profile minimal`, which does
+      #       not include the `clippy` component, and `rust-toolchain.toml`
+      #       pins only the channel (no `components` key). This gate can be
+      #       enabled once `--component clippy` is added to the toolchain
+      #       step above.
       # ---------------------------------------------------------------------
-      # - name: Build examples
-      #   run: cargo build --examples
-      #
       # - name: Lint (clippy, deny warnings)
       #   run: cargo clippy --workspace --all-targets -- -D warnings
 

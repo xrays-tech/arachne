@@ -1,0 +1,32 @@
+# Arachne L4 node config — template for the real-process `kill -9` durability
+# harness (decision D-L4 / test-plan §2 L4, §3.3, §12 M0).
+#
+# This file serves two roles:
+#   1. A directly-runnable single-node config:
+#          arachne-node --config l4/node.toml
+#   2. The *template* that `l4/kill_loop.sh` and `l4/verify_wal.sh` read their
+#      stable settings from (cluster_id, node_id, initial_cluster, heartbeat,
+#      election timeout). The harness substitutes a **per-run temp `data_dir`**
+#      and an **ephemeral `http_listen` port** — the durable data dir must
+#      persist across restarts (that is what WAL durability is tested against),
+#      and the HTTP port must be free (fresh per restart to avoid TIME_WAIT
+#      conflicts on Linux CI).
+#
+# "temp-ish" data dir + ephemeral ports + short heartbeat (fast self-election).
+
+cluster_id = "arachne-l4"
+node_id = "n1"
+# Raft listen address (reserved for the M1 tonic transport; unused by the M0
+# placeholder transport). Ephemeral so it never collides.
+listen = "127.0.0.1:0"
+# The on-disk WAL data dir. The harness overrides this with a per-run temp dir
+# that is wiped before the run and (on success) removed afterwards.
+data_dir = "/tmp/arachne-l4/data"
+# The HTTP endpoint for /readyz and /metrics. The harness overrides this with
+# a freshly-allocated free port each restart.
+http_listen = "127.0.0.1:43310"
+# Single-node bootstrap cluster (propsol §5.7).
+initial_cluster = ["n1"]
+# Short heartbeat/election so the single node elects itself quickly (scaffold).
+heartbeat_interval_ms = 50
+election_timeout_ms = 500

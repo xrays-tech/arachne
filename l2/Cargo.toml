@@ -1,0 +1,38 @@
+# Arachne L2 deterministic-simulator harness (decision D-T1 / D-ART).
+#
+# This is a SEPARATE, standalone cargo project (NOT a workspace member of the
+# root Arachne workspace). The trailing `[workspace]` table makes this
+# directory its own workspace root so cargo does not fold it into the root
+# workspace. It depends on `arachne` / `arachne-seam` via path dependencies.
+#
+# Why separate from the root workspace (D-ART / test-plan §3.2)?
+#   The L2 simulator (`turmoil`) and its whole dependency tree are dev-only
+#   tooling. Keeping them OUT of the production workspace guarantees the
+#   simulator can never leak into any production crate's normal dependency
+#   tree (enforced by scripts/check-deps.sh, which only scans workspace
+#   members). `fuzz/` and `model-check/` follow the same standalone pattern.
+#
+# See `l2/README.md` for the L2 roadmap (real tonic at M1, FaultyStorage,
+# INV1-6 checks) and the known macOS `--sanitizer none` note analogue.
+
+[package]
+name = "arachne-l2"
+description = "Arachne L2 deterministic-simulator harness (turmoil); dev-only, never published"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+# The deterministic simulator (D-T1). Runs real tokio (and, at M1, real tonic)
+# over a simulated network + clock with seeded scheduling.
+turmoil = "0.7"
+# The async runtime the simulator drives.
+tokio = { version = "1", features = ["full"] }
+# The product core and the seam vocabulary, pulled LEAN (no tonic transport):
+# mirrors the production sim-build rule (`default-features = false`, test-plan
+# §3.2) so the L2 build stays light and never silently pulls in tonic.
+arachne = { path = "../arachne", default-features = false }
+arachne-seam = { path = "../arachne-seam" }
+
+# Standalone workspace root (keeps `l2/` out of the root Arachne workspace).
+[workspace]
