@@ -19,6 +19,13 @@ transport-tonic = ["dep:arachne-transport-tonic"]
 # nothing to the dependency tree beyond itself.
 arachne-seam = { workspace = true }
 
+# The raft consensus library. `raft` 0.7 is the pinned version for the
+# consensus core (P4a). It pulls in `protobuf` for message serialization.
+raft = "0.7"
+slog = "2"
+thiserror = "1"
+protobuf = "2"
+
 # Optional: only compiled when the `transport-tonic` feature is enabled.
 # This is the sole edge from the core to a concrete transport, and it is the
 # only crate allowed to reference tonic/rustls types.

@@ -21,6 +21,8 @@
 //!
 //! [`arachne_seam`]: https://docs.rs/arachne-seam
 
+pub mod consensus;
+pub mod state_machine;
 pub mod storage;
 
 pub use arachne_seam::seam;
