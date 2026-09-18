@@ -28,20 +28,29 @@ mod wal;
 // Re-export the seam's storage types so `arachne::storage::Storage` etc.
 // continue to work.
 pub use arachne_seam::storage::{
-    ConfState, EntryType, HardState, LogEntry, RaftId, RaftState, Snapshot, SnapshotMeta,
-    Storage, StorageError,
+    ConfState, EntryType, FsyncObserver, HardState, LogEntry, RaftId, RaftState, Snapshot,
+    SnapshotMeta, Storage, StorageError,
 };
 
 // Re-export the WAL format and I/O items.
+//
+// F5: only the items actually needed by the standalone `fuzz/` crate and
+// integration tests are public. The rest are `#[doc(hidden)]` to keep the
+// production API surface minimal while still allowing the fuzz harness to
+// compile (it is a separate crate that cannot access `pub(crate)` items).
+#[doc(hidden)]
 pub use crate::storage::format::{
     decode_entry, decode_hard_state, decode_record, encode_entry, encode_hard_state,
     encode_record, DecodeError, RecordType, MAX_RECORD_BYTES,
 };
+#[doc(hidden)]
 pub use crate::storage::meta::{read_meta, write_meta, Meta, MetaError, FORMAT_VERSION};
+#[doc(hidden)]
 pub use crate::storage::segment::{
     parse_segment_name, segment_name, segment_path, Segment, SegmentError,
     DEFAULT_SEGMENT_BYTES,
 };
+#[doc(hidden)]
 pub use crate::storage::crc32c::crc32c;
 
 // Re-export the WAL-backed storage implementation.

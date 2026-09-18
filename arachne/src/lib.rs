@@ -26,8 +26,8 @@ pub mod storage;
 pub use arachne_seam::seam;
 pub use arachne_seam::types;
 pub use arachne_seam::{
-    ApplyOutcome, Clock, ConfState, EntryType, HardState, LogIndex, LogEntry, NodeId,
-    NodeIdError, RaftId, RaftState, Rng, Snapshot, SnapshotMeta, StateMachine, Storage,
+    ApplyOutcome, Clock, ConfState, EntryType, FsyncObserver, HardState, LogIndex, LogEntry,
+    NodeId, NodeIdError, RaftId, RaftState, Rng, Snapshot, SnapshotMeta, StateMachine, Storage,
     StorageError, Term, Timestamp, Transport, TransportFactory, TransportMessage, TransportRx,
 };
 

@@ -29,7 +29,7 @@ pub use seam::{
     TransportRx,
 };
 pub use storage::{
-    ConfState, EntryType, HardState, LogEntry, RaftId, RaftState, Snapshot, SnapshotMeta,
-    Storage, StorageError,
+    ConfState, EntryType, FsyncObserver, HardState, LogEntry, RaftId, RaftState, Snapshot,
+    SnapshotMeta, Storage, StorageError,
 };
 pub use types::{LogIndex, NodeId, NodeIdError, Term, Timestamp};

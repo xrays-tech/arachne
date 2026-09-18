@@ -23,3 +23,10 @@ arachne-seam = { workspace = true }
 # This is the sole edge from the core to a concrete transport, and it is the
 # only crate allowed to reference tonic/rustls types.
 arachne-transport-tonic = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Test-only: the test support crate provides the FsyncLedger and FaultyStorage
+# for integration tests. This is a dev-dependency only (enforced by
+# scripts/check-deps.sh Gate A: production crates may only pull in
+# arachne-testsupport via [dev-dependencies]).
+arachne-testsupport = { workspace = true }

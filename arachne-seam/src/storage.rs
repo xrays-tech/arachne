@@ -235,6 +235,28 @@ pub trait Storage: Send + 'static {
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError>;
 }
 
+/// Observes per-segment fsync events from a WAL implementation.
+///
+/// The WAL calls [`on_segment_fsynced`](FsyncObserver::on_segment_fsynced)
+/// after **every real fsync** of a segment file. This allows external
+/// verification machinery (e.g., a [`FsyncLedger`]) to track which segments'
+/// bytes are durably on disk, enabling detection of cross-segment durability
+/// gaps (the N2 class of bug).
+///
+/// # Implementation requirements
+///
+/// Observers must be **cheap and non-blocking**: the call happens on the hot
+/// path of the WAL's fsync. Do not perform I/O, allocation, or locking in the
+/// observer implementation.
+pub trait FsyncObserver: Send + Sync + 'static {
+    /// Called AFTER a segment's bytes have been durably fsynced.
+    ///
+    /// `segment_first_index` identifies the segment (its filename index);
+    /// `durable_through_index` is the highest log index whose bytes in that
+    /// segment are now durable (0 if the segment holds no Entry yet).
+    fn on_segment_fsynced(&self, segment_first_index: LogIndex, durable_through_index: LogIndex);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

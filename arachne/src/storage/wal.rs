@@ -51,9 +51,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arachne_seam::storage::{
-    ConfState, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
+    ConfState, FsyncObserver, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
 };
 use arachne_seam::types::{LogIndex, Term};
 
@@ -113,7 +114,6 @@ impl Default for WalConfig {
 }
 
 /// Options for opening a [`WalStorage`].
-#[derive(Clone, Debug)]
 pub struct WalOptions {
     /// The cluster identifier.
     pub cluster_id: String,
@@ -124,6 +124,33 @@ pub struct WalOptions {
     /// The creation timestamp in milliseconds since the Unix epoch, supplied
     /// by the caller (the storage core does not read the system clock).
     pub created_at_millis: u64,
+    /// An optional observer that is notified after every real fsync of a
+    /// segment. `None` (zero-overhead) by default.
+    pub fsync_observer: Option<Arc<dyn FsyncObserver>>,
+}
+
+impl Clone for WalOptions {
+    fn clone(&self) -> Self {
+        Self {
+            cluster_id: self.cluster_id.clone(),
+            node_id: self.node_id.clone(),
+            config: self.config.clone(),
+            created_at_millis: self.created_at_millis,
+            fsync_observer: self.fsync_observer.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for WalOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalOptions")
+            .field("cluster_id", &self.cluster_id)
+            .field("node_id", &self.node_id)
+            .field("config", &self.config)
+            .field("created_at_millis", &self.created_at_millis)
+            .field("fsync_observer", &self.fsync_observer.as_ref().map(|_| "Some(observer)"))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +189,11 @@ pub struct WalStorage {
     data_dir: PathBuf,
     /// The active (last) segment.
     segment: Segment,
+    /// The first log index of the active segment (from its filename).
+    segment_first_index: LogIndex,
+    /// The highest Entry index physically present in the active segment.
+    /// 0 if the segment holds no Entry yet.
+    max_entry_in_segment: LogIndex,
     /// The in-memory log entries (contiguous, 1-based indices).
     entries: Vec<LogEntry>,
     /// The current hard state.
@@ -174,6 +206,8 @@ pub struct WalStorage {
     segment_bytes: u64,
     /// Fsync/recovery counters.
     stats: StorageStats,
+    /// Optional fsync observer (zero-overhead when `None`).
+    fsync_observer: Option<Arc<dyn FsyncObserver>>,
     /// The data-dir lock file (held for the lifetime of this struct).
     /// Dropping it releases the lock.
     _lock: File,
@@ -268,15 +302,25 @@ impl WalStorage {
             stats.dir_fsyncs += 1;
         }
 
+        // Compute the max entry index in the active segment. Since entries
+        // are sequential and the segment is named by its first entry index,
+        // the max entry in the segment is min(global_last, ...) — but since
+        // the active segment is the LAST segment, it holds entries from
+        // `active_first_index` through the global last.
+        let max_entry_in_segment = entries.last().map(|e| e.index).unwrap_or(0);
+
         Ok(Self {
             data_dir: dir.to_path_buf(),
             segment,
+            segment_first_index: active_first_index,
+            max_entry_in_segment,
             entries,
             hard_state,
             pending_entry_fsync: false,
             fsync_policy: opts.config.fsync_policy,
             segment_bytes: opts.config.segment_bytes,
             stats,
+            fsync_observer: opts.fsync_observer,
             _lock: lock_file,
         })
     }
@@ -289,6 +333,16 @@ impl WalStorage {
     /// Return the data directory path.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Notify the fsync observer (no-op if `None`).
+    fn notify_fsynced(&self) {
+        if let Some(observer) = &self.fsync_observer {
+            observer.on_segment_fsynced(
+                self.segment_first_index,
+                self.max_entry_in_segment,
+            );
+        }
     }
 
     // ---- Recovery helpers ----
@@ -508,6 +562,9 @@ impl WalStorage {
                 self.segment.sync().map_err(StorageError::Io)?;
                 self.stats.entry_fsyncs += 1;
                 self.pending_entry_fsync = false;
+                // Notify the observer for the outgoing segment (before we
+                // reset its identity for the new segment).
+                self.notify_fsynced();
             }
             // Create a new segment named by the next entry's index.
             let new_segment = open_segment_at(
@@ -519,6 +576,9 @@ impl WalStorage {
             fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
             self.stats.dir_fsyncs += 1;
             self.segment = new_segment;
+            // Reset per-segment tracking for the new segment.
+            self.segment_first_index = next_entry_index;
+            self.max_entry_in_segment = 0;
         }
         Ok(())
     }
@@ -633,8 +693,9 @@ impl Storage for WalStorage {
                 .append_record(RecordType::Entry, &payload)
                 .map_err(segment_err_to_storage_err)?;
 
-            // Update the in-memory index.
+            // Update the in-memory index and per-segment tracking.
             self.entries.push(entry.clone());
+            self.max_entry_in_segment = entry.index;
 
             // Mark unsynced *per record* so that a mid-batch rollover
             // (checked at the top of the next iteration) fsyncs the outgoing
@@ -656,6 +717,7 @@ impl Storage for WalStorage {
             .sync()
             .map_err(StorageError::Io)?;
         self.stats.hard_state_fsyncs += 1;
+        self.notify_fsynced();
 
         self.hard_state = hs.clone();
         Ok(())
@@ -670,6 +732,7 @@ impl Storage for WalStorage {
                 self.stats.entry_fsyncs += 1;
                 self.stats.entry_sync_batches += 1;
                 self.pending_entry_fsync = false;
+                self.notify_fsynced();
             }
             FsyncPolicy::BatchMs(_) => {
                 // sync_entries is the synchronous durability barrier: it
@@ -682,6 +745,7 @@ impl Storage for WalStorage {
                     self.stats.entry_fsyncs += 1;
                     self.stats.entry_sync_batches += 1;
                     self.pending_entry_fsync = false;
+                    self.notify_fsynced();
                 }
             }
         }
@@ -792,6 +856,7 @@ mod tests {
             node_id: "node-1".into(),
             config: WalConfig::default(),
             created_at_millis: 1_700_000_000_000,
+            fsync_observer: None,
         }
     }
 
@@ -804,6 +869,7 @@ mod tests {
                 ..WalConfig::default()
             },
             created_at_millis: 1_700_000_000_000,
+            fsync_observer: None,
         }
     }
 
@@ -816,6 +882,7 @@ mod tests {
                 ..WalConfig::default()
             },
             created_at_millis: 1_700_000_000_000,
+            fsync_observer: None,
         }
     }
 
@@ -1209,6 +1276,7 @@ mod tests {
             node_id: "node-1".into(),
             config: WalConfig::default(),
             created_at_millis: 1_700_000_000_000,
+            fsync_observer: None,
         };
         let result = WalStorage::open(&dir, bad_opts);
         assert!(result.is_err());

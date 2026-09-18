@@ -25,9 +25,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.93"
 
-# Intra-workspace path dependencies. These are the ONLY dependencies any member
-# may use — there are ZERO external (crates.io) crates in this phase, so the
-# workspace builds fully offline.
+# Intra-workspace path dependencies. The core (`arachne`, `arachne-seam`,
+# `arachne-testsupport`) has ZERO external crates and builds fully offline.
+# The `arachne-transport-tonic` member pulls in tonic/rustls when its feature
+# is enabled (see `scripts/check-deps.sh` Gate B for the lean-core invariant).
 [workspace.dependencies]
 arachne-seam = { path = "arachne-seam" }
 # The workspace-wide default for `arachne` is the LEAN core (no transport).

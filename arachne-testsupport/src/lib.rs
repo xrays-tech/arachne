@@ -24,13 +24,19 @@
 //! All of these are dependency-free (std/core only) and build offline.
 
 mod clock;
+mod faulty_storage;
+mod fsync_ledger;
 mod rng;
 mod state_machine;
+mod store_suite;
 mod transport;
 
 pub use clock::ManualClock;
+pub use faulty_storage::{FaultSchedule, FaultyStorage, OpKind, OpRecord};
+pub use fsync_ledger::{FsyncEvent, FsyncLedger};
 pub use rng::SeededRng;
 pub use state_machine::{InMemoryStateMachine, SmError};
+pub use store_suite::{CheckResult, SuiteReport, run_storage_suite};
 pub use transport::{
     block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx, TransportError,
 };

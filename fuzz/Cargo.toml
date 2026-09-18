@@ -1,0 +1,46 @@
+# Arachne `cargo-fuzz` harness.
+#
+# This is a SEPARATE, standalone cargo project (NOT a workspace member of the
+# root Arachne workspace). The trailing `[workspace]` table makes this
+# directory its own workspace root so cargo does not fold it into the root
+# workspace. It depends on `arachne` via a path dependency.
+#
+# Fuzzing requires the nightly toolchain:
+#   cargo +nightly fuzz run wal_recovery
+#
+# See `fuzz/README.md` for the CI invocation and the relationship to the
+# deterministic in-repo harness (`arachne/tests/wal_mutation.rs`), which is the
+# primary CI evidence for M0 ② / INV6.
+
+[package]
+name = "arachne-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Marks this as a cargo-fuzz project (consumed by `cargo fuzz`).
+[package.metadata]
+cargo-fuzz = true
+
+# Fuzzing wants debug assertions + overflow checks ON in release to surface
+# more classes of bug (this is the cargo-fuzz recommended profile).
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `default-features = false` keeps the harness lean: it only exercises the
+# always-on storage core (no tonic transport). Note the path points at the
+# `arachne` *crate* (`../arachne`), not the virtual workspace root (`..`).
+arachne = { path = "../arachne", default-features = false }
+
+# Each file under `fuzz_targets/` is one fuzz target (harness = false: the
+# entry point comes from libfuzzer-sys, not the default test harness).
+[[bin]]
+name = "wal_recovery"
+path = "fuzz_targets/wal_recovery.rs"
+harness = false
+
+# Standalone workspace root (keeps `fuzz/` out of the root Arachne workspace).
+[workspace]

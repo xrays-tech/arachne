@@ -1,0 +1,6 @@
+# cargo-fuzz build output and fuzzer state. Keep the harness source (and its
+# lockfile, per the repo's lockfile policy) in the repo; ignore only generated
+# artifacts and any fuzz corpus/artifacts.
+/target
+/corpus
+/artifacts

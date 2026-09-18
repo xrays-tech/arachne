@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The fuzz job runs on a nightly schedule and on manual dispatch only
+  # (not per-PR, to keep PR feedback fast).
+  schedule:
+    - cron: "0 4 * * *" # nightly at 04:00 UTC
+  workflow_dispatch:
 
 # The workspace pins its toolchain in rust-toolchain.toml (channel = "1.93.1").
 env:
@@ -65,3 +70,24 @@ jobs:
       #
       # - name: Lint (clippy, deny warnings)
       #   run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Fuzz job: runs only on the nightly schedule or manual dispatch (not per-PR).
+  # Uses `github.event_name` to gate: `schedule` and `workflow_dispatch` are
+  # the only triggers that should run the fuzzer.
+  fuzz:
+    name: Fuzz (wal_recovery)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain (libFuzzer requires nightly)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Run fuzz target (wal_recovery) for a bounded wall-clock
+        working-directory: fuzz
+        run: cargo +nightly fuzz run wal_recovery -- -max_total_time=300
