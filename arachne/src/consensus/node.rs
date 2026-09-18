@@ -154,6 +154,15 @@ where
     /// Returns the committed entries `(index, data)` to apply to the state
     /// machine. After applying them, call [`Self::advance_apply`] to update the
     /// apply progress. Returns an empty vec when there is no pending work.
+    ///
+    /// # Transport failures are non-fatal
+    ///
+    /// A message that cannot be delivered (e.g. its peer is currently down) is
+    /// dropped, **not** surfaced as an error, and never prevents `advance()`:
+    /// raft retransmits on a later tick. Aborting the `Ready` cycle on a send
+    /// failure would let one unreachable peer stall this node's persistence
+    /// pipeline, which is exactly the failure mode raft is designed to absorb.
+    /// (`NodeError::Transport` remains for callers that send explicitly.)
     pub async fn step(&mut self) -> Result<Vec<(LogIndex, Vec<u8>)>, NodeError<T>> {
         if !self.raw.has_ready() {
             return Ok(Vec::new());
@@ -169,30 +178,49 @@ where
         // replication messages, which do not depend on local durability.
         let immediate: Vec<Message> = ready.messages().to_vec();
         for msg in &immediate {
-            send_one(&self.transport, &self.peers, self_id, msg).await?;
+            let _ = send_one(&self.transport, &self.peers, self_id, msg).await;
         }
 
         // Persisted messages must go out only after their payload is durable.
         // Capture them before moving `ready` into `advance`.
         let persisted: Vec<Message> = ready.persisted_messages().to_vec();
 
+        // Committed entries that were ALREADY durable and committed before this
+        // `Ready` was produced (raft doc, step 3). `RawNode::advance`'s
+        // `LightReady` (doc, step 7) only carries the entries that became
+        // committed *by this* `Ready` (the ones just persisted above). The two
+        // sets are disjoint and together form the complete set of newly-committed
+        // entries; returning only the `LightReady` set silently drops the first
+        // set — which is exactly the entries a follower/leader persists in one
+        // round and commits in a later round. Capture before `ready` is moved.
+        let ready_committed: Vec<(LogIndex, Vec<u8>)> = ready
+            .committed_entries()
+            .iter()
+            .map(|e| (e.get_index(), e.get_data().to_vec()))
+            .collect();
+
         // Advance: confirms persistence and yields the `LightReady` (committed
         // entries plus any messages generated during the advance).
         let light = self.raw.advance(ready);
 
         for msg in &persisted {
-            send_one(&self.transport, &self.peers, self_id, msg).await?;
+            let _ = send_one(&self.transport, &self.peers, self_id, msg).await;
         }
         for msg in light.messages() {
-            send_one(&self.transport, &self.peers, self_id, msg).await?;
+            let _ = send_one(&self.transport, &self.peers, self_id, msg).await;
         }
 
-        // Committed entries for the state machine.
-        let committed: Vec<(LogIndex, Vec<u8>)> = light
-            .committed_entries()
-            .iter()
-            .map(|e| (e.get_index(), e.get_data().to_vec()))
-            .collect();
+        // Committed entries for the state machine: the union of the entries that
+        // were already committed before this `Ready` and those committed by it.
+        // They are disjoint and in ascending index order (`ready_committed`
+        // holds the lower indices), which the state machine requires.
+        let mut committed = ready_committed;
+        committed.extend(
+            light
+                .committed_entries()
+                .iter()
+                .map(|e| (e.get_index(), e.get_data().to_vec())),
+        );
         Ok(committed)
     }
 

@@ -38,5 +38,5 @@ pub use rng::SeededRng;
 pub use state_machine::{InMemoryStateMachine, SmError};
 pub use store_suite::{CheckResult, SuiteReport, run_storage_suite};
 pub use transport::{
-    block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx, TransportError,
+    block_on, InMemoryClosed, InMemoryRx, InMemoryTransportFactory, InMemoryTx, TransportError,
 };

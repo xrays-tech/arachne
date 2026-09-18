@@ -53,6 +53,23 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+/// A closed in-memory receiving half: every sender has been dropped and the
+/// queue is drained, so no further messages can arrive.
+///
+/// This is the non-`Pending` counterpart of a drained, fully-disconnected
+/// channel. It is reported by [`InMemoryRx::try_recv`] (and, as `None`, by
+/// [`InMemoryRx::recv`]) once the transport can no longer deliver anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InMemoryClosed;
+
+impl std::fmt::Display for InMemoryClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("in-memory transport is closed (all senders dropped, queue drained)")
+    }
+}
+
+impl std::error::Error for InMemoryClosed {}
+
 /// A message in the switch's queue: who sent it and the payload.
 type Queued = (NodeId, TransportMessage);
 
@@ -147,6 +164,26 @@ impl TransportRx for InMemoryRx {
         RecvFuture {
             receiver: &mut self.receiver,
             waker: None,
+        }
+    }
+}
+
+/// Non-blocking receive, for deterministic single-threaded harness loops that
+/// must not suspend when the queue happens to be empty.
+///
+/// * `Ok(Some(msg))` — a message was queued;
+/// * `Ok(None)` — the queue is empty right now (try again later);
+/// * `Err(InMemoryClosed)` — every sender is gone and the queue is drained.
+///
+/// `InMemoryClosed` itself is defined near the top of this module.
+impl InMemoryRx {
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<Option<(NodeId, TransportMessage)>, InMemoryClosed> {
+        match self.receiver.try_recv() {
+            Ok(item) => Ok(Some(item)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(InMemoryClosed),
         }
     }
 }
@@ -307,6 +344,33 @@ mod tests {
         assert_eq!(block_on(b_rx.recv()), Some((NodeId::from("a"), raft(b"one"))));
         // Now the queue is empty and every sender is gone: closed => None.
         assert_eq!(block_on(b_rx.recv()), None);
+    }
+
+    #[test]
+    fn try_recv_reports_queued_empty_and_closed() {
+        let factory = InMemoryTransportFactory::new();
+        let (a_tx, _a_rx) = factory.create(NodeId::from("a"));
+        let (_b_tx, mut b_rx) = factory.create(NodeId::from("b"));
+
+        // Empty queue with senders still alive -> Ok(None) (not an error).
+        assert_eq!(b_rx.try_recv(), Ok(None));
+
+        // A queued message is reported as Ok(Some(..)) in FIFO order.
+        block_on(a_tx.send(NodeId::from("b"), raft(b"one"))).unwrap();
+        block_on(a_tx.send(NodeId::from("b"), raft(b"two"))).unwrap();
+        assert_eq!(b_rx.try_recv(), Ok(Some((NodeId::from("a"), raft(b"one")))));
+        assert_eq!(b_rx.try_recv(), Ok(Some((NodeId::from("a"), raft(b"two")))));
+
+        // Drained again but senders alive -> Ok(None).
+        assert_eq!(b_rx.try_recv(), Ok(None));
+
+        // Drop every sender (and the factory that owns the switch's senders)
+        // -> the channel is closed and drained -> Err(InMemoryClosed).
+        drop(a_tx);
+        drop(_a_rx);
+        drop(_b_tx);
+        drop(factory);
+        assert_eq!(b_rx.try_recv(), Err(InMemoryClosed));
     }
 
     #[test]
