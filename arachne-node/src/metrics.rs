@@ -13,6 +13,7 @@ pub struct Metrics {
     commit_index: AtomicU64,
     applied_index: AtomicU64,
     is_leader: AtomicU64,
+    dropped_sends: AtomicU64,
 }
 
 impl Metrics {
@@ -46,6 +47,12 @@ impl Metrics {
         self.is_leader.store(u64::from(value), Ordering::Relaxed);
     }
 
+    /// Record the number of outbound raft messages dropped due to a failed
+    /// transport send (see `RaftNode::dropped_send_count`).
+    pub fn set_dropped_sends(&self, value: u64) {
+        self.dropped_sends.store(value, Ordering::Relaxed);
+    }
+
     /// Whether this node currently believes it is the leader.
     pub fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::Relaxed) == 1
@@ -54,6 +61,12 @@ impl Metrics {
     /// The current leader's raft id (0 = unknown).
     pub fn leader_id(&self) -> u64 {
         self.leader_id.load(Ordering::Relaxed)
+    }
+
+    /// The number of outbound raft messages dropped due to a failed transport
+    /// send.
+    pub fn dropped_sends(&self) -> u64 {
+        self.dropped_sends.load(Ordering::Relaxed)
     }
 
     /// Render every gauge in the Prometheus text exposition format.
@@ -89,6 +102,12 @@ impl Metrics {
             "1 if this node is the leader, else 0.",
             self.is_leader.load(Ordering::Relaxed),
         );
+        gauge(
+            &mut out,
+            "arachne_dropped_sends",
+            "Outbound raft messages dropped due to a failed transport send.",
+            self.dropped_sends.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -120,6 +139,7 @@ mod tests {
         m.set_commit_index(7);
         m.set_applied_index(6);
         m.set_is_leader(true);
+        m.set_dropped_sends(4);
         let text = m.render();
         for name in [
             "arachne_term",
@@ -127,14 +147,17 @@ mod tests {
             "arachne_commit_index",
             "arachne_applied_index",
             "arachne_is_leader",
+            "arachne_dropped_sends",
         ] {
             assert!(text.contains(name), "missing {name}");
         }
         assert!(text.contains("# TYPE arachne_term gauge"));
         assert!(text.contains("arachne_term 3"));
         assert!(text.contains("arachne_is_leader 1"));
+        assert!(text.contains("arachne_dropped_sends 4"));
         assert!(m.is_leader());
         assert_eq!(m.leader_id(), 1);
+        assert_eq!(m.dropped_sends(), 4);
     }
 
     #[test]
@@ -142,5 +165,6 @@ mod tests {
         let text = Metrics::new().render();
         assert!(text.contains("arachne_term 0"));
         assert!(text.contains("arachne_is_leader 0"));
+        assert!(text.contains("arachne_dropped_sends 0"));
     }
 }

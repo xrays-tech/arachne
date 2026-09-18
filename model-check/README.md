@@ -31,16 +31,27 @@ The BFS checker (bounded depth) verifies:
 | `commit_within_log`    | always    | The commit watermark never exceeds the log                     |
 | `an_entry_committed`   | sometimes | The model is live: an entry can be committed                   |
 
-The entry payload is a bounded `u8` and the term is fixed (no elections),
-which keeps the state space small enough for fast, exhaustive checking. The
-harness depends on the real `arachne` crate (lean, `default-features = false`)
-so it always builds against the shipped API.
+**Honest scope (M0 scaffold).** The model's actions are deliberately
+idealized: the leader and the term are **fixed** (no elections), messages are
+**never lost, delayed, reordered, or duplicated**, and **no node crashes**. On
+top of that, `Commit` is only enabled **when a quorum already holds the entry**
+at that index, so the commit rule can never be violated. As a result the safety
+properties above are **unfalsifiable by construction** — the model can never
+produce a counterexample, so "no counterexample found" currently validates the
+**stateright wiring only** (D-T2), not Arachne's real consensus logic.
 
-## Scope: later milestone
+> Note: the harness does **not** exercise the real `arachne` crate — its only
+> use is a `version()` banner in the startup line. It does *not* build against
+> the shipped API in any meaningful sense at this stage.
 
-This is the **M0 onboarding scaffold** — it proves the stateright wiring
-(D-T2). The full scoped model check (3-node elections, log matching, and
-state-machine safety over the designed abstract model, cross-validated against
-Arachne's real entry encoding) is a later milestone (test-plan T3). Per the
-design-change checklist, a consensus design change must pass this harness
-before it is accepted.
+## What M2 must add (to make the properties falsifiable)
+
+- **Elections / term changes** (replace the fixed leader/term);
+- **Message loss, delay, reordering, and duplication**;
+- **Crashes** (nodes going down and recovering);
+- **Real-encoding cross-validation** (drive the model with Arachne's actual
+  entry encoding instead of a bounded `u8` payload).
+
+Per the design-change checklist, a consensus design change must pass this
+harness before it is accepted — that obligation becomes meaningful only once
+the M2 additions above are in place (test-plan T3).

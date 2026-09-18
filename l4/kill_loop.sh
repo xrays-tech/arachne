@@ -122,9 +122,12 @@ wait_ready() {
 }
 
 # --- Read one gauge from /metrics (empty if absent) -------------------------
+# Tolerant of a no-match: under `set -euo pipefail` a `grep` with no match
+# would abort the script before the caller's `-z` diagnostic can fire, so the
+# pipeline is guarded with `|| true` (the value is simply empty).
 read_metric() {
   local port="$1" name="$2"
-  curl -s "http://127.0.0.1:${port}/metrics" 2>/dev/null | grep "^${name} " | awk '{print $2}'
+  curl -s "http://127.0.0.1:${port}/metrics" 2>/dev/null | grep "^${name} " | awk '{print $2}' || true
 }
 
 # --- Temp run dir (holds the durable data dir + per-restart logs) -----------

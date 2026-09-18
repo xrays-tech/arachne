@@ -150,6 +150,8 @@ impl Arachne {
         self.metrics.set_leader_id(self.raft.leader_id());
         self.metrics
             .set_is_leader(self.raft.leader_id() == self.raft_id);
+        // P4 gate: surface dropped sends so a dead transport is visible.
+        self.metrics.set_dropped_sends(self.raft.dropped_send_count());
     }
 }
 

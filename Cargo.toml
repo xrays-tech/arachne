@@ -3,9 +3,9 @@
 # Virtual (root-less) workspace: there is no root package. The members below
 # are the only crates built as part of the workspace.
 #
-# NOTE: `fuzz/` and `model-check/` are intentionally NOT workspace members.
-# They are standalone harnesses (each gets its own toolchain / build config)
-# and will be wired up in later phases.
+# NOTE: `l2/`, `fuzz/`, and `model-check/` are intentionally NOT workspace
+# members. They are standalone harnesses (each gets its own toolchain / build
+# config) and will be wired up in later phases.
 
 [workspace]
 members = [

@@ -481,13 +481,16 @@ mod tests {
     /// `Corruption` / `Unrecoverable` (fail-start) map to raft `Unavailable`.
     #[test]
     fn fail_start_errors_map_to_unavailable() {
-        let mut inner = Double::new();
-        inner.set_forced(ForcedError::Corruption);
-        let store = RaftStorage::new(inner);
-        let err = store
-            .entries(1, 2, u64::MAX, GetEntriesContext::empty(false))
-            .expect_err("forced error must surface");
-        assert_eq!(err, RaftError::Store(RaftStorageError::Unavailable));
+        // Both fail-start conditions must map to raft's `Unavailable`.
+        for forced in [ForcedError::Corruption, ForcedError::Unrecoverable] {
+            let mut inner = Double::new();
+            inner.set_forced(forced);
+            let store = RaftStorage::new(inner);
+            let err = store
+                .entries(1, 2, u64::MAX, GetEntriesContext::empty(false))
+                .expect_err("forced error must surface");
+            assert_eq!(err, RaftError::Store(RaftStorageError::Unavailable));
+        }
     }
 
     /// `Io` errors pass through as `raft::Error::Io`.

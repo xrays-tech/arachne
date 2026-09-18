@@ -118,7 +118,10 @@ async fn run(
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    loop {
+    // The loop exits either on a fatal drive-loop error (fail-stop: the
+    // process must exit non-zero) or on a signal (graceful: exit 0). Carry
+    // that distinction out of the loop.
+    let drive_result: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
             biased;
             _ = tick.tick() => {
@@ -129,13 +132,14 @@ async fn run(
                         }
                     }
                     Err(e) => {
-                        // A drive-loop failure is fatal (fail-stop discipline).
+                        // A drive-loop failure is fatal (fail-stop discipline):
+                        // report it and exit non-zero.
                         eprintln!("drive loop error: {e}");
-                        break;
+                        break Err(Box::new(e));
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = async {
                 #[cfg(unix)]
                 {
@@ -145,16 +149,16 @@ async fn run(
                 {
                     std::future::pending::<()>().await;
                 }
-            } => break,
+            } => break Ok(()),
         }
-    }
+    };
 
     // Graceful shutdown: stop the HTTP server, then drop the node (which
     // releases the WAL data-dir lock).
     http_shutdown.store(true, Ordering::Relaxed);
     let _ = http_thread.join();
     drop(node);
-    Ok(())
+    drive_result
 }
 
 fn build_logger(node_id: &str) -> slog::Logger {

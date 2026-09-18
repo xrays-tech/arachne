@@ -76,11 +76,19 @@ pub enum ConfigError {
     Parse(String),
     /// A required string field was empty.
     EmptyField { field: &'static str },
+    /// A `node_id` or an `initial_cluster` member is not a valid node
+    /// identifier (it failed `NodeId::try_new`, i.e. it is empty or otherwise
+    /// malformed). Distinct from [`ConfigError::EmptyField`], which is reserved
+    /// for the explicitly-emptied top-level fields.
+    InvalidNodeId { value: String },
     /// `initial_cluster` had no entries.
     EmptyCluster,
+    /// `initial_cluster` lists the same node more than once (two entries would
+    /// collide on the same raft id under the index-based bootstrap mapping).
+    DuplicateClusterMember { value: NodeId },
     /// `node_id` is not a member of `initial_cluster`.
     NodeNotInCluster { node: NodeId },
-    /// An address field was not a valid `host:port`.
+    /// An address field was not a valid `IP:port` (only IP literals parse).
     BadAddress { field: &'static str, value: String },
 }
 
@@ -91,12 +99,18 @@ impl std::fmt::Display for ConfigError {
             ConfigError::EmptyField { field } => {
                 write!(f, "config field `{field}` must be non-empty")
             }
+            ConfigError::InvalidNodeId { value } => {
+                write!(f, "invalid node id: `{value}` (a node id must be a non-empty string)")
+            }
             ConfigError::EmptyCluster => write!(f, "`initial_cluster` must contain at least one node"),
+            ConfigError::DuplicateClusterMember { value } => {
+                write!(f, "`initial_cluster` lists the same node more than once: `{value}`")
+            }
             ConfigError::NodeNotInCluster { node } => {
                 write!(f, "`node_id` ({node}) must be a member of `initial_cluster`")
             }
             ConfigError::BadAddress { field, value } => {
-                write!(f, "config field `{field}` is not a valid `host:port`: {value}")
+                write!(f, "config field `{field}` is not a valid `IP:port`: {value}")
             }
         }
     }
@@ -129,7 +143,7 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
     }
 
     let node_id = NodeId::try_new(raw.node_id.clone())
-        .map_err(|_| ConfigError::EmptyField { field: "node_id" })?;
+        .map_err(|_| ConfigError::InvalidNodeId { value: raw.node_id.clone() })?;
 
     // Deterministic raft id: the node's 1-based position in `initial_cluster`
     // (propsol §5.7 bootstrap mapping — see the module docs).
@@ -146,9 +160,22 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
     let initial_cluster = raw
         .initial_cluster
         .iter()
-        .map(NodeId::try_new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ConfigError::EmptyField { field: "initial_cluster" })?;
+        .map(|id| {
+            NodeId::try_new(id.clone())
+                .map_err(|_| ConfigError::InvalidNodeId { value: id.clone() })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Reject duplicate members: two entries for the same node would collide on
+    // the same raft id under the index-based bootstrap mapping.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for id in &initial_cluster {
+            if !seen.insert(id.clone()) {
+                return Err(ConfigError::DuplicateClusterMember { value: id.clone() });
+            }
+        }
+    }
 
     Ok(Config {
         cluster_id: raw.cluster_id,
@@ -242,6 +269,28 @@ mod tests {
         let err = parse_config(&toml).expect_err("bad listen address must fail");
         assert!(
             matches!(err, ConfigError::BadAddress { .. }),
+            "error: {err}"
+        );
+        // Only IP literals parse, so the message says IP:port (not host:port).
+        assert!(err.to_string().contains("IP:port"), "error: {err}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_cluster_member() {
+        let toml = VALID.replace("initial_cluster = [\"n1\"]", "initial_cluster = [\"n1\", \"n1\"]");
+        let err = parse_config(&toml).expect_err("duplicate member must fail");
+        assert!(
+            matches!(err, ConfigError::DuplicateClusterMember { .. }),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_cluster_member_id() {
+        let toml = VALID.replace("initial_cluster = [\"n1\"]", "initial_cluster = [\"n1\", \"\"]");
+        let err = parse_config(&toml).expect_err("empty member id must fail");
+        assert!(
+            matches!(err, ConfigError::InvalidNodeId { .. }),
             "error: {err}"
         );
     }

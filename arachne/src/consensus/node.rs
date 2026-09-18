@@ -77,6 +77,11 @@ where
     /// Raft id → transport `NodeId` for outbound resolution. Peers not present
     /// here are not yet part of this node's membership and are skipped.
     peers: HashMap<RaftId, NodeId>,
+    /// Outbound raft messages dropped because their transport `send` failed.
+    /// A failed send is non-fatal (raft retransmits on a later tick), so it is
+    /// counted — not surfaced — making a permanently dead transport visible as
+    /// a rising gauge instead of a silent liveness loss (P4 gate, propsol §8).
+    dropped_sends: u64,
 }
 
 impl<S, T, Tr> RaftNode<S, T, Tr>
@@ -141,6 +146,7 @@ where
             transport,
             rx,
             peers,
+            dropped_sends: 0,
         })
     }
 
@@ -162,10 +168,11 @@ where
     /// raft retransmits on a later tick. Aborting the `Ready` cycle on a send
     /// failure would let one unreachable peer stall this node's persistence
     /// pipeline, which is exactly the failure mode raft is designed to absorb.
-    /// (`NodeError::Transport` remains for callers that send explicitly.) A
-    /// dropped send is therefore invisible: add a dropped-message counter/metric
-    /// at P5 (§8), since a permanently dead transport degrades to silent
-    /// liveness loss.
+    /// (`NodeError::Transport` remains for callers that send explicitly.) Every
+    /// dropped send is counted in [`Self::dropped_send_count`] and exposed as the
+    /// `arachne_dropped_sends` metric, so a permanently dead transport degrades
+    /// to a visible, rising gauge instead of a silent liveness loss (P4 gate,
+    /// propsol §8).
     ///
     /// # Forward note (M3)
     ///
@@ -179,7 +186,6 @@ where
             return Ok(Vec::new());
         }
         let ready = self.raw.ready();
-        let self_id = self.raw.raft.id;
 
         // I1/I2: persist entries, hard state, and snapshot durably BEFORE any
         // message is sent.
@@ -189,7 +195,7 @@ where
         // replication messages, which do not depend on local durability.
         let immediate: Vec<Message> = ready.messages().to_vec();
         for msg in &immediate {
-            let _ = send_one(&self.transport, &self.peers, self_id, msg).await;
+            self.deliver(msg).await;
         }
 
         // Persisted messages must go out only after their payload is durable.
@@ -215,10 +221,10 @@ where
         let light = self.raw.advance(ready);
 
         for msg in &persisted {
-            let _ = send_one(&self.transport, &self.peers, self_id, msg).await;
+            self.deliver(msg).await;
         }
         for msg in light.messages() {
-            let _ = send_one(&self.transport, &self.peers, self_id, msg).await;
+            self.deliver(msg).await;
         }
 
         // Committed entries for the state machine: the union of the entries that
@@ -278,6 +284,14 @@ where
         self.raw.raft.raft_log.applied
     }
 
+    /// The number of outbound raft messages dropped because their transport
+    /// `send` failed (see the `step` docs). A dead transport shows up here as a
+    /// rising count rather than a silent liveness loss; the node runtime
+    /// exposes it as the `arachne_dropped_sends` metric.
+    pub fn dropped_send_count(&self) -> u64 {
+        self.dropped_sends
+    }
+
     /// The current **in-memory** hard state (term, vote, commit).
     ///
     /// The `commit` watermark here is raft's current view and may run ahead of
@@ -332,6 +346,21 @@ where
         }
 
         Ok(())
+    }
+
+    /// Deliver one raft message, counting any failure in `dropped_sends`.
+    ///
+    /// A failed send is non-fatal — raft retransmits on a later tick — so the
+    /// error is dropped after being counted (P4 gate: a permanently dead
+    /// transport degrades to a visible counter instead of a silent liveness
+    /// loss). This is a `&mut self` method so the counting write and the
+    /// `send_one` borrows of `self.transport`/`self.peers` never overlap.
+    async fn deliver(&mut self, msg: &Message) {
+        let self_id = self.raw.raft.id;
+        let outcome = send_one(&self.transport, &self.peers, self_id, msg).await;
+        if outcome.is_err() {
+            self.dropped_sends += 1;
+        }
     }
 
 }
@@ -633,5 +662,36 @@ mod tests {
         let hs = node.hard_state();
         assert_eq!(hs.vote, Some(1), "the single node votes for itself");
         assert!(hs.term >= 1);
+    }
+
+    #[test]
+    fn dropped_send_counter_increments_when_a_send_fails() {
+        // A two-voter cluster where the peer (raft id 2) is mapped to a NodeId
+        // that is NOT registered with the transport switch, so every send to it
+        // fails (`UnknownPeer`). The node keeps trying to reach that peer
+        // (election / replication messages), so the dropped-send counter must
+        // rise.
+        let factory = InMemoryTransportFactory::new();
+        let (tx, rx) = factory.create(NodeId::from("node-1"));
+        let mut peers = HashMap::new();
+        peers.insert(2u64, NodeId::from("ghost"));
+        let node = RaftNode::new(1, peers, MemStore::new(), tx, rx, 0, &logger())
+            .expect("two-voter node must construct");
+
+        let mut node = node;
+        let mut dropped = 0u64;
+        for _ in 0..200 {
+            node.tick();
+            let _entries = block_on(node.step()).expect("drive cycle must succeed");
+            node.advance_apply();
+            dropped = node.dropped_send_count();
+            if dropped > 0 {
+                break;
+            }
+        }
+        assert!(
+            dropped > 0,
+            "a failed send to the unknown peer must be counted; got {dropped}"
+        );
     }
 }
