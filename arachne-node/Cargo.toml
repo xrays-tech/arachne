@@ -1,14 +1,28 @@
 [package]
 name = "arachne-node"
-description = "Arachne node binary (scaffold: prints version + transport; no consensus/storage yet)"
+description = "Arachne node binary: a runnable single-node Arachne process (WAL + raft + KV state machine + /readyz + /metrics)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Depends only on the core. The workspace default for `arachne` is the LEAN
-# core (`default-features = false`), so this binary opts in explicitly to the
-# tonic transport with `features = ["transport-tonic"]`. The transport is
-# surfaced through `arachne`'s re-export of `transport_name`.
-arachne = { workspace = true, features = ["transport-tonic"] }
+# The LEAN core (no transport). M0 runs the node over a local, no-peer
+# placeholder transport (see `src/transport.rs`); the real tonic transport
+# lands at M1. The workspace default for `arachne` is lean, so no feature is
+# needed here. (Gate A is unaffected: no test/sim scaffolding is pulled in.)
+arachne = { workspace = true }
+# Async runtime: drives the raft Ready loop, the tick interval, and signals.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# Config parsing (TOML).
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+# The `RaftNode` takes a `&slog::Logger`; M0 uses a no-op sink (see
+# `build_logger`). Structured terminal logging lands at M1.
+slog = "2"
+
+[dev-dependencies]
+# The integration tests (tests/) drive the async `RaftNode` directly, so they
+# need a tokio runtime. `arachne` stays lean (no transport) in the test build;
+# this is a dev-only dependency (Gate A checks the normal tree with `-e normal`).
+tokio = { version = "1", features = ["rt", "macros"] }
