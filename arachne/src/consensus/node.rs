@@ -162,7 +162,18 @@ where
     /// raft retransmits on a later tick. Aborting the `Ready` cycle on a send
     /// failure would let one unreachable peer stall this node's persistence
     /// pipeline, which is exactly the failure mode raft is designed to absorb.
-    /// (`NodeError::Transport` remains for callers that send explicitly.)
+    /// (`NodeError::Transport` remains for callers that send explicitly.) A
+    /// dropped send is therefore invisible: add a dropped-message counter/metric
+    /// at P5 (§8), since a permanently dead transport degrades to silent
+    /// liveness loss.
+    ///
+    /// # Forward note (M3)
+    ///
+    /// Committed entries are returned as `(index, data)`; the raft `EntryType`
+    /// is dropped for now. When ConfChange is introduced (`propose_conf_change`),
+    /// ConfChange entries must be routed to the raft membership machinery and
+    /// **must not** be fed to the KV state machine (which would reject them as
+    /// malformed).
     pub async fn step(&mut self) -> Result<Vec<(LogIndex, Vec<u8>)>, NodeError<T>> {
         if !self.raw.has_ready() {
             return Ok(Vec::new());
@@ -267,7 +278,12 @@ where
         self.raw.raft.raft_log.applied
     }
 
-    /// The current durable hard state (term, vote, commit).
+    /// The current **in-memory** hard state (term, vote, commit).
+    ///
+    /// The `commit` watermark here is raft's current view and may run ahead of
+    /// what is durable on disk between `Ready` cycles (raft re-derives commit on
+    /// restart — see the M0 ① notes). For the durable commit watermark, read the
+    /// WAL (`Storage::initial_state`).
     pub fn hard_state(&self) -> SeamHardState {
         RaftStorage::<S>::to_seam_hard_state(&self.raw.raft.hard_state())
     }

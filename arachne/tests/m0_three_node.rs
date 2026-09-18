@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arachne::consensus::RaftNode;
 use arachne::state_machine::KvStateMachine;
 use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{LogEntry, NodeId, RaftId, StateMachine, Storage, TransportFactory};
+use arachne::{
+    LogEntry, NodeId, RaftId, StateMachine, Storage, TransportFactory, TransportMessage,
+};
 use arachne_testsupport::{block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx};
 use slog::{o, Drain, Logger};
 
@@ -160,8 +162,6 @@ impl Cluster {
         })
     }
 }
-
-use arachne::TransportMessage;
 
 #[test]
 fn three_node_cluster_survives_leader_kill() {

@@ -39,6 +39,9 @@ jobs:
         run: cargo build --workspace
 
       - name: Test workspace
+        # The double-run determinism gate (m0_determinism.rs: two runs of the
+        # same fixed scenario must be byte-identical) is part of this PR gate,
+        # run here via `cargo test --workspace`.
         run: cargo test --workspace
 
       - name: Build lean core (no default features)

@@ -44,7 +44,13 @@ pub struct RaftStorage<S: SeamStorage> {
 }
 
 impl<S: SeamStorage> RaftStorage<S> {
-    /// Wrap a seam storage in a raft-compatible adapter.
+    /// Wrap a seam storage in a raft-compatible adapter with an **empty**
+    /// bootstrap voter set.
+    ///
+    /// A store built this way reports no voters until the durable `ConfState`
+    /// carries one, so a node with no persisted membership can never elect
+    /// itself. Use [`RaftStorage::with_conf_state`] to bootstrap a cluster;
+    /// this constructor is a convenience for unit tests of the adapter.
     pub fn new(inner: S) -> Self {
         Self {
             inner,

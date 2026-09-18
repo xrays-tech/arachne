@@ -1,6 +1,6 @@
 [package]
 name = "arachne"
-description = "Arachne: transport-agnostic product core (no consensus/storage/networking yet)"
+description = "Arachne: transport-agnostic product core (consensus, WAL storage, KV state machine)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -37,9 +37,6 @@ arachne-transport-tonic = { workspace = true, optional = true }
 # scripts/check-deps.sh Gate A: production crates may only pull in
 # arachne-testsupport via [dev-dependencies]).
 arachne-testsupport = { workspace = true }
-# `slog` is a normal dependency of `arachne`, but integration tests (tests/)
-# are separate crates that cannot use the main crate's normal dependencies.
-# `RaftNode::new` takes a `&slog::Logger`, so the M0 kill-recovery integration
-# test needs `slog` to build a logger. Dev-only: this does not change the
-# production dependency tree (Gate A checks `-e normal`).
-slog = "2"
+# NOTE: integration tests (`tests/`) are part of this package and can therefore
+# use the normal `[dependencies]` directly (`slog`, `raft`, ...). No extra
+# dev-dependency entries are needed for those.
