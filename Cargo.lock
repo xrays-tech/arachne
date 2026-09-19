@@ -46,6 +46,7 @@ name = "arachne-node"
 version = "0.1.0"
 dependencies = [
  "arachne",
+ "arachne-transport-tonic",
  "serde",
  "slog",
  "tokio",

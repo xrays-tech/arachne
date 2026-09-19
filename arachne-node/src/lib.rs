@@ -4,23 +4,23 @@
 //! the binary (and the integration tests) compose:
 //!
 //! * [`config`] — TOML config parsing and validation.
-//! * [`transport`] — a no-peer placeholder transport (M0); replaced by the
-//!   tonic transport at M1.
 //! * [`metrics`] — a lock-free, thread-safe metrics registry.
-//! * [`http`] — a minimal, dependency-free HTTP server for `/readyz` and
-//!   `/metrics`.
-//! * [`node`] — assembly of a single-node Arachne node (WAL + state machine +
-//!   `RaftNode`).
+//! * [`http`] — a minimal, dependency-free HTTP server for `/readyz`,
+//!   `/metrics`, and the KV read/write endpoints.
+//! * [`node`] — assembly of an Arachne node (WAL + state machine + `RaftNode`)
+//!   over the real tonic transport.
 //!
 //! The binary (`src/main.rs`) wires these together: it loads a TOML config,
-//! opens a real WAL, drives the raft Ready loop on a tokio runtime, serves the
-//! HTTP endpoints, and shuts down gracefully on SIGINT/SIGTERM.
+//! opens a real WAL, binds this process's tonic listener, drives the raft
+//! Ready loop on a tokio runtime, serves the HTTP endpoints, and shuts down
+//! gracefully on SIGINT/SIGTERM.
 //!
-//! M0 runs over the local placeholder transport (no peers); the real tonic
-//! transport lands at M1.
+//! M1: the node runs over the real tonic transport (`arachne-transport-tonic`),
+//! so each process can join a multi-process cluster — binding only its own
+//! `listen` address and reaching peers through the shared `NodeId ->
+//! SocketAddr` map.
 
 pub mod config;
 pub mod http;
 pub mod metrics;
 pub mod node;
-pub mod transport;

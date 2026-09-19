@@ -25,7 +25,7 @@ async fn node_serves_writes_after_election() {
     let toml = format!(
         "cluster_id = \"smoke\"\n\
          node_id = \"n1\"\n\
-         listen = \"127.0.0.1:7000\"\n\
+          listen = \"127.0.0.1:0\"\n\
          data_dir = \"{dir}\"\n\
          http_listen = \"127.0.0.1:0\"\n\
          initial_cluster = [\"n1\"]\n\

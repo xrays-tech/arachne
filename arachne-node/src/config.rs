@@ -16,12 +16,34 @@
 //!
 //! # Raft id mapping
 //!
-//! `node_id` is mapped to its raft [`RaftId`] as its 1-based position in
+//! `node_id` is mapped to its raft id as its 1-based position in
 //! `initial_cluster`. This is a *bootstrap* mapping (propsol §5.7): the
 //! persisted `String` ↔ `u64` mapping is a P4-flagged open item, so the index
-//! order of `initial_cluster` is the single source of truth here. M0 uses a
-//! single-node cluster, so the mapping is `n1 → 1`.
+//! order of `initial_cluster` is the single source of truth here. The position
+//! matches on the node id — the part of the entry before any `=` — so an entry
+//! with an inline address (`"n1=127.0.0.1:7000"`) maps to the same id as a
+//! bare `"n1"`. M0 uses a single-node cluster, so the mapping is `n1 → 1`.
+//!
+//! # Cluster addresses
+//!
+//! Each `initial_cluster` entry is either a bare `"<node_id>"` or
+//! `"<node_id>=<ip:port>"`. The bare form is sufficient for the node itself;
+//! every *other* member must carry an explicit `id=addr` so that it is
+//! reachable.
+//!
+//! The parsed `Config` exposes `addresses: HashMap<NodeId, SocketAddr>`, which
+//! maps **every** member to its listen address under this invariant:
+//!
+//! * The self entry is **always** `listen`. If the self entry carries an
+//!   inline address, it must equal `listen`, else `SelfAddressMismatch`.
+//! * Every non-self member **requires** an inline address, else
+//!   `MissingMemberAddress`.
+//!
+//! A single-node cluster (`initial_cluster = ["n1"]`) therefore stays valid
+//! with no inline address (the l4/ scripts rely on this), while a multi-node
+//! cluster must spell out each peer's address.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -47,6 +69,13 @@ pub struct Config {
     pub http_listen: SocketAddr,
     /// The bootstrap cluster membership (this node must be a member).
     pub initial_cluster: Vec<NodeId>,
+    /// Every cluster member mapped to its listen address. The self entry is
+    /// always `listen`; every other member carries the address declared in
+    /// `initial_cluster` (see the module docs' "Cluster addresses"). A peer's
+    /// inline address must be a concrete `ip:port` (a usable dial target): the
+    /// self entry may be `:0` (its real bound port is learned at bind), but a
+    /// peer `:0` would be a useless dial target.
+    pub addresses: HashMap<NodeId, SocketAddr>,
     /// The selected propsol §7 preset (`lan` / `wan`).
     pub profile: Profile,
     /// The full, validated tuning table (profile + overrides).
@@ -106,6 +135,15 @@ pub enum ConfigError {
     NodeNotInCluster { node: NodeId },
     /// An address field was not a valid `IP:port` (only IP literals parse).
     BadAddress { field: &'static str, value: String },
+    /// An `initial_cluster` entry had an inline `id=addr` whose address part
+    /// was not a valid `IP:port` (only IP literals parse).
+    BadClusterAddress { value: String },
+    /// A non-self cluster member had no inline `id=addr`; every member other
+    /// than this node must be reachable, so each requires an explicit address.
+    MissingMemberAddress { node: NodeId },
+    /// The self entry in `initial_cluster` carried an inline address that did
+    /// not equal `listen` (the self address is always `listen`).
+    SelfAddressMismatch { listen: SocketAddr, configured: SocketAddr },
     /// The `profile` field was not `lan` or `wan`.
     UnknownProfile { value: String },
     /// A profile field (or a profile + override combination) failed validation.
@@ -131,6 +169,18 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::BadAddress { field, value } => {
                 write!(f, "config field `{field}` is not a valid `IP:port`: {value}")
+            }
+            ConfigError::BadClusterAddress { value } => {
+                write!(f, "`initial_cluster` entry has a bad `IP:port` address: `{value}`")
+            }
+            ConfigError::MissingMemberAddress { node } => {
+                write!(f, "cluster member `{node}` has no address (a non-self member must be `id=addr`)")
+            }
+            ConfigError::SelfAddressMismatch { listen, configured } => {
+                write!(
+                    f,
+                    "self address `{configured}` in `initial_cluster` must equal `listen` (`{listen}`)"
+                )
             }
             ConfigError::UnknownProfile { value } => {
                 write!(f, "unknown profile `{value}` (expected `lan` or `wan`)")
@@ -169,35 +219,56 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
     let node_id = NodeId::try_new(raw.node_id.clone())
         .map_err(|_| ConfigError::InvalidNodeId { value: raw.node_id.clone() })?;
 
-    // Deterministic raft id: the node's 1-based position in `initial_cluster`
-    // (propsol §5.7 bootstrap mapping — see the module docs).
-    let raft_id = raw
-        .initial_cluster
-        .iter()
-        .position(|id| id == &raw.node_id)
-        .map(|i| (i + 1) as u64)
-        .ok_or_else(|| ConfigError::NodeNotInCluster { node: node_id.clone() })?;
-
     let listen = parse_addr("listen", &raw.listen)?;
     let http_listen = parse_addr("http_listen", &raw.http_listen)?;
 
-    let initial_cluster = raw
+    // Parse each `initial_cluster` entry into `(node_id, optional inline
+    // address)`. An entry is either `"<node_id>"` or `"<node_id>=<ip:port>"`.
+    let members: Vec<(NodeId, Option<SocketAddr>)> = raw
         .initial_cluster
         .iter()
-        .map(|id| {
-            NodeId::try_new(id.clone())
-                .map_err(|_| ConfigError::InvalidNodeId { value: id.clone() })
-        })
+        .map(|entry| parse_cluster_entry(entry))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Deterministic raft id: the node's 1-based position in `initial_cluster`
+    // (propsol §5.7 bootstrap mapping — see the module docs). The position
+    // matches on the node id, so an inline address does not shift it.
+    let raft_id = members
+        .iter()
+        .position(|(id, _)| id == &node_id)
+        .map(|i| (i + 1) as u64)
+        .ok_or_else(|| ConfigError::NodeNotInCluster { node: node_id.clone() })?;
 
     // Reject duplicate members: two entries for the same node would collide on
     // the same raft id under the index-based bootstrap mapping.
     {
         let mut seen = std::collections::HashSet::new();
-        for id in &initial_cluster {
+        for (id, _) in &members {
             if !seen.insert(id.clone()) {
                 return Err(ConfigError::DuplicateClusterMember { value: id.clone() });
             }
+        }
+    }
+
+    // Build the member → address map (the invariant described in the module
+    // docs). The self entry is always `listen`; every other member requires an
+    // explicit inline address so that it is reachable.
+    let mut addresses: HashMap<NodeId, SocketAddr> = HashMap::new();
+    for (id, addr) in &members {
+        if id == &node_id {
+            if let Some(configured) = addr {
+                if *configured != listen {
+                    return Err(ConfigError::SelfAddressMismatch {
+                        listen,
+                        configured: *configured,
+                    });
+                }
+            }
+            addresses.insert(id.clone(), listen);
+        } else {
+            let configured =
+                addr.ok_or_else(|| ConfigError::MissingMemberAddress { node: id.clone() })?;
+            addresses.insert(id.clone(), configured);
         }
     }
 
@@ -219,6 +290,8 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
         .validate()
         .map_err(|e| ConfigError::ProfileInvalid { message: e.to_string() })?;
 
+    let initial_cluster: Vec<NodeId> = members.iter().map(|(id, _)| id.clone()).collect();
+
     Ok(Config {
         cluster_id: raw.cluster_id,
         node_id,
@@ -227,11 +300,36 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
         data_dir: PathBuf::from(raw.data_dir),
         http_listen,
         initial_cluster,
+        addresses,
         profile,
         heartbeat_interval_ms: profile_config.heartbeat_interval_ms,
         election_timeout_ms: profile_config.election_timeout_ms,
         profile_config,
     })
+}
+
+/// Parse a single `initial_cluster` entry into `(node_id, optional address)`.
+///
+/// An entry is either a bare `"<node_id>"` (no inline address) or
+/// `"<node_id>=<ip:port>"`. The entry is split on the first `=`; the node id
+/// (before it) is validated with [`NodeId::try_new`] and the address part (if
+/// present) must parse as an IP-literal `IP:port`.
+fn parse_cluster_entry(entry: &str) -> Result<(NodeId, Option<SocketAddr>), ConfigError> {
+    match entry.split_once('=') {
+        None => {
+            let id = NodeId::try_new(entry.to_string())
+                .map_err(|_| ConfigError::InvalidNodeId { value: entry.to_string() })?;
+            Ok((id, None))
+        }
+        Some((id_part, addr_part)) => {
+            let id = NodeId::try_new(id_part.to_string())
+                .map_err(|_| ConfigError::InvalidNodeId { value: id_part.to_string() })?;
+            let addr = addr_part
+                .parse::<SocketAddr>()
+                .map_err(|_| ConfigError::BadClusterAddress { value: entry.to_string() })?;
+            Ok((id, Some(addr)))
+        }
+    }
 }
 
 fn parse_addr(field: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
@@ -263,6 +361,12 @@ mod tests {
         assert_eq!(config.listen, "127.0.0.1:7000".parse().expect("addr"));
         assert_eq!(config.http_listen, "127.0.0.1:8000".parse().expect("addr"));
         assert_eq!(config.initial_cluster.len(), 1);
+        // The single-node cluster maps to exactly {n1: listen}.
+        assert_eq!(config.addresses.len(), 1);
+        assert_eq!(
+            config.addresses[&NodeId::new("n1")],
+            "127.0.0.1:7000".parse().expect("addr")
+        );
         // No `profile` key defaults to `lan`; the effective tick timings are
         // the Lan preset values (propsol §7).
         assert_eq!(config.profile, Profile::Lan);
@@ -283,9 +387,67 @@ mod tests {
 
     #[test]
     fn maps_node_id_to_its_cluster_index() {
-        let toml = VALID.replace("initial_cluster = [\"n1\"]", "initial_cluster = [\"a\", \"n1\", \"c\"]");
+        let toml = VALID
+            .replace(
+                "initial_cluster = [\"n1\"]",
+                "initial_cluster = [\"a=127.0.0.1:7001\", \"n1=127.0.0.1:7002\", \"c=127.0.0.1:7003\"]",
+            )
+            .replace("listen = \"127.0.0.1:7000\"", "listen = \"127.0.0.1:7002\"");
         let config = parse_config(&toml).expect("config");
         assert_eq!(config.raft_id, 2, "n1 is the second (1-based) member");
+        // The self entry (n1) uses `listen` (7002); every peer carries its
+        // declared address.
+        assert_eq!(config.addresses.len(), 3);
+        assert_eq!(
+            config.addresses[&NodeId::new("a")],
+            "127.0.0.1:7001".parse().expect("addr")
+        );
+        assert_eq!(
+            config.addresses[&NodeId::new("n1")],
+            "127.0.0.1:7002".parse().expect("addr")
+        );
+        assert_eq!(
+            config.addresses[&NodeId::new("c")],
+            "127.0.0.1:7003".parse().expect("addr")
+        );
+    }
+
+    #[test]
+    fn parses_a_multi_node_cluster_with_addresses() {
+        let toml = r#"
+            cluster_id = "demo"
+            node_id = "n1"
+            listen = "127.0.0.1:7000"
+            data_dir = "/var/lib/arachne"
+            http_listen = "127.0.0.1:8000"
+            initial_cluster = ["n1=127.0.0.1:7000", "n2=127.0.0.1:7001", "n3=127.0.0.1:7002"]
+        "#;
+        let config = parse_config(toml).expect("multi-node config");
+        assert_eq!(config.raft_id, 1);
+        assert_eq!(config.initial_cluster.len(), 3);
+        assert_eq!(config.addresses.len(), 3);
+        assert_eq!(
+            config.addresses[&NodeId::new("n1")],
+            "127.0.0.1:7000".parse().expect("addr")
+        );
+        assert_eq!(
+            config.addresses[&NodeId::new("n2")],
+            "127.0.0.1:7001".parse().expect("addr")
+        );
+        assert_eq!(
+            config.addresses[&NodeId::new("n3")],
+            "127.0.0.1:7002".parse().expect("addr")
+        );
+    }
+
+    #[test]
+    fn single_node_without_address_is_valid() {
+        // A bare self entry (no `id=addr`) is valid: the self address is
+        // always `listen`, so no inline address is required for a single node.
+        let config = parse_config(VALID).expect("single node, no address");
+        assert_eq!(config.initial_cluster.len(), 1);
+        assert_eq!(config.addresses.len(), 1);
+        assert_eq!(config.addresses[&config.node_id], config.listen);
     }
 
     #[test]
@@ -342,6 +504,47 @@ mod tests {
             matches!(err, ConfigError::InvalidNodeId { .. }),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_a_missing_peer_address() {
+        let toml = VALID.replace(
+            "initial_cluster = [\"n1\"]",
+            "initial_cluster = [\"n1\", \"n2\"]",
+        );
+        let err = parse_config(&toml).expect_err("a peer without an address must fail");
+        assert!(
+            matches!(err, ConfigError::MissingMemberAddress { .. }),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_self_address_mismatching_listen() {
+        let toml = VALID.replace(
+            "initial_cluster = [\"n1\"]",
+            "initial_cluster = [\"n1=127.0.0.1:9999\"]",
+        );
+        let err = parse_config(&toml).expect_err("self address != listen must fail");
+        assert!(
+            matches!(err, ConfigError::SelfAddressMismatch { .. }),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_bad_cluster_address() {
+        let toml = VALID.replace(
+            "initial_cluster = [\"n1\"]",
+            "initial_cluster = [\"n1\", \"n2=not-an-addr\"]",
+        );
+        let err = parse_config(&toml).expect_err("a bad cluster address must fail");
+        assert!(
+            matches!(err, ConfigError::BadClusterAddress { .. }),
+            "error: {err}"
+        );
+        // Only IP literals parse, so the message says IP:port (not host:port).
+        assert!(err.to_string().contains("IP:port"), "error: {err}");
     }
 
     #[test]

@@ -5,8 +5,13 @@
 //! a client [`Handle`]. All consensus/storage logic lives in the `arachne` lib,
 //! so the process under test is the shipped path.
 //!
-//! M1-3a runs the single-node placeholder transport (no peers). The tonic
-//! transport is wired for real clustering in a later increment.
+//! M1: the node runs over the **real tonic transport**. One
+//! [`TonicTransportFactory`] owns the cluster identity (cluster id, protocol
+//! version) and the shared `NodeId -> SocketAddr` map; `open` binds **only this
+//! process's own** listener ([`TonicTransportFactory::start_with_bind`]) and
+//! mints this node's `(Tx, Rx)` halves. Each process therefore binds a single
+//! port and reaches its peers through the shared address map — which is what
+//! lets several processes form a real cluster.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,14 +20,26 @@ use arachne::client::Handle;
 use arachne::consensus::RaftNodeConfig;
 use arachne::runtime::{Runtime, RuntimeConfig};
 use arachne::storage::{WalConfig, WalOptions, WalStorage};
-use arachne::{Metrics, StorageError};
+use arachne::{Metrics, RaftId, StorageError, TransportFactory};
+use arachne_transport_tonic::{TonicRx, TonicTransport, TonicTransportFactory, TransportError};
 use slog::Logger;
 
 use crate::config::Config;
-use crate::transport::{PlaceholderRx, PlaceholderTx};
 
-/// The node runtime type for the placeholder (no-peer) transport.
-pub type NodeRuntime = Runtime<PlaceholderTx, PlaceholderRx>;
+/// The node runtime type for the real tonic transport.
+pub type NodeRuntime = Runtime<TonicTransport, TonicRx>;
+
+/// Wire-protocol major version this node speaks in the transport handshake.
+///
+/// A peer whose major differs is rejected (propsol §5.6). Kept in sync with the
+/// `arachne-transport-tonic` factory defaults so a same-cluster handshake always
+/// matches.
+const PROTOCOL_MAJOR: u32 = 1;
+/// Wire-protocol minor version this node speaks in the transport handshake.
+///
+/// A peer whose minor is *newer* than ours is rejected; equal or older is
+/// accepted. `0` is the first (and current) revision of the M1 wire protocol.
+const PROTOCOL_MINOR: u32 = 0;
 
 /// Errors from assembling the node.
 #[derive(Debug)]
@@ -31,6 +48,9 @@ pub enum NodeError {
     Storage(StorageError),
     /// A runtime-assembly failure.
     Runtime(String),
+    /// A transport failure (a `listen` bind failure, an invalid cluster
+    /// configuration, …) raised while setting up the tonic transport.
+    Transport(TransportError),
 }
 
 impl std::fmt::Display for NodeError {
@@ -38,6 +58,7 @@ impl std::fmt::Display for NodeError {
         match self {
             NodeError::Storage(e) => write!(f, "storage error: {e}"),
             NodeError::Runtime(e) => write!(f, "runtime error: {e}"),
+            NodeError::Transport(e) => write!(f, "transport error: {e}"),
         }
     }
 }
@@ -50,18 +71,31 @@ impl From<StorageError> for NodeError {
     }
 }
 
+impl From<TransportError> for NodeError {
+    fn from(e: TransportError) -> Self {
+        NodeError::Transport(e)
+    }
+}
+
 /// A running Arachne node.
 pub struct Arachne {
+    /// The tonic transport factory; [`Arachne::shutdown`] stops its server and
+    /// closes the inbound channels before the runtime actor is aborted.
+    factory: TonicTransportFactory,
     task: tokio::task::JoinHandle<()>,
     handle: Handle,
     metrics: Arc<Metrics>,
 }
 
 impl Arachne {
-    /// Open the node's WAL, assemble the lib runtime, and spawn its actor.
+    /// Open the node's WAL, bind its tonic listener, assemble the lib runtime,
+    /// and spawn its actor.
     ///
     /// Both the WAL (`fsync_policy`, `segment_bytes`) and the raft tick/flow
     /// timings are driven by the validated [`arachne::ProfileConfig`] (propsol §7).
+    /// The tonic factory binds **only** this node's `listen` address: in a
+    /// multi-process cluster a process must never bind its peers' ports, so it
+    /// calls `start_with_bind` (not `start`) for its own node id.
     pub async fn open(
         config: &Config,
         metrics: Arc<Metrics>,
@@ -82,28 +116,57 @@ impl Arachne {
             },
         )?;
 
-        // M1-3a: single node, no peers (bootstrap voters = {self}).
+        // The real tonic transport: one factory owns the cluster identity and
+        // the `NodeId -> SocketAddr` map and mints this node's halves.
+        let factory = TonicTransportFactory::new(
+            config.cluster_id.clone(),
+            PROTOCOL_MAJOR,
+            PROTOCOL_MINOR,
+            Vec::new(),
+            config.addresses.clone(),
+        );
+        // Bind ONLY this node's listener and start serving it. This node id is
+        // guaranteed to be in the factory's address map: the map holds every
+        // `initial_cluster` member, and this node is one of them.
+        factory
+            .start_with_bind(config.node_id.clone(), config.listen)
+            .await
+            .map_err(NodeError::Transport)?;
+        let (tx, rx) = factory.create(config.node_id.clone());
+
+        // Bootstrap peers: each OTHER member's raft id is its 1-based position
+        // in `initial_cluster` — the same bootstrap mapping as `self_raft_id`.
+        let mut peers = HashMap::new();
+        for (i, id) in config.initial_cluster.iter().enumerate() {
+            if *id != config.node_id {
+                peers.insert((i + 1) as RaftId, id.clone());
+            }
+        }
+
         let runtime_config = RuntimeConfig {
             self_raft_id: config.raft_id,
             self_node_id: config.node_id.clone(),
-            peers: HashMap::new(),
-            addresses: HashMap::new(),
+            peers,
+            addresses: config.addresses.clone(),
             raft: RaftNodeConfig::from_profile(profile),
             profile: profile.clone(),
             metrics: Arc::clone(&metrics),
         };
 
-        let (runtime, handle) = Runtime::new(
-            runtime_config,
-            wal,
-            PlaceholderTx,
-            PlaceholderRx,
-            logger,
-        )
-        .map_err(|e| NodeError::Runtime(e.to_string()))?;
+        // If runtime assembly fails, `start_with_bind` has already bound this
+        // node's listener: shut the factory down before returning so the gRPC
+        // server is torn down now rather than left running until process exit.
+        let (runtime, handle) = match Runtime::new(runtime_config, wal, tx, rx, logger) {
+            Ok(built) => built,
+            Err(e) => {
+                factory.shutdown().await;
+                return Err(NodeError::Runtime(e.to_string()));
+            }
+        };
 
         let task = tokio::spawn(runtime.run());
         Ok(Self {
+            factory,
             task,
             handle,
             metrics,
@@ -120,8 +183,12 @@ impl Arachne {
         Arc::clone(&self.metrics)
     }
 
-    /// Stop the runtime actor (dropping the WAL, releasing the dir lock).
+    /// Stop the node: shut the tonic factory down first (stopping the gRPC
+    /// server and closing the inbound channels, so the runtime's inbound
+    /// `recv` resolves to `None`), then abort the runtime actor (dropping the
+    /// WAL and releasing the dir lock).
     pub async fn shutdown(self) {
+        self.factory.shutdown().await;
         self.task.abort();
         let _ = self.task.await;
     }

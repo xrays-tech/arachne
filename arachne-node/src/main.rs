@@ -6,8 +6,12 @@
 //! SIGINT/SIGTERM.
 //!
 //! KV endpoints (M1 cross-process surface):
-//! * `PUT /kv/<key>/<value>` — write; `409` (with the leader hint) if this node
-//!   is not the leader, `503` if no quorum.
+//! * `PUT /kv/<key>/<value>` — write; `200` on the leader. In a multi-process
+//!   deployment a **non-leader returns `503` (quorum unavailable)**: this build
+//!   has no cross-process client redirect, so a follower write collapses to a
+//!   bounded quorum failure (it never hangs). `409` (with a leader hint) is only
+//!   produced when a peer's handle is registered in-process; cross-process
+//!   `409` + hint is deferred to task (D).
 //! * `GET /kv/<key>` — leader-local read (provisional; ReadIndex lands in M1-3b).
 //! * `GET /kv/<key>?stale=1` — stale local read (works on any node).
 //! * `DELETE /kv/<key>` — delete.

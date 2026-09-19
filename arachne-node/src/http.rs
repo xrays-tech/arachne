@@ -234,16 +234,21 @@ fn drain_request(reader: &mut impl BufRead, max: usize) -> std::io::Result<()> {
 }
 
 /// Route a parsed request line to a response.
+///
+/// `GET`, `PUT`, and `DELETE` are dispatched to the handler (the KV write/read
+/// surface uses all three). Every other method is rejected with `405 Method
+/// Not Allowed` *before* the handler runs. An empty method or path is a `400`
+/// Bad Request.
 fn dispatch_line<H: HttpHandler>(line: &str, handler: &H) -> HttpResponse {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
     if method.is_empty() || path.is_empty() {
         HttpResponse::bad_request()
-    } else if method != "GET" {
-        HttpResponse::method_not_allowed()
-    } else {
+    } else if matches!(method, "GET" | "PUT" | "DELETE") {
         handler.handle(method, path)
+    } else {
+        HttpResponse::method_not_allowed()
     }
 }
 
@@ -299,10 +304,13 @@ mod tests {
     struct TestHandler;
 
     impl HttpHandler for TestHandler {
-        fn handle(&self, _method: &str, path: &str) -> HttpResponse {
+        fn handle(&self, method: &str, path: &str) -> HttpResponse {
             match path {
                 "/readyz" => HttpResponse::text("ready\n"),
                 "/metrics" => HttpResponse::ok("text/plain; version=0.0.4", "arachne_term 1\n"),
+                // Echo the method + path so tests can prove `PUT`/`DELETE` are
+                // routed to the handler (not rejected as `405`).
+                "/kv/x" => HttpResponse::text(format!("{method} {path}\n")),
                 _ => HttpResponse::not_found(),
             }
         }
@@ -356,6 +364,33 @@ mod tests {
         // A header-less request is valid HTTP and must still be served.
         let bare = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
         assert!(bare.starts_with("HTTP/1.1 200 OK"), "got: {bare}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// `GET`, `PUT`, and `DELETE` are all routed to the handler (the KV
+    /// write/read surface uses all three); any other method is rejected with
+    /// `405` before the handler runs. This is the regression test for the bug
+    /// where `dispatch_line` rejected every non-`GET` method with `405`.
+    #[test]
+    fn put_and_delete_reach_the_handler() {
+        let (addr, shutdown, handle) = start();
+
+        let put = request(addr, "PUT /kv/x HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(put.starts_with("HTTP/1.1 200 OK"), "got: {put}");
+        assert!(put.ends_with("PUT /kv/x\n"), "got: {put}");
+
+        let delete = request(addr, "DELETE /kv/x HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(delete.starts_with("HTTP/1.1 200 OK"), "got: {delete}");
+        assert!(delete.ends_with("DELETE /kv/x\n"), "got: {delete}");
+
+        // A method the server does not serve is still rejected with 405.
+        let unknown = request(addr, "PATCH /kv/x HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            unknown.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "got: {unknown}"
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();

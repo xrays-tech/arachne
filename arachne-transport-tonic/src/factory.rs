@@ -254,7 +254,54 @@ impl TonicTransportFactory {
             }
         }
 
-        // Double-start guard: stop any servers from a previous `start()` before
+        self.start_targets(listen).await
+    }
+
+    /// Bind a single listener for `me` at `bind` and start serving it.
+    ///
+    /// This is the multi-process counterpart of [`Self::start`]: a process that
+    /// is part of a cluster should bind **only its own node**, not the whole
+    /// address map (which would `EADDRINUSE` against a peer that already holds
+    /// that port). The caller supplies the concrete `bind` address for its own
+    /// node; the real post-bind address is written back into the shared map, and
+    /// a gRPC server is spawned to feed that node's inbound channel.
+    ///
+    /// `me` must be a node this factory was constructed with (it owns a
+    /// pre-created inbound sender for exactly the nodes in its address map); any
+    /// other identity is rejected as an invalid cluster configuration.
+    pub async fn start_with_bind(&self, me: NodeId, bind: SocketAddr) -> Result<(), TransportError> {
+        // Same cluster-identity validation as `start()`.
+        if self.inner.cluster_id.is_empty() {
+            return Err(TransportError::InvalidClusterConfig {
+                reason: "cluster_id must be non-empty".to_string(),
+            });
+        }
+        if me.as_str().is_empty() {
+            return Err(TransportError::InvalidClusterConfig {
+                reason: "node id must be non-empty".to_string(),
+            });
+        }
+        // `me` must own a pre-created inbound sender; without one there is no
+        // channel the server could feed.
+        if !unlock(&self.inner.senders).contains_key(&me) {
+            return Err(TransportError::InvalidClusterConfig {
+                reason: format!("node '{}' is not part of this factory's cluster", me.as_str()),
+            });
+        }
+
+        self.start_targets(vec![(me, bind)]).await
+    }
+
+    /// Shared serve logic behind [`Self::start`] and [`Self::start_with_bind`]:
+    /// stop any previously-started servers, then bind the given
+    /// `(node, address)` targets (phase 1), record their real post-bind
+    /// addresses, and spawn a gRPC server per target (phase 2).
+    ///
+    /// Binding is done in a separate phase from starting servers, so a mid-start
+    /// bind failure never leaves a partially-started server set behind (the
+    /// already-bound listeners close on the early return — leak-free).
+    async fn start_targets(&self, targets: Vec<(NodeId, SocketAddr)>) -> Result<(), TransportError> {
+        // Double-start guard: stop any servers from a previous start before
         // binding again, so we never leak old servers or re-bind a port they
         // still hold. Awaiting the tasks also drops their inbound sender clones.
         if let Some(prev) = unlock(&self.inner.servers).take() {
@@ -270,8 +317,8 @@ impl TonicTransportFactory {
         // fails, no server has started, so there is nothing to tear down — the
         // already-bound listeners close when `listeners` is dropped on the early
         // return (a mid-start bind failure is leak-free).
-        let mut listeners = Vec::with_capacity(listen.len());
-        for (node, addr) in &listen {
+        let mut listeners = Vec::with_capacity(targets.len());
+        for (node, addr) in &targets {
             let listener = tokio::net::TcpListener::bind(*addr)
                 .await
                 .map_err(TransportError::Bind)?;

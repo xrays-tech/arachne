@@ -7,11 +7,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# The LEAN core (no transport). M0 runs the node over a local, no-peer
-# placeholder transport (see `src/transport.rs`); the real tonic transport
-# lands at M1. The workspace default for `arachne` is lean, so no feature is
-# needed here. (Gate A is unaffected: no test/sim scaffolding is pulled in.)
+# The LEAN core (no transport): the node composes the transport explicitly.
+# The workspace default for `arachne` is lean, so the core itself never links
+# tonic; the real transport is pulled in directly below. (Gate A is
+# unaffected: no test/sim scaffolding is pulled in.)
 arachne = { workspace = true }
+# The real network transport (M1): the node binds one listener per process and
+# mints its `(Tx, Rx)` halves through a `TonicTransportFactory`.
+arachne-transport-tonic = { workspace = true }
 # Async runtime: drives the raft Ready loop, the tick interval, and signals.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 # Config parsing (TOML).
