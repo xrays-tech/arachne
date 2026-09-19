@@ -2,12 +2,13 @@
 
 > 面向**新会话**。先读本文，再读 `dev-docs/propsol-v0.2.8`（设计权威）与 `dev-docs/test-plan-v0.1.3`（测试方案）。会话态进度见 `.slim/deepwork/arachne-m1.md`（git-local，但 OpenCode 可读）。
 >
-> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**271 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
+> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**275 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
 
 ## 1. 现状总览
 
 - **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
-- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）** 与 **(C) stage 1 ClientOracle + 线性化检查器（commit a915f6b）**；**未完成 (C) stage 2/3（D-S1 raft RNG 补丁 + SimNetwork/S01/S02/S16/INV）+ M1-5/(D)**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。**待办**：(C) stage 1 的 oracle 确认门禁因 oracle provider 连续失败而未跑（已记录），provider 恢复后补跑。
+- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）** 与 **(C) stage 1 ClientOracle + 线性化检查器（commit a915f6b；自证补强 395fc9a）**；**未完成 (C) stage 2/3（D-S1 raft RNG 补丁 + SimNetwork/S01/S02/S16/INV）+ M1-5/(D)**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。
+- **⚠ 已暂停（用户决定）**：(C) stage 1 的 oracle 确认门禁因 **oracle provider 持续故障（ora-1/2/4/5 连续 5 次 error，读完文件即错）** 无法运行。已按"先补强自证"补足本地证据（见 (C) 节），随后**暂停等待 provider 恢复**；恢复后第一步 = 补跑 stage 1 确认门禁，再继续 stage 2/3。
 
 ### 提交线（新 → 旧）
 ```
@@ -58,7 +59,7 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - `arachne-testsupport::oracle`：无时钟纯逻辑历史（`ValueId`/`ClientId`/`SeqNo`/`CallId` + 逻辑 ts）、`merge_retries`（记录层保留原多次调用）、检查①幻值（区间语义：Put 可解释读当且仅当 `put.invoke < get.complete`）、②one-log-id-per-seq（含 Put|Delete）、③RYW（latest-mutation-wins）、④单调读，可选⑤丢写/⑥持久性；`History::validate` 对畸形历史（complete 无 invoke／CallId 复用／同 `(client,seq)` op 不一致）**报错而非静默丢弃**；§9 JSONL。
 - `arachne-testsupport::linearizability`：实时偏序上的完备回溯搜索（Wing–Gong 等价）；**required**点（成功 op）+ **optional**点（结果未知/在途写，故 timeout-committed 竞态不再是假违规）；超 `MAX_CHECK_POINTS=12` → `Inconclusive`；witness 贪心最小化；确定性（BTree/Vec、无 HashMap 迭代）。
 - 测试：testsupport 79 项（含每检查一条坏历史元测试、贪心对抗回溯正例、**32 种子与 stateright 差分一致**——stateright 仅 dev-dependency，结构化隔离经 Gate C 验证）。
-- **门禁状态**：初次 oracle 门禁 NO-GO（B1 并发 put/读假阳性、B2 自删 RYW 假阳性、B3 timeout 写被当作未生效）已按门禁处方修复并加回归；**修复后的确认门禁 PENDING**——oracle provider 连续 3 次失败（ora-1/ora-2/ora-4 均 error），provider 恢复后补跑。stateright 交叉验证暂限"全成功"历史（未知结果写不喂 stateright，避免 pending-invocation 建模偏差）——确认门禁需评估此缺口是否可接受。
+- **门禁状态（PAUSED）**：初次 oracle 门禁 NO-GO（B1 并发 put/读假阳性、B2 自删 RYW 假阳性、B3 timeout 写被当作未生效）已按门禁处方修复并加回归；**修复后的确认门禁 PENDING / 已暂停**——oracle provider 连续 **5 次失败**（ora-1/ora-2/ora-4/ora-5 均 error，读完文件即错），故先补强本地自证（commit `395fc9a`：1000 种子多键差分对 stateright、witness 回放 500 种子模糊、optional 单调性、500 顺序历史 oracle+checker 双通过），随后按用户决定**暂停等待 provider 恢复**。恢复后第一步 = 补跑确认门禁。stateright 交叉验证暂限"全成功"历史（未知结果写不喂 stateright，避免 pending-invocation 建模偏差）——确认门禁需评估此缺口是否可接受。
 
 **stage 2（未开始）：D-S1**：`raft-0.7.0/src/raft.rs` 的 `reset_randomized_election_timeout` 用 `rand::thread_rng` 且无可注入/播种入口；root `Cargo.toml` 无 `[patch.crates-io]`。→ 打 workspace `[patch.crates-io]` 一行 RNG 注入补丁（以上游化为目标），落地双跑复现金丝雀。
 **stage 3（未开始）**：`arachne-transport-tonic` 加 I/O 接缝（注入 listener 工厂 + connector；生产用真实 tokio 实现，L2 用 turmoil 实现）→ `l2/` 铺满 SimNetwork 原语（partition/partition_oneway/repair/hold/release/set_fail_rate/crash/bounce）+ INV3/4/7/8/9 + S01/S02/S16 + 双跑复现门禁。**用户已选定：给 production transport 加 I/O 接缝**（而非独立适配 crate）。
