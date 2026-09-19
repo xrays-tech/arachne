@@ -12,7 +12,8 @@
 
 ### 提交线（新 → 旧）
 ```
-f132e44 M1-4 (C) stage 2: D-S1 可播种 raft 选举 RNG [patch.crates-io] + 双跑金丝雀     ← HEAD
+edd913d M1-4 (C) stage 3a: 可注入 transport I/O 接缝（生产默认不变）            ← HEAD
+f132e44 M1-4 (C) stage 2: D-S1 可播种 raft 选举 RNG [patch.crates-io] + 双跑金丝雀
 9bf857f docs: (C) stage 1 确认门禁 GO
 395fc9a M1-4 (C) stage 1 自证补强（1000 种子差分/witness 回放/optional 单调性）
 a915f6b M1-4 (C) stage 1: ClientOracle v1 + 自建线性化检查器
@@ -65,7 +66,9 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **门禁状态：GO（已通过）**。初次 oracle 门禁 NO-GO（B1 并发 put/读假阳性、B2 自删 RYW 假阳性、B3 timeout 写被当作未生效）已按门禁处方修复并加回归；期间 oracle provider 出过故障（模型 id `zhipuai-coding-plan/GLM-5.3-Flash` 无法解析 + 空结果），先补强本地自证（commit `395fc9a`：1000 种子多键差分对 stateright、witness 回放 500 种子模糊、optional 单调性、500 顺序历史 oracle+checker 双通过）。provider 恢复后**确认门禁经 ora-2 判 **GO****：三个 blocker 均被证明真实修复且回归测试在旧代码上会失败；S1–S5 解决；新增自证被判为实质性。**遗留 nit（L2 阶段跟进）**：(a) 差分生成器均为顺序历史，未对并发/排序搜索做 stateright 交叉验证（现靠手写并发/回溯用例覆盖）；(b) `MAX_CHECK_POINTS=12` 在对抗性全失败历史上仍有 ~12! 最坏情况——L2 接真实交错历史时需降 cap 或加 memoization。stateright 交叉验证暂限"全成功"历史（未知结果写不喂 stateright，避免 pending-invocation 建模偏差），门禁判定为**可接受的已记录缺口**。
 
 **stage 2（已完成，commit f132e44）：D-S1 可播种 raft 选举 RNG**：`arithmetic raft` 0.7.0 唯一 RNG 点（`reset_randomized_election_timeout`）原用不可播种的 `thread_rng`。已 vendor `third_party/raft/`（与 registry 仅差一个最小可上游化 hook：thread-local 可播种选举 RNG + 每节点子流 `base ^ node_id`；未设种子时行为与上游逐字节一致），root `Cargo.toml` 加 `[patch.crates-io]`，`ARACHNE-PATCH.md` 记录 diff 与「需单线程」约束；`arachne/tests/determinism_canary.rs` = 同种子双跑轨迹逐字节一致 + 不同种子→不同选举超时。**门禁 GO**；已知 nit：Cargo.lock 附带把 windows-sys 0.61.2→0.52.0（semver 合法、Windows-only）；hook 需单线程（E8），已在 PATCH.md 记录。
-**stage 3（未开始，下一步）**：`arachne-transport-tonic` 加 I/O 接缝（注入 listener 工厂 + connector；生产用真实 tokio 实现，L2 用 turmoil 实现）→ `l2/` 铺满 SimNetwork 原语（partition/partition_oneway/repair/hold/release/set_fail_rate/crash/bounce）+ INV3/4/7/8/9 + S01/S02/S16 + 双跑复现门禁。**用户已选定：给 production transport 加 I/O 接缝**（而非独立适配 crate）。
+**stage 3a（已完成，commit edd913d）：transport I/O 接缝**：`arachne-transport-tonic` 新增 `TransportIo` 接缝 + `TokioIoProvider`（真实 tokio）+ `TcpConnector`；`TonicTransportFactory`/`TonicTransport` 对 `Io = TokioIoProvider` 泛型，server 经 `io.bind`/`io.incoming`、client 经 `Endpoint::connect_with_connector`。既有 API 不变（默认类型参数保住 `arachne-node` 用法）；`hyper/hyper-util/tower(util)/http` 均经 tonic 已传递，无新包。**门禁 NO-GO→修 `TcpConnector` 丢 `TCP_NODELAY`（tonic 默认连接器会设、自定义连接器绕过）→GO**。
+**stage 3b（进行中）：真实 tonic over turmoil + SimNetwork**：`l2/` 用 `TonicTransportFactory::with_io(TurmoilIo,..)` 把生产 transport 跑在 trmoil 上；`TurmoilIo`（`turmoil::net` listener/stream + `Accepted` newtype 实现 tonic `Connected` + `TokioIo` connector）；`SimNetwork` 包装 partition/partition_oneway/repair/hold/release/crash/bounce/set_fail_rate/set_link_latency；3 节点 in-sim 真实 tonic 集群选出 leader、提交一次写并复制到全部节点 + 同种子双跑逐字节一致。（oracle P3 注：turmoil 适配层需命名 tonic/hyper 类型，故置于 dev-only 的 `l2/`，不进生产 crate。）
+**stage 3c（未开始）**：`l2/` 上铺满 SimNetwork 故障 + INV3/4/7/8/9 + 场景 S01/S02/S16 + 接入 stage 1 的 ClientOracle/线性化检查器 + 双跑复现门禁（故障调度序列/apply 哈希/预言机判定）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
 - (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
