@@ -18,6 +18,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::error::TransportError;
 use crate::factory::TransportConfig;
+use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_client::RaftTransportClient;
 use crate::proto::{Hello, RaftEnvelope};
 use crate::unlock;
@@ -32,8 +33,13 @@ type ChannelCache = HashMap<NodeId, Channel>;
 type AddressMap = Arc<RwLock<HashMap<NodeId, SocketAddr>>>;
 
 /// The outbound half for one node.
+///
+/// Generic over the I/O seam `Io` (default [`TokioIoProvider`], i.e. real tokio
+/// TCP). The `connector` field is the seam's client-side dialer; in production
+/// it is [`crate::io::TcpConnector`], and in M1 stage 3b a deterministic
+/// simulator.
 #[derive(Clone)]
-pub struct TonicTransport {
+pub struct TonicTransport<Io: TransportIo = TokioIoProvider> {
     /// The full cluster `NodeId → SocketAddr` map (shared across all nodes).
     addresses: AddressMap,
     /// This node's own id; sends to it are short-circuited (never go over the
@@ -46,13 +52,17 @@ pub struct TonicTransport {
     /// Client-side transport knobs (timeouts, keep-alive, message size),
     /// resolved from the factory's config at construction.
     config: TransportConfig,
+    /// The client-side connector used to dial peers.
+    connector: <Io as TransportIo>::Connector,
 }
 
-impl TonicTransport {
-    /// Build a transport for the node `self_id`. `addresses` is the shared
-    /// cluster address map, `hello` the sender's handshake, and `config` the
-    /// resolved client-side transport knobs.
+impl<Io: TransportIo> TonicTransport<Io> {
+    /// Build a transport for the node `self_id`. `connector` is the client-side
+    /// I/O connector (from the factory's seam), `addresses` the shared cluster
+    /// address map, `hello` the sender's handshake, and `config` the resolved
+    /// client-side transport knobs.
     pub(crate) fn new(
+        connector: <Io as TransportIo>::Connector,
         addresses: AddressMap,
         self_id: NodeId,
         hello: Hello,
@@ -64,11 +74,12 @@ impl TonicTransport {
             hello,
             channels: Arc::new(Mutex::new(HashMap::new())),
             config,
+            connector,
         }
     }
 }
 
-impl Transport for TonicTransport {
+impl<Io: TransportIo> Transport for TonicTransport<Io> {
     type Error = TransportError;
 
     async fn send(&self, to: NodeId, msg: TransportMessage) -> Result<(), Self::Error> {
@@ -88,7 +99,8 @@ impl Transport for TonicTransport {
             return Err(TransportError::UnsupportedMessage);
         };
 
-        let channel = get_or_connect(&self.channels, &to, addr, self.config).await?;
+        let channel =
+            get_or_connect::<Io>(&self.channels, &self.connector, &to, addr, self.config).await?;
 
         let envelope = RaftEnvelope {
             payload,
@@ -125,9 +137,10 @@ impl Transport for TonicTransport {
 /// per-request timeout bounds any single `send`.
 ///
 /// The `Mutex` is only held across the synchronous map lookup/insert, never
-/// across the `connect().await`, so a slow connect cannot block other sends.
-async fn get_or_connect(
+/// across the connect `await`, so a slow connect cannot block other sends.
+async fn get_or_connect<Io: TransportIo>(
     channels: &Mutex<ChannelCache>,
+    connector: &Io::Connector,
     to: &NodeId,
     addr: SocketAddr,
     config: TransportConfig,
@@ -152,7 +165,7 @@ async fn get_or_connect(
         .keep_alive_timeout(config.keep_alive_timeout)
         .keep_alive_while_idle(true);
     let channel = endpoint
-        .connect()
+        .connect_with_connector(connector.clone())
         .await
         .map_err(|e| TransportError::Send(tonic::Status::unavailable(e.to_string())))?;
 

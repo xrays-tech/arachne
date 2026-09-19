@@ -29,6 +29,15 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "1"
+# The I/O seam (`src/io.rs`). These are all already in the dependency tree via
+# tonic; declaring them directly lets the seam name the exact types it builds
+# on (the `Service` connector for `connect_with_connector`, hyper's async I/O
+# bounds, and the HTTP types). `tower` must be 0.4 (the version tonic uses),
+# NOT 0.5.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.4", features = ["util"] }
+http = "1"
 
 [build-dependencies]
 # Codegen for the wire protocol (`proto/raft.proto`).

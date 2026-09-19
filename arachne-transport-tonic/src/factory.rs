@@ -32,12 +32,12 @@ use std::time::Duration;
 use arachne_seam::seam::{TransportFactory, TransportMessage};
 use arachne_seam::types::NodeId;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 use crate::error::TransportError;
 use crate::handshake::build_hello;
+use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_server::RaftTransportServer;
 use crate::rx::TonicRx;
 use crate::server::RaftTransportService;
@@ -100,7 +100,9 @@ struct ServerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-struct FactoryInner {
+struct FactoryInner<Io: TransportIo> {
+    /// The I/O seam (real tokio TCP in production; a simulator in M1 stage 3b).
+    io: Io,
     cluster_id: String,
     protocol_major: u32,
     protocol_minor: u32,
@@ -123,20 +125,54 @@ struct FactoryInner {
 }
 
 /// Mints the tonic transport halves for the nodes of a cluster.
+///
+/// Generic over the I/O seam `Io` (default [`TokioIoProvider`], i.e. real tokio
+/// TCP). M1 stage 3b injects a deterministic simulator here; production code
+/// and the public API are unchanged because the default is `TokioIoProvider`.
 #[derive(Clone)]
-pub struct TonicTransportFactory {
-    inner: Arc<FactoryInner>,
+pub struct TonicTransportFactory<Io: TransportIo = TokioIoProvider> {
+    inner: Arc<FactoryInner<Io>>,
 }
 
-impl TonicTransportFactory {
-    /// Create a factory for a cluster.
+impl TonicTransportFactory<TokioIoProvider> {
+    /// Create a factory for a cluster using the default I/O provider
+    /// ([`TokioIoProvider`], real tokio TCP).
     ///
     /// `addresses` maps every node in the cluster to the address it should
     /// listen on (a `:0` port allocates an ephemeral one; the real address is
     /// learned at [`Self::start`]). A bounded inbound channel is pre-created for
     /// each. Transport knobs start at their documented defaults; override them
     /// with the optional setters *before* calling [`Self::start`]/[`Self::create`].
+    ///
+    /// For a custom I/O seam (e.g. a deterministic simulator) use
+    /// [`TonicTransportFactory::with_io`] instead.
     pub fn new(
+        cluster_id: impl Into<String>,
+        protocol_major: u32,
+        protocol_minor: u32,
+        feature_flags: Vec<String>,
+        addresses: HashMap<NodeId, SocketAddr>,
+    ) -> Self {
+        Self::with_io(
+            TokioIoProvider,
+            cluster_id,
+            protocol_major,
+            protocol_minor,
+            feature_flags,
+            addresses,
+        )
+    }
+}
+
+impl<Io: TransportIo> TonicTransportFactory<Io> {
+    /// Create a factory for a cluster with an explicit I/O provider.
+    ///
+    /// This is the seam-aware constructor: it takes the [`TransportIo`]
+    /// implementation (real tokio TCP or a deterministic simulator) and threads
+    /// it through to both the server listeners ([`Self::start`]) and the client
+    /// connectors (`create` → [`TonicTransport`]).
+    pub fn with_io(
+        io: Io,
         cluster_id: impl Into<String>,
         protocol_major: u32,
         protocol_minor: u32,
@@ -159,6 +195,7 @@ impl TonicTransportFactory {
 
         Self {
             inner: Arc::new(FactoryInner {
+                io,
                 cluster_id,
                 protocol_major,
                 protocol_minor,
@@ -319,10 +356,12 @@ impl TonicTransportFactory {
         // return (a mid-start bind failure is leak-free).
         let mut listeners = Vec::with_capacity(targets.len());
         for (node, addr) in &targets {
-            let listener = tokio::net::TcpListener::bind(*addr)
+            let (listener, real_addr) = self
+                .inner
+                .io
+                .bind(*addr)
                 .await
                 .map_err(TransportError::Bind)?;
-            let real_addr = listener.local_addr().map_err(TransportError::Bind)?;
             listeners.push((node.clone(), real_addr, listener));
         }
 
@@ -353,7 +392,7 @@ impl TonicTransportFactory {
                         .max_decoding_message_size(config.max_message_size)
                         .max_encoding_message_size(config.max_message_size),
                 )
-                .serve_with_incoming(TcpListenerStream::new(listener));
+                .serve_with_incoming(self.inner.io.incoming(listener));
 
             // Serve until the cancel token fires; then the server future is
             // dropped, stopping it and closing the listener.
@@ -406,8 +445,8 @@ impl TonicTransportFactory {
     }
 }
 
-impl TransportFactory for TonicTransportFactory {
-    type Tx = TonicTransport;
+impl<Io: TransportIo> TransportFactory for TonicTransportFactory<Io> {
+    type Tx = TonicTransport<Io>;
     type Rx = TonicRx;
 
     fn create(&self, me: NodeId) -> (Self::Tx, Self::Rx) {
@@ -419,7 +458,13 @@ impl TransportFactory for TonicTransportFactory {
             &self.inner.feature_flags,
         );
         let config = *unlock(&self.inner.config);
-        let tx = TonicTransport::new(Arc::clone(&self.inner.addresses), me.clone(), hello, config);
+        let tx = TonicTransport::new(
+            self.inner.io.connector(),
+            Arc::clone(&self.inner.addresses),
+            me.clone(),
+            hello,
+            config,
+        );
 
         let rx = match unlock(&self.inner.receivers).remove(&me) {
             Some(receiver) => TonicRx::new(receiver),

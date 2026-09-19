@@ -32,8 +32,9 @@ pub mod error;
 pub mod factory;
 // `handshake` and `server` are implementation details (only `factory` uses
 // them) and are deliberately crate-private so the public surface stays
-// `error` / `factory` / `rx` / `transport`.
+// `error` / `factory` / `io` / `rx` / `transport`.
 mod handshake;
+pub mod io;
 pub mod rx;
 mod server;
 pub mod transport;
@@ -47,6 +48,7 @@ pub mod proto {
 
 pub use error::TransportError;
 pub use factory::TonicTransportFactory;
+pub use io::{TokioIoProvider, TransportIo};
 pub use rx::TonicRx;
 pub use transport::TonicTransport;
 
