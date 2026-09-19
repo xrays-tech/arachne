@@ -12,7 +12,9 @@
 
 ### 提交线（新 → 旧）
 ```
-edd913d M1-4 (C) stage 3a: 可注入 transport I/O 接缝（生产默认不变）            ← HEAD
+76df587 M1-4 (C) stage 3b spike: 真实 tonic over turmoil（部分；commit 路径卡住）        ← HEAD
+377f3ce fix(runtime): actor 截止时间改用模拟 tokio::time::Instant（确定性）
+edd913d M1-4 (C) stage 3a: 可注入 transport I/O 接缝（生产默认不变）
 f132e44 M1-4 (C) stage 2: D-S1 可播种 raft 选举 RNG [patch.crates-io] + 双跑金丝雀
 9bf857f docs: (C) stage 1 确认门禁 GO
 395fc9a M1-4 (C) stage 1 自证补强（1000 种子差分/witness 回放/optional 单调性）
@@ -67,8 +69,13 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 
 **stage 2（已完成，commit f132e44）：D-S1 可播种 raft 选举 RNG**：`arithmetic raft` 0.7.0 唯一 RNG 点（`reset_randomized_election_timeout`）原用不可播种的 `thread_rng`。已 vendor `third_party/raft/`（与 registry 仅差一个最小可上游化 hook：thread-local 可播种选举 RNG + 每节点子流 `base ^ node_id`；未设种子时行为与上游逐字节一致），root `Cargo.toml` 加 `[patch.crates-io]`，`ARACHNE-PATCH.md` 记录 diff 与「需单线程」约束；`arachne/tests/determinism_canary.rs` = 同种子双跑轨迹逐字节一致 + 不同种子→不同选举超时。**门禁 GO**；已知 nit：Cargo.lock 附带把 windows-sys 0.61.2→0.52.0（semver 合法、Windows-only）；hook 需单线程（E8），已在 PATCH.md 记录。
 **stage 3a（已完成，commit edd913d）：transport I/O 接缝**：`arachne-transport-tonic` 新增 `TransportIo` 接缝 + `TokioIoProvider`（真实 tokio）+ `TcpConnector`；`TonicTransportFactory`/`TonicTransport` 对 `Io = TokioIoProvider` 泛型，server 经 `io.bind`/`io.incoming`、client 经 `Endpoint::connect_with_connector`。既有 API 不变（默认类型参数保住 `arachne-node` 用法）；`hyper/hyper-util/tower(util)/http` 均经 tonic 已传递，无新包。**门禁 NO-GO→修 `TcpConnector` 丢 `TCP_NODELAY`（tonic 默认连接器会设、自定义连接器绕过）→GO**。
-**stage 3b（进行中）：真实 tonic over turmoil + SimNetwork**：`l2/` 用 `TonicTransportFactory::with_io(TurmoilIo,..)` 把生产 transport 跑在 trmoil 上；`TurmoilIo`（`turmoil::net` listener/stream + `Accepted` newtype 实现 tonic `Connected` + `TokioIo` connector）；`SimNetwork` 包装 partition/partition_oneway/repair/hold/release/crash/bounce/set_fail_rate/set_link_latency；3 节点 in-sim 真实 tonic 集群选出 leader、提交一次写并复制到全部节点 + 同种子双跑逐字节一致。（oracle P3 注：turmoil 适配层需命名 tonic/hyper 类型，故置于 dev-only 的 `l2/`，不进生产 crate。）
-**stage 3c（未开始）**：`l2/` 上铺满 SimNetwork 故障 + INV3/4/7/8/9 + 场景 S01/S02/S16 + 接入 stage 1 的 ClientOracle/线性化检查器 + 双跑复现门禁（故障调度序列/apply 哈希/预言机判定）。
+**stage 3b（部分完成 → 记为 spike，commit 76df587）：真实 tonic over turmoil + SimNetwork**。已落地并可编译：`l2/` 的 `TurmoilIo`（`turmoil::net` listener/stream + `Accepted` newtype 实现 tonic `Connected` + `TokioIo` connector）、`SimNetwork`（partition/partition_oneway/repair/hold/release/crash/bounce/set_fail_rate/set_link_latency）、3 节点 in-sim 真实 tonic 集群；两个 `in_sim` 测试标 `#[ignore]`（原因见下）以保 `l2` suite 绿。
+- **已证明可用**：3 节点全部启动（WAL+bind+Runtime actor）；在 turmoil 承载的真实 tonic 上**成功选出 leader**；follower 学到 leader；消息双向健康（`MsgHeartbeat`/`MsgHeartbeatResponse` 双向、term 1）。
+- **卡点（未解）**：客户端 `put` 永不提交。经临时探针（已回退）诊断：transport 所有 `send` 均成功；**即使关掉 `check_quorum` 让 leader 稳定，actor 也收不到 `Command::Propose`**——actor 循环卡在 commit 路径上某个永不返回的 `await`（疑为 turmoil 下某次 `send`/`step` await 悬挂或跨 host 死锁）。相同 Runtime/RaftNode/Handle 路径在进程内内存传输下已证明可用（m0/client_runtime）。
+- **附带修复**：`Runtime` 的 propose/ReadIndex 截止时间原用 `std::time::Instant`（真实墙钟）→ 在模拟器下是确定性泄漏，已改 `tokio::time::Instant`（commit 377f3ce，root 仍 277 绿）。
+- **下一步建议（待用户决定）**：(a) 继续攻 3b：给 `TonicTransport::send`/`step` 加临时超时定位悬挂点，或做最小 tonic 双向 echo-under-turmoil 实验对照；(b) 3b 暂缓，3c 先用**内存传输**跑 INV3/4/7/8/9 + S01/S02/S16（保留 stage 3a seam，real-tonic 作为已记录 spike）。
+
+**stage 3c（未开始，依赖 3b 决策）**：`l2/` 上铺满 SimNetwork 故障 + INV3/4/7/8/9 + 场景 S01/S02/S16 + 接入 stage 1 的 ClientOracle/线性化检查器 + 双跑复现门禁（故障调度序列/apply 哈希/预言机判定）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
 - (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
