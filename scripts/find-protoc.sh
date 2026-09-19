@@ -35,6 +35,14 @@ candidates=(
   "/opt/homebrew/bin/protoc"
   "/usr/local/bin/protoc"
   "/usr/bin/protoc"
+  # Last-resort candidates: a `protoc` bundled with a PyTorch install is often
+  # 3.x even when the system `protoc` is calendar-versioned (25.x+). These are
+  # *candidates*, not requirements — on machines without them the glob simply
+  # does not match and the loop skips on. (Unmatched globs stay literal; the
+  # `[ -x ]` / `command -v` guard below filters them out.)
+  /opt/anaconda3/lib/python*/site-packages/torch/bin/protoc
+  /usr/local/lib/python*/site-packages/torch/bin/protoc
+  "$HOME"/miniconda3/lib/python*/site-packages/torch/bin/protoc
   "protoc"
 )
 
