@@ -17,6 +17,7 @@ use arachne_seam::types::NodeId;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::error::TransportError;
+use crate::factory::TransportConfig;
 use crate::proto::raft_transport_client::RaftTransportClient;
 use crate::proto::{Hello, RaftEnvelope};
 use crate::unlock;
@@ -42,17 +43,27 @@ pub struct TonicTransport {
     hello: Hello,
     /// Lazily-opened channels, one per peer.
     channels: Arc<Mutex<ChannelCache>>,
+    /// Client-side transport knobs (timeouts, keep-alive, message size),
+    /// resolved from the factory's config at construction.
+    config: TransportConfig,
 }
 
 impl TonicTransport {
     /// Build a transport for the node `self_id`. `addresses` is the shared
-    /// cluster address map and `hello` the sender's handshake.
-    pub(crate) fn new(addresses: AddressMap, self_id: NodeId, hello: Hello) -> Self {
+    /// cluster address map, `hello` the sender's handshake, and `config` the
+    /// resolved client-side transport knobs.
+    pub(crate) fn new(
+        addresses: AddressMap,
+        self_id: NodeId,
+        hello: Hello,
+        config: TransportConfig,
+    ) -> Self {
         Self {
             addresses,
             self_id,
             hello,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            config,
         }
     }
 }
@@ -77,13 +88,20 @@ impl Transport for TonicTransport {
             return Err(TransportError::UnsupportedMessage);
         };
 
-        let channel = get_or_connect(&self.channels, &to, addr).await?;
+        let channel = get_or_connect(&self.channels, &to, addr, self.config).await?;
 
         let envelope = RaftEnvelope {
             payload,
             hello: Some(self.hello.clone()),
         };
-        let mut client = RaftTransportClient::new(channel);
+        // The per-request timeout lives on the channel (see `get_or_connect`),
+        // so a hung peer cannot stall the core's `step()` — the `send` future
+        // resolves to `DeadlineExceeded`, mapped to `TransportError::Send`
+        // below. The message-size cap is set here so an oversized payload fails
+        // fast on the client too (F3).
+        let mut client = RaftTransportClient::new(channel)
+            .max_decoding_message_size(self.config.max_message_size)
+            .max_encoding_message_size(self.config.max_message_size);
         let response = client
             .send(tonic::Request::new(envelope))
             .await
@@ -101,12 +119,18 @@ impl Transport for TonicTransport {
 /// Return a channel to `to` (at `addr`), reusing a cached one or opening a new
 /// connection (and caching it) if none exists.
 ///
+/// Every channel is built with a connect timeout, a per-request timeout, and
+/// HTTP/2 keep-alive (F1): a peer that accepts the connection but then hangs
+/// must not stall the drive loop — keep-alive detects a dead connection and the
+/// per-request timeout bounds any single `send`.
+///
 /// The `Mutex` is only held across the synchronous map lookup/insert, never
 /// across the `connect().await`, so a slow connect cannot block other sends.
 async fn get_or_connect(
     channels: &Mutex<ChannelCache>,
     to: &NodeId,
     addr: SocketAddr,
+    config: TransportConfig,
 ) -> Result<Channel, TransportError> {
     {
         let cache = unlock(channels);
@@ -116,7 +140,17 @@ async fn get_or_connect(
     }
 
     let endpoint = Endpoint::from_shared(format!("http://{addr}"))
-        .map_err(|e| TransportError::Send(tonic::Status::unavailable(e.to_string())))?;
+        .map_err(|e| TransportError::Send(tonic::Status::unavailable(e.to_string())))?
+        // Bound the connect phase so a black-holed peer cannot wedge the
+        // channel cache forever.
+        .connect_timeout(config.connect_timeout)
+        // Bound every `send`; a timeout surfaces as `DeadlineExceeded`.
+        .timeout(config.request_timeout)
+        // Detect and reap dead connections: ping when idle, and give up on a
+        // connection whose last ping went unanswered.
+        .http2_keep_alive_interval(config.keep_alive_interval)
+        .keep_alive_timeout(config.keep_alive_timeout)
+        .keep_alive_while_idle(true);
     let channel = endpoint
         .connect()
         .await

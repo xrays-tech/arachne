@@ -14,6 +14,10 @@ use tonic::Status;
 pub const ERR_CLUSTER_ID_MISMATCH: &str = "cluster_id_mismatch";
 /// Stable wire code: the sender's protocol version is incompatible.
 pub const ERR_PROTOCOL_MISMATCH: &str = "protocol_mismatch";
+/// Stable wire code: the sender sent no handshake at all. This is rejected
+/// unconditionally (a `Default` handshake would otherwise be accepted by a
+/// cluster misconfigured with an empty id / major `0`).
+pub const ERR_HELLO_MISSING: &str = "missing_hello";
 
 /// Errors the tonic transport reports to the core.
 ///
@@ -53,6 +57,12 @@ pub enum TransportError {
     /// The server failed to bind its listen address.
     #[error("failed to bind listen address: {0}")]
     Bind(#[source] std::io::Error),
+
+    /// The cluster configuration is invalid (an empty `cluster_id` or an empty
+    /// node id). Reported by [`TonicTransportFactory::start`](crate::TonicTransportFactory::start)
+    /// so a misconfigured cluster fails loudly instead of serving bogus handshakes.
+    #[error("invalid cluster configuration: {reason}")]
+    InvalidClusterConfig { reason: String },
 }
 
 impl TransportError {

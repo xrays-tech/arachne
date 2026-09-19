@@ -5,5 +5,14 @@
 # calendar-versioned `25.x`/`31.x` that modern distributions ship. This points
 # `PROTOC` at `scripts/find-protoc.sh`, which resolves a usable `protoc` 3.x so
 # the whole workspace builds (see that script for details).
+#
+# `relative = true` resolves the path against THIS config file's directory
+# (the workspace root), not the build script's CWD. Without it, a registry
+# dependency's build script (which cargo runs from the dependency's own source
+# dir) would resolve `scripts/find-protoc.sh` relative to the wrong directory
+# and fail on a fresh CI checkout.
+#
+# CI requirement: a `protoc` 3.x must be available on `PATH` (or
+# `PROTOC_FALLBACK` set to one); see `scripts/find-protoc.sh`.
 [env]
-PROTOC = "scripts/find-protoc.sh"
+PROTOC = { value = "scripts/find-protoc.sh", relative = true }

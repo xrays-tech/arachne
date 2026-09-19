@@ -20,6 +20,15 @@ service RaftTransport {
 // One message in transit: the opaque raft payload plus its handshake.
 message RaftEnvelope {
   // The already-framed raft wire payload (a serialized raft 0.7 `Message`).
+  //
+  // MESSAGE-SIZE COUPLING (M1): the transport caps gRPC messages at
+  // `max_message_size` (default 8 MiB) on BOTH the client and the server —
+  // deliberately left above tonic's 4 MiB default so the largest raft payload
+  // the core allows (the Lan preset's 4 MiB `max_size_per_msg`) always fits with
+  // headroom. If the core's `max_size_per_msg` ever grows past ~8 MiB, this cap
+  // (see `TransportConfig::max_message_size` / `TonicTransportFactory::
+  // max_message_size`) must be raised in step, or oversized payloads fail with
+  // a `RESOURCE_EXHAUSTED` status on both ends.
   bytes payload = 1;
   // The sender's handshake (protocol version, cluster id, node id, flags).
   Hello hello = 2;

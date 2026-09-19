@@ -30,9 +30,12 @@
 
 pub mod error;
 pub mod factory;
-pub mod handshake;
+// `handshake` and `server` are implementation details (only `factory` uses
+// them) and are deliberately crate-private so the public surface stays
+// `error` / `factory` / `rx` / `transport`.
+mod handshake;
 pub mod rx;
-pub mod server;
+mod server;
 pub mod transport;
 
 /// The generated gRPC wire types (client, server, and message structs) for

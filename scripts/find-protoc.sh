@@ -10,24 +10,31 @@
 # On a machine where the only system `protoc` is too new (as here), the whole
 # workspace cannot build.
 #
-# This wrapper is pointed at by `PROTOC` (see `.cargo/config.toml`). Both
-# `protobuf-build` (for `raft-proto`) and `tonic-build` (for
-# `arachne-transport-tonic`) invoke it exactly like `protoc` (e.g.
-# `protoc --version`, or the usual `-I ... -o ...` codegen arguments), so it
-# simply locates a suitable `protoc` and `exec`s it with the same arguments.
+# This wrapper is pointed at by `PROTOC` (see `.cargo/config.toml`, set with
+# `relative = true` so it resolves against the workspace root regardless of the
+# build script's CWD). Both `protobuf-build` (for `raft-proto`) and
+# `tonic-build` (for `arachne-transport-tonic`) invoke it exactly like `protoc`
+# (e.g. `protoc --version`, or the usual `-I ... -o ...` codegen arguments), so
+# it simply locates a suitable `protoc` and `exec`s it with the same arguments.
+#
+# CI REQUIREMENT
+# ==============
+# A `protoc` 3.x must be available. Either install one on `PATH` (e.g.
+# `protobuf-compiler` 3.21/3.25) or set `PROTOC_FALLBACK` to the absolute path
+# of a 3.x binary. A newer calendar-versioned `protoc` alone is NOT enough.
 #
 # Precedence
 # ==========
 #   1. `$PROTOC_FALLBACK` — an explicit override (if set and usable);
-#   2. a short list of well-known `protoc` 3.x install locations;
+#   2. a short list of well-known `protoc` install locations;
 #   3. `protoc` on `PATH` (if it reports a 3.x version).
 set -euo pipefail
 
 candidates=(
   "${PROTOC_FALLBACK:-}"
-  "/opt/anaconda3/lib/python3.12/site-packages/torch/bin/protoc"
   "/opt/homebrew/bin/protoc"
   "/usr/local/bin/protoc"
+  "/usr/bin/protoc"
   "protoc"
 )
 
@@ -40,5 +47,5 @@ for c in "${candidates[@]}"; do
   fi
 done
 
-echo "find-protoc: no suitable protoc (3.x) found; set PROTOC_FALLBACK to one" >&2
+echo "find-protoc: no suitable protoc (3.x) found; install one on PATH or set PROTOC_FALLBACK to a 3.x binary" >&2
 exit 1
