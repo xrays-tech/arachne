@@ -251,7 +251,7 @@ impl Cluster {
         for i in 0..self.nodes.len() {
             if let Some(node) = self.nodes[i].as_mut() {
                 node.tick();
-                let entries = block_on(node.step()).expect("step");
+                let entries = block_on(node.step()).expect("step").committed;
                 for (idx, data) in entries {
                     self.sms[i].apply(idx, &data).expect("apply");
                 }

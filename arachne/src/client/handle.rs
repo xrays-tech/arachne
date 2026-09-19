@@ -108,13 +108,15 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no).await
     }
 
-    /// Linearizable read (propsol §2.1).
+    /// Linearizable read (propsol §2.1 / §5.4).
     ///
-    /// **Provisional (M1-3a):** this is a leader-local read — the request is
-    /// redirected to the current leader, which reads its own applied state. It
-    /// is *not* yet a ReadIndex read (no quorum-lease confirmation that the
-    /// reader still leads), so a leader that has not noticed it lost
-    /// leadership can serve a stale value. True ReadIndex lands in M1-3b.
+    /// This is a **ReadIndex** read: the request is redirected to the current
+    /// leader (a non-leader returns [`ArachneError::NotLeader`], and the client
+    /// follows the hint to an in-process peer or the seeds), which confirms it
+    /// still leads with a quorum heartbeat round before serving the value once
+    /// the read index is applied. It does not rely on a leader lease or clock
+    /// drift, so it stays linearizable (propsol §1 — lease reads are forbidden
+    /// in v1). Bounded by the operation deadline (`Timeout`).
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ArachneError> {
         self.validate_key(key)?;
         self.get_with_redirect(key).await
@@ -301,7 +303,7 @@ impl Handle {
         handle
             .inner
             .tx
-            .send(Command::Get {
+            .send(Command::Read {
                 key: key.to_vec(),
                 ack: ack_tx,
             })

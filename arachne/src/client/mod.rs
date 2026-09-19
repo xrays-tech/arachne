@@ -13,7 +13,7 @@
 //! | Operation | Semantics | Implementation |
 //! |---|---|---|
 //! | `put` / `delete` | linearizable write | Raft log; committed after quorum persistence, replied after apply |
-//! | `get` | linearizable read (default) | **Provisional M1: leader-local read** (redirected to the leader; a true ReadIndex read lands in M1-3b) |
+//! | `get` | linearizable read (default) | **ReadIndex** (propsol §5.4): a quorum-confirmed read on the leader, served after `applied ≥ read_index`; a non-leader returns `NotLeader` and is redirected |
 //! | `get_stale` | arbitrary stale read allowed | direct local state-machine read; **not monotone** (propsol N1) |
 //! | loss of quorum | writes/linearizable reads → `QuorumUnavailable`; `get_stale` still works | CheckQuorum + leader step-down |
 //!
@@ -59,8 +59,9 @@ pub enum ArachneError {
     /// `(client_id, seq_no)`.
     #[error("operation timed out (result unknown)")]
     Timeout,
-    /// Back-pressure: the proposal queue is full. Not fatal — retry later.
-    #[error("busy (proposal queue full)")]
+    /// Back-pressure: a queue is full — the proposal queue, or the ReadIndex
+    /// read-wait queue (propsol §3.2/§4.1). Not fatal — retry later.
+    #[error("busy (proposal or read queue full)")]
     Busy,
     /// An argument violated a constraint (key/value size). Rejected **before**
     /// propose, so it never enters the log (fail-stop discipline, propsol §3.2).

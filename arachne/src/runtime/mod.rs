@@ -55,11 +55,13 @@ pub enum Command {
         /// Reply channel with the local applied value.
         ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
     },
-    /// Leader-local read (provisional; ReadIndex lands in M1-3b).
-    Get {
+    /// Linearizable read via ReadIndex (propsol §5.4). The leader registers a
+    /// quorum-confirmed read and replies once the read index is applied; a
+    /// non-leader replies `NotLeader{hint}` for the client to redirect.
+    Read {
         /// The key to read.
         key: Vec<u8>,
-        /// Reply channel with the leader's applied value or `NotLeader`.
+        /// Reply channel with the value once the read is confirmed, or an error.
         ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
     },
     /// Report the current leader hint.
@@ -95,6 +97,27 @@ struct Pending {
     deadline: Instant,
 }
 
+/// A linearizable (ReadIndex) read awaiting quorum confirmation and apply
+/// (propsol §5.4).
+struct PendingRead {
+    /// The 8-byte token registered with raft's ReadIndex round (big-endian).
+    token: u64,
+    /// The key to read once the read index is applied.
+    key: Vec<u8>,
+    /// Reply channel, taken exactly once on resolution.
+    ack: Option<oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>>,
+    /// Deadline for the current wait (quorum round or apply window).
+    deadline: Instant,
+    /// The quorum-confirmed read index, once raft reports it (`None` until then).
+    read_index: Option<LogIndex>,
+    /// How many times this read has been issued (`1` initially; one retry allowed).
+    attempts: u8,
+}
+
+/// Upper bound on concurrent pending ReadIndex reads (propsol §4.1/§7: 4096).
+/// Beyond this, new reads are rejected with `Busy`.
+const MAX_PENDING_READS: usize = 4096;
+
 enum Outcome {
     Tick,
     Inbound(Option<(NodeId, TransportMessage)>),
@@ -116,6 +139,12 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     commands: mpsc::Receiver<Command>,
     tick: tokio::time::Interval,
     pending: Vec<Pending>,
+    /// Linearizable reads awaiting quorum confirmation / apply (propsol §5.4).
+    pending_reads: Vec<PendingRead>,
+    /// Wait timeout for a ReadIndex round / apply window (`2 × election_timeout`).
+    read_index_timeout: Duration,
+    /// Monotonic source of ReadIndex tokens (8-byte big-endian `ctx`).
+    next_read_token: u64,
     propose_timeout: Duration,
 }
 
@@ -166,6 +195,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             commands,
             tick: tokio::time::interval(period),
             pending: Vec::new(),
+            pending_reads: Vec::new(),
+            read_index_timeout: Duration::from_millis(
+                config.profile.read_index_timeout_ms.max(1),
+            ),
+            next_read_token: 0,
             propose_timeout: Duration::from_millis(config.profile.election_timeout_ms.max(1)),
         };
         runtime.refresh_metrics();
@@ -199,26 +233,44 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         self.fail_all_pending("runtime stopped");
     }
 
-    /// Apply a batch of committed entries, then advance the apply index.
-    /// Returns `false` on a fatal (fail-stop) error.
+    /// Drive one `Ready` cycle: apply committed entries, register quorum
+    /// read-states, then resolve reads and reply to pendings. Returns `false`
+    /// on a fatal (fail-stop) error.
     async fn drive_cycle(&mut self) -> bool {
-        match self.node.step().await {
-            Ok(entries) => {
-                for (index, data) in entries {
-                    if let Err(e) = self.sm.apply(index, &data) {
-                        self.fail_all_pending(&format!("state machine apply failed: {e}"));
-                        self.metrics.set_is_leader(false);
-                        return false;
-                    }
-                }
-            }
+        let outcome = match self.node.step().await {
+            Ok(outcome) => outcome,
             Err(e) => {
                 self.fail_all_pending(&format!("raft step failed: {e}"));
                 self.metrics.set_is_leader(false);
                 return false;
             }
+        };
+
+        for (index, data) in outcome.committed {
+            if let Err(e) = self.sm.apply(index, &data) {
+                self.fail_all_pending(&format!("state machine apply failed: {e}"));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
         }
+
+        // Quorum-confirmed read states (propsol §5.4 step 2): record the read
+        // index and open the wait-for-apply window. The ctx is the 8-byte
+        // big-endian token issued by the `Read` command; unknown tokens (already
+        // resolved or dropped) are ignored.
+        for (ctx, index) in &outcome.read_states {
+            let Ok(token_bytes) = ctx.as_slice().try_into() else {
+                continue;
+            };
+            let token = u64::from_be_bytes(token_bytes);
+            if let Some(r) = self.pending_reads.iter_mut().find(|r| r.token == token) {
+                r.read_index = Some(*index);
+                r.deadline = Instant::now() + self.read_index_timeout;
+            }
+        }
+
         self.node.advance_apply();
+        self.resolve_reads();
         self.reply_pendings();
         self.refresh_metrics();
         true
@@ -258,14 +310,33 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             Command::GetStale { key, ack } => {
                 let _ = ack.send(self.read_local(&key));
             }
-            Command::Get { key, ack } => {
-                if self.node.leader_id() == self.raft_id {
-                    let _ = ack.send(self.read_local(&key));
-                } else {
+            Command::Read { key, ack } => {
+                // Only the leader can serve a linearizable read (propsol §5.4
+                // step 5); a non-leader redirects.
+                if self.node.leader_id() != self.raft_id {
                     let _ = ack.send(Err(ArachneError::NotLeader {
                         leader_hint: self.hint(),
                     }));
+                    return;
                 }
+                // Backpressure: bound the read-wait queue (propsol §4.1).
+                if self.pending_reads.len() >= MAX_PENDING_READS {
+                    let _ = ack.send(Err(ArachneError::Busy));
+                    return;
+                }
+                // Register a ReadIndex round. The token is the 8-byte big-endian
+                // `ctx` raft echoes back in `StepOutcome::read_states`.
+                let token = self.next_read_token;
+                self.next_read_token += 1;
+                self.pending_reads.push(PendingRead {
+                    token,
+                    key,
+                    ack: Some(ack),
+                    deadline: Instant::now() + self.read_index_timeout,
+                    read_index: None,
+                    attempts: 1,
+                });
+                self.node.read_index(token.to_be_bytes().to_vec());
             }
             Command::LeaderHint { ack } => {
                 let _ = ack.send(self.hint());
@@ -299,9 +370,73 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         self.pending = still;
     }
 
+    /// Resolve pending ReadIndex reads (propsol §5.4 steps 3–4).
+    ///
+    /// For each pending read:
+    /// * if leadership was lost, reply `NotLeader{hint}` (step-down clears
+    ///   waiters);
+    /// * else if the read index is applied, reply the local value;
+    /// * else if the wait timed out, retry once (re-issue the ReadIndex round
+    ///   with a fresh token) or reply `Timeout`;
+    /// * otherwise keep it pending.
+    fn resolve_reads(&mut self) {
+        let now = Instant::now();
+        // Drain into an owned vec first so the `&mut self.pending_reads` borrow
+        // is released before we call `&self` / `&mut self.node` methods.
+        let drained: Vec<PendingRead> = self.pending_reads.drain(..).collect();
+        let mut still = Vec::with_capacity(drained.len());
+        for mut r in drained {
+            if self.node.leader_id() != self.raft_id {
+                let _ = r.ack.take().map(|ack| {
+                    ack.send(Err(ArachneError::NotLeader {
+                        leader_hint: self.hint(),
+                    }))
+                });
+                continue;
+            }
+
+            let applied = matches!(
+                r.read_index,
+                Some(idx) if self.sm.applied_index() >= idx
+            );
+            if applied {
+                let _ = r.ack.take().map(|ack| ack.send(self.read_local(&r.key)));
+                continue;
+            }
+
+            if now >= r.deadline {
+                if r.attempts <= 1 {
+                    // One retry: re-issue the ReadIndex round with a fresh token.
+                    r.attempts += 1;
+                    r.read_index = None;
+                    r.deadline = now + self.read_index_timeout;
+                    let new_token = self.next_read_token;
+                    self.next_read_token += 1;
+                    r.token = new_token;
+                    self.node.read_index(new_token.to_be_bytes().to_vec());
+                    still.push(r);
+                } else {
+                    self.metrics.inc_read_index_timeout();
+                    let _ = r.ack.take().map(|ack| ack.send(Err(ArachneError::Timeout)));
+                }
+                continue;
+            }
+
+            still.push(r);
+        }
+        self.pending_reads = still;
+    }
+
     fn fail_all_pending(&mut self, message: &str) {
         for mut p in self.pending.drain(..) {
             if let Some(ack) = p.ack.take() {
+                let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
+            }
+        }
+        // Also fail all in-flight ReadIndex reads (a fatal error means the
+        // process is failing stop).
+        for mut r in self.pending_reads.drain(..) {
+            if let Some(ack) = r.ack.take() {
                 let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
             }
         }
@@ -327,6 +462,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         self.metrics
             .set_is_leader(self.node.leader_id() == self.raft_id);
         self.metrics.set_dropped_sends(self.node.dropped_send_count());
+        self.metrics.set_read_index_pending(self.pending_reads.len() as u64);
     }
 
     /// This node's cluster identity.

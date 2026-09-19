@@ -1,15 +1,15 @@
 //! Integration: the node runtime actor + client `Handle` over the in-memory
 //! transport (single node).
 //!
-//! Proves the M1-3a path end to end: `Handle::put` proposes through the actor,
-//! waits for commit+apply, and a successful return means the write is visible to
-//! `get_stale`/`get`.
+//! Proves the read/write path end to end: `Handle::put` proposes through the
+//! actor and waits for commit+apply; `Handle::get` is a ReadIndex linearizable
+//! read (propsol §5.4) and `get_stale` a local read, both of which observe the
+//! committed write.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::client::Handle;
 use arachne::consensus::RaftNodeConfig;
 use arachne::runtime::{Runtime, RuntimeConfig};
 use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};

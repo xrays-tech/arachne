@@ -12,7 +12,9 @@
 //!   bounded quorum failure (it never hangs). `409` (with a leader hint) is only
 //!   produced when a peer's handle is registered in-process; cross-process
 //!   `409` + hint is deferred to task (D).
-//! * `GET /kv/<key>` — leader-local read (provisional; ReadIndex lands in M1-3b).
+//! * `GET /kv/<key>` — linearizable **ReadIndex** read on the leader (propsol
+//!   §5.4); a non-leader in a multi-process deployment returns `503` (no
+//!   cross-process redirect), matching the `PUT` note above.
 //! * `GET /kv/<key>?stale=1` — stale local read (works on any node).
 //! * `DELETE /kv/<key>` — delete.
 //!

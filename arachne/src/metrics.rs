@@ -20,6 +20,10 @@ pub struct Metrics {
     applied_index: AtomicU64,
     is_leader: AtomicU64,
     dropped_sends: AtomicU64,
+    /// Total number of ReadIndex reads that timed out after one retry.
+    read_index_timeout_total: AtomicU64,
+    /// Number of ReadIndex reads currently pending confirmation/apply.
+    read_index_pending: AtomicU64,
 }
 
 impl Metrics {
@@ -57,6 +61,18 @@ impl Metrics {
     /// transport send (see `RaftNode::dropped_send_count`).
     pub fn set_dropped_sends(&self, value: u64) {
         self.dropped_sends.store(value, Ordering::Relaxed);
+    }
+
+    /// Increment the ReadIndex timeout counter (a read timed out after its
+    /// single retry, propsol §5.4).
+    pub fn inc_read_index_timeout(&self) {
+        self.read_index_timeout_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the number of ReadIndex reads currently pending confirmation or
+    /// apply.
+    pub fn set_read_index_pending(&self, value: u64) {
+        self.read_index_pending.store(value, Ordering::Relaxed);
     }
 
     /// Whether this node currently believes it is the leader.
@@ -122,6 +138,18 @@ impl Metrics {
             "Outbound raft messages dropped due to a failed transport send.",
             self.dropped_sends.load(Ordering::Relaxed),
         );
+        counter(
+            &mut out,
+            "arachne_read_index_timeout_total",
+            "ReadIndex reads that timed out after one retry.",
+            self.read_index_timeout_total.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "arachne_read_index_pending",
+            "ReadIndex reads currently pending confirmation or apply.",
+            self.read_index_pending.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -141,6 +169,21 @@ fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
     out.push('\n');
 }
 
+fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push_str(" counter\n");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +197,9 @@ mod tests {
         m.set_applied_index(6);
         m.set_is_leader(true);
         m.set_dropped_sends(4);
+        m.inc_read_index_timeout();
+        m.inc_read_index_timeout();
+        m.set_read_index_pending(5);
         let text = m.render();
         for name in [
             "arachne_term",
@@ -162,6 +208,8 @@ mod tests {
             "arachne_applied_index",
             "arachne_is_leader",
             "arachne_dropped_sends",
+            "arachne_read_index_timeout_total",
+            "arachne_read_index_pending",
         ] {
             assert!(text.contains(name), "missing {name}");
         }
@@ -169,6 +217,10 @@ mod tests {
         assert!(text.contains("arachne_term 3"));
         assert!(text.contains("arachne_is_leader 1"));
         assert!(text.contains("arachne_dropped_sends 4"));
+        assert!(text.contains("# TYPE arachne_read_index_timeout_total counter"));
+        assert!(text.contains("arachne_read_index_timeout_total 2"));
+        assert!(text.contains("# TYPE arachne_read_index_pending gauge"));
+        assert!(text.contains("arachne_read_index_pending 5"));
         assert!(m.is_leader());
         assert_eq!(m.leader_id(), 1);
         assert_eq!(m.dropped_sends(), 4);

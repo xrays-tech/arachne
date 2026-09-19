@@ -109,6 +109,20 @@ impl RaftNodeConfig {
     }
 }
 
+/// The result of one [`RaftNode::step`] `Ready` cycle.
+///
+/// `committed` are the entries to apply to the state machine; `read_states`
+/// are quorum-confirmed ReadIndex results `(request_ctx, read_index)` — a read
+/// may be served locally once the applied index reaches `read_index`
+/// (propsol §5.4). Both are empty when there was no pending work.
+#[derive(Debug, Default)]
+pub struct StepOutcome {
+    /// Committed entries `(index, data)` to apply, in ascending index order.
+    pub committed: Vec<(LogIndex, Vec<u8>)>,
+    /// Quorum-confirmed ReadIndex results `(request_ctx, read_index)`.
+    pub read_states: Vec<(Vec<u8>, LogIndex)>,
+}
+
 /// A raft consensus node that drives the `RawNode` Ready loop with the frozen
 /// persist/send ordering.
 ///
@@ -147,8 +161,12 @@ where
     ///
     /// `self_raft_id` must be non-zero and unique in the group. `applied` is
     /// the last index applied to the state machine (0 for a fresh node). The
-    /// raft configuration enables PreVote, CheckQuorum, and lease-based
-    /// linearizable reads (`LeaseBased` requires `check_quorum`).
+    /// raft configuration enables PreVote, CheckQuorum, and quorum-confirmed
+    /// linearizable reads (`Safe` ReadIndex, propsol §5.4): v1 confirms each
+    /// read with a quorum heartbeat round, so read consistency does not depend
+    /// on a clock-drift bound. Lease-based reads are forbidden in v1 (propsol
+    /// §1) — they rely on a leader lease and would weaken linearizability under
+    /// unbounded clock skew.
     pub fn new(
         self_raft_id: RaftId,
         peers: HashMap<RaftId, NodeId>,
@@ -206,7 +224,9 @@ where
             max_inflight_msgs: config.max_inflight_msgs as usize,
             check_quorum: true,
             pre_vote: true,
-            read_only_option: ReadOnlyOption::LeaseBased,
+            // Quorum-confirmed ReadIndex (propsol §5.4). `Safe` is the
+            // linearizable read mode that does not trust a leader lease.
+            read_only_option: ReadOnlyOption::Safe,
             ..Default::default()
         };
         raft_config.validate().map_err(NodeError::Raft)?;
@@ -243,9 +263,10 @@ where
 
     /// Drive one `Ready` cycle with the frozen persist/send ordering (I1–I4).
     ///
-    /// Returns the committed entries `(index, data)` to apply to the state
-    /// machine. After applying them, call [`Self::advance_apply`] to update the
-    /// apply progress. Returns an empty vec when there is no pending work.
+    /// Returns a [`StepOutcome`]: the committed entries to apply to the state
+    /// machine, and any quorum-confirmed ReadIndex results. After applying the
+    /// committed entries, call [`Self::advance_apply`] to update the apply
+    /// progress. Returns an empty [`StepOutcome`] when there is no pending work.
     ///
     /// # Transport failures are non-fatal
     ///
@@ -267,9 +288,9 @@ where
     /// ConfChange entries must be routed to the raft membership machinery and
     /// **must not** be fed to the KV state machine (which would reject them as
     /// malformed).
-    pub async fn step(&mut self) -> Result<Vec<(LogIndex, Vec<u8>)>, NodeError<T>> {
+    pub async fn step(&mut self) -> Result<StepOutcome, NodeError<T>> {
         if !self.raw.has_ready() {
-            return Ok(Vec::new());
+            return Ok(StepOutcome::default());
         }
         let ready = self.raw.ready();
 
@@ -302,6 +323,17 @@ where
             .map(|e| (e.get_index(), e.get_data().to_vec()))
             .collect();
 
+        // Quorum-confirmed ReadIndex results (propsol §5.4 step 2). Read states
+        // appear only on the full `Ready`, not the `LightReady`, so they must be
+        // captured before `ready` is moved into `advance` (exactly like
+        // `ready_committed`). Each is `(request_ctx, read_index)`: the caller
+        // may serve the read once the applied index reaches `read_index`.
+        let read_states: Vec<(Vec<u8>, LogIndex)> = ready
+            .read_states()
+            .iter()
+            .map(|rs| (rs.request_ctx.clone(), rs.index))
+            .collect();
+
         // Advance: confirms persistence and yields the `LightReady` (committed
         // entries plus any messages generated during the advance).
         let light = self.raw.advance(ready);
@@ -324,7 +356,10 @@ where
                 .iter()
                 .map(|e| (e.get_index(), e.get_data().to_vec())),
         );
-        Ok(committed)
+        Ok(StepOutcome {
+            committed,
+            read_states,
+        })
     }
 
     /// Propose a command to the raft log.
@@ -332,6 +367,18 @@ where
         self.raw
             .propose(Vec::new(), cmd.to_vec())
             .map_err(NodeError::Raft)
+    }
+
+    /// Issue a quorum-confirmed ReadIndex read (propsol §5.4).
+    ///
+    /// `ctx` is an opaque, caller-chosen token that raft echoes back in the
+    /// matching [`StepOutcome::read_states`] entry. The caller is responsible
+    /// for ensuring this node is the leader (a non-leader silently drops the
+    /// request). The read is confirmed once a quorum heartbeats back, after
+    /// which the caller may serve it locally once the applied index reaches
+    /// the returned `read_index`.
+    pub fn read_index(&mut self, ctx: Vec<u8>) {
+        self.raw.read_index(ctx);
     }
 
     /// Process an inbound transport message from the peer `from`.
@@ -623,7 +670,7 @@ mod tests {
         let mut sm = KvStateMachine::new();
         for _ in 0..100 {
             node.tick();
-            let entries = block_on(node.step()).expect("drive cycle must succeed");
+            let entries = block_on(node.step()).expect("drive cycle must succeed").committed;
             for (idx, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
@@ -645,7 +692,7 @@ mod tests {
 
         for _ in 0..100 {
             node.tick();
-            let entries = block_on(node.step()).expect("drive cycle must succeed");
+            let entries = block_on(node.step()).expect("drive cycle must succeed").committed;
             for (idx, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
@@ -660,6 +707,58 @@ mod tests {
     }
 
     #[test]
+    fn read_index_yields_a_quorum_confirmed_read_state() {
+        let (mut node, mut sm) = make_leader();
+
+        // Propose, commit, and apply a value so there is a stable committed
+        // index for the read to anchor on.
+        let cmd = KvStateMachine::encode_put(1, 1, b"key", b"value");
+        node.propose(&cmd).expect("propose to a leader must succeed");
+        for _ in 0..100 {
+            node.tick();
+            let entries = block_on(node.step()).expect("drive cycle must succeed").committed;
+            for (idx, data) in entries {
+                sm.apply(idx, &data).expect("apply must succeed");
+            }
+            node.advance_apply();
+            if sm.get(b"key").unwrap() == Some(b"value".to_vec()) {
+                break;
+            }
+        }
+        assert_eq!(sm.get(b"key").unwrap(), Some(b"value".to_vec()));
+
+        // Issue a ReadIndex read with a known ctx and drive until it resolves.
+        let ctx = b"read-ctx-1".to_vec();
+        node.read_index(ctx.clone());
+        let mut resolved: Option<(Vec<u8>, LogIndex)> = None;
+        for _ in 0..100 {
+            node.tick();
+            let outcome = block_on(node.step()).expect("drive cycle must succeed");
+            for (idx, data) in outcome.committed {
+                sm.apply(idx, &data).expect("apply must succeed");
+            }
+            node.advance_apply();
+            for (rctx, index) in &outcome.read_states {
+                if *rctx == ctx {
+                    resolved = Some((rctx.clone(), *index));
+                }
+            }
+            if resolved.is_some() {
+                break;
+            }
+        }
+
+        let (got_ctx, index) =
+            resolved.expect("the read state must resolve with our ctx");
+        assert_eq!(got_ctx, ctx, "the request ctx must round-trip");
+        assert!(
+            index <= node.applied_index(),
+            "read index {index} must be <= applied index {}",
+            node.applied_index()
+        );
+    }
+
+    #[test]
     fn i1_i2_persist_durable_before_step_returns() {
         let ledger = std::sync::Arc::new(arachne_testsupport::FsyncLedger::new());
         let observer: std::sync::Arc<dyn arachne_seam::FsyncObserver> = ledger.clone();
@@ -669,7 +768,7 @@ mod tests {
         // Become leader.
         for _ in 0..100 {
             node.tick();
-            let entries = block_on(node.step()).expect("drive must succeed");
+            let entries = block_on(node.step()).expect("drive must succeed").committed;
             for (idx, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
@@ -683,7 +782,7 @@ mod tests {
         node.propose(&cmd).expect("propose must succeed");
         for _ in 0..100 {
             node.tick();
-            let entries = block_on(node.step()).expect("drive must succeed");
+            let entries = block_on(node.step()).expect("drive must succeed").committed;
             for (idx, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
@@ -768,7 +867,7 @@ mod tests {
         let mut dropped = 0u64;
         for _ in 0..200 {
             node.tick();
-            let _entries = block_on(node.step()).expect("drive cycle must succeed");
+            let _ = block_on(node.step()).expect("drive cycle must succeed");
             node.advance_apply();
             dropped = node.dropped_send_count();
             if dropped > 0 {

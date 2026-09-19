@@ -223,7 +223,7 @@ fn three_processes_form_a_cluster_and_replicate_over_http() {
     );
     let writer = writer.expect("a leader accepted the PUT");
 
-    // 3. Read back from the writer (leader-local read).
+    // 3. Read back from the writer (a linearizable ReadIndex read on the leader).
     let mut read_ok = false;
     for _ in 0..100 {
         if let Some((status, body)) = http_request(http_addrs[writer], "GET", "/kv/k") {
