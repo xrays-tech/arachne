@@ -16,3 +16,10 @@ publish = false
 # Production crates may only pull in this crate via their [dev-dependencies]
 # (enforced by scripts/check-deps.sh Gate A).
 arachne-seam = { workspace = true }
+
+# Test-only (never a normal dependency): the stateright reference linearizability
+# checker, used solely in `#[cfg(test)]` to cross-validate the self-built
+# Wing-Gong checker (test-plan §4 T2 / decision D-T2). It is a dev-dependency,
+# so it never enters any production crate's normal dependency tree (Gate A/C).
+[dev-dependencies]
+stateright = "0.31"
