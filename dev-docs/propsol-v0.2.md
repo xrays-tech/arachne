@@ -1,11 +1,11 @@
-# Arachne 设计文档（v0.2.7 RFC）
+# Arachne 设计文档（v0.2.8 RFC）
 
 > 上游文档：`propsol.md`（v0.1）。本文件在其基础上做需求/设计精化，**不包含实现代码**。
 > 设计基线不变：复用成熟共识内核（`tikv/raft-rs`，备选 `openraft`）、CP 语义、不自研共识、失去多数派不自动接管、不基于 ACK 超时自动剔除节点。
 
 ---
 
-## 变更日志（v0.1 → v0.2.7）
+## 变更日志（v0.1 → v0.2.8）
 
 ### A. 三项待决策项已决议（见 §11）
 
@@ -115,6 +115,18 @@ P2 崩溃安全门禁评审发现 §5.5.3 的恢复算法**按原文实现不安
 | 恢复后校验 | 无 | 增加 **`hard_state.commit ≤ last_index` 断言**，否则 fail-start | 关闭"损坏 len 伪装撕裂"导致已提交数据静默丢失 |
 | 新段持久化 | 未提 | 新建段文件后 **fsync 数据目录** | 目录项不持久化会使已 fsync 的条目在掉电后消失（I2） |
 | 段命名/滚动 | 段名=段首 log index；未明确重开行为 | 滚动在超 `segment_bytes` 时新建段；**重开续写最高编号既有段**，仅无段时建 `wal-1.log` | 避免每次重启新建空段、破坏"段名=首 index"不变式 |
+
+### K. v0.2.8：§5.1/§7 约束注解自相矛盾修正（E-rev）
+
+M1-1 实现配置管线（`ProfileConfig::validate`）时发现：§7 的**约束注解与其自身预设表冲突**——注解要求 `rpc_timeout < heartbeat_interval`（§5.1 同述）与 `election_timeout ≥ 10× heartbeat`，但预设 Lan 为 `rpc 500ms > hb 100ms`；Wan 为 `el 2500ms < 10×500ms` 且 `rpc 2000ms > hb 500ms`。若按注解校验，两个预设都非法、节点无法启动。
+
+| 修订点 | v0.2.7 原文 | v0.2.8 修正 | 理由 |
+|---|---|---|---|
+| RPC 超时约束 | `rpc_timeout < heartbeat_interval`（§5.1、§7） | **`rpc_timeout < election_timeout`** | 单次 RPC 须在选举超时前结束才构成可用性约束；`< heartbeat` 无物理依据且与预设冲突 |
+| 选举超时约束 | `election_timeout ≥ 10× heartbeat` | **`election_timeout ≥ 5× heartbeat`**（Lan 预设仍为 10×） | Wan 预设为 5×；5× 是预设实际采用的最小比 |
+| 预设数值 | 不变 | 不变 | 预设是冻结决策；本次只修**注解**使其与预设一致 |
+
+实现侧已按修正后的约束强制（`el ≥ 5·hb`、`rpc < el`）；本 E-rev 使**文档 / 实现 / 预设**三者自洽。
 
 ---
 
@@ -322,7 +334,7 @@ enum ArachneError {
 
 ### 5.1 选举
 
-- 随机化选举超时（`[1x, 2x)` 均匀分布），心跳 = 选举超时的 1/10；约束：`rpc_timeout < heartbeat_interval`（§7）。
+- 随机化选举超时（`[1x, 2x)` 均匀分布），心跳 = 选举超时的 1/10；约束：`rpc_timeout < election_timeout`（§7；v0.2.8 修正，原写作 `< heartbeat_interval` 与 §7 预设冲突）。
 - **PreVote**：重新上线/分区内恢复的节点先预投票，不抬 term，防止抖动 leader。
 - **CheckQuorum**：leader 超过选举超时未获多数派心跳则 step down；step down 时清空未决 ReadIndex 等待者（返回 `NotLeader{hint: None}`）。
 - 与 ReadIndex 的关系：即使 CheckQuorum 尚未触发 step-down，ReadIndex 的 quorum 心跳轮也独立防止分区内旧 leader 服务线性读（§5.4），二者互为防线。
@@ -474,9 +486,9 @@ Lease Read 留 v2，显式记录其前提：配置化的时钟偏移上限 + 安
 
 | 参数 | Lan | Wan | 说明 / 约束 |
 |---|---|---|---|
-| heartbeat_interval | 100ms | 500ms | election_timeout ≥ 10× heartbeat |
+| heartbeat_interval | 100ms | 500ms | election_timeout ≥ 5× heartbeat（Lan 预设 10×、Wan 预设 5×；v0.2.8 修正，原写 10× 与 Wan 预设冲突） |
 | election_timeout | 1s | 2.5s | 实际随机化 [1x, 2x) |
-| rpc_timeout | 500ms | 2s | 必须 < heartbeat_interval |
+| rpc_timeout | 500ms | 2s | 必须 < election_timeout（v0.2.8 修正，原写 `< heartbeat_interval` 与预设冲突） |
 | max_inflight_bytes | 4MB | 1MB | 每 follower |
 | max_inflight_msgs | 256 | 256 | raft 内建计数流控 |
 | snapshot_threshold | 64MB 日志 | 16MB 日志 | 触发快照+压缩 |
@@ -668,8 +680,8 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 | Q6 | `wal_trailing_keep` 是否与 `snapshot_threshold` 解耦 | 绑定同值简化运维，出现慢 follower 快照风暴证据再解耦 | §5.5.4、§7 | M2 追赶测试 |
 | Q7 | 提案队列按字节还是按条数计 | 按字节（64MB），对大值更稳 | §4.1、§7 | M1 压测 |
 
-**截至 v0.2.7 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
+**截至 v0.2.8 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
 
 ---
 
-*v0.2.7 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.8 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
