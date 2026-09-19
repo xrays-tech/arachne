@@ -22,7 +22,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use slog::Logger;
 use tokio::sync::{mpsc, oneshot};
