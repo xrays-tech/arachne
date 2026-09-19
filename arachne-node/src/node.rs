@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arachne::consensus::RaftNode;
+use arachne::consensus::{RaftNode, RaftNodeConfig};
 use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne::storage::{WalConfig, WalOptions, WalStorage};
 use arachne::{StateMachine, StorageError};
 use slog::Logger;
 
@@ -62,22 +62,26 @@ pub struct Arachne {
 impl Arachne {
     /// Open the node's WAL and assemble the raft node. A fresh node starts with
     /// `applied = 0` (M0 does not yet replay a persisted state-machine snapshot).
+    ///
+    /// Both the WAL (`fsync_policy`, `segment_bytes`) and the raft tick/flow
+    /// timings are driven by the validated [`ProfileConfig`] (propsol §7).
     pub fn open(config: &Config, metrics: Arc<Metrics>, logger: &Logger) -> Result<Self, NodeError> {
+        let profile = &config.profile_config;
         let wal = WalStorage::open(
             &config.data_dir,
             WalOptions {
                 cluster_id: config.cluster_id.clone(),
                 node_id: config.node_id.as_str().to_string(),
                 config: WalConfig {
-                    fsync_policy: FsyncPolicy::Always,
-                    segment_bytes: WalConfig::default().segment_bytes,
+                    fsync_policy: profile.fsync_policy,
+                    segment_bytes: profile.wal_segment_bytes,
                 },
                 created_at_millis: now_millis(),
                 fsync_observer: None,
             },
         )?;
 
-        let raft = RaftNode::new(
+        let raft = RaftNode::new_with_config(
             config.raft_id,
             // M0 single-node: no peers. Bootstrap voters = {self}.
             HashMap::new(),
@@ -85,6 +89,7 @@ impl Arachne {
             PlaceholderTx,
             PlaceholderRx,
             0,
+            RaftNodeConfig::from_profile(profile),
             logger,
         )
         .map_err(|e| NodeError::Raft(e.to_string()))?;

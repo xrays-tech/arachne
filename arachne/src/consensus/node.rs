@@ -37,6 +37,7 @@ use arachne_seam::storage::{
 use arachne_seam::types::{LogIndex, NodeId};
 
 use super::raft_storage::RaftStorage;
+use crate::profile::ProfileConfig;
 
 /// Errors reported by the consensus node.
 ///
@@ -55,6 +56,57 @@ pub enum NodeError<T: Transport> {
     /// A raft wire-message codec error (encode/decode of `Message` bytes).
     #[error("codec error: {0}")]
     Codec(String),
+}
+
+/// Raft tick and flow-control timings for a [`RaftNode`].
+///
+/// These are the knobs that were previously hardcoded in [`RaftNode::new`].
+/// A deployment derives them from a [`ProfileConfig`] (via
+/// [`RaftNodeConfig::from_profile`]) or uses [`Default`] (the original
+/// hardcoded values, kept so existing callers and tests are unchanged).
+#[derive(Clone, Copy, Debug)]
+pub struct RaftNodeConfig {
+    /// Number of ticks for an election timeout.
+    pub election_tick: u64,
+    /// Number of ticks between heartbeats.
+    pub heartbeat_tick: u64,
+    /// Max total bytes in a single raft message (AppendEntries batching).
+    pub max_size_per_msg: u64,
+    /// Max messages in flight to a single follower (raft built-in flow control).
+    pub max_inflight_msgs: u64,
+}
+
+impl Default for RaftNodeConfig {
+    /// The values previously hardcoded in [`RaftNode::new`].
+    fn default() -> Self {
+        Self {
+            election_tick: 10,
+            heartbeat_tick: 1,
+            max_size_per_msg: 1_048_576,
+            max_inflight_msgs: 256,
+        }
+    }
+}
+
+impl RaftNodeConfig {
+    /// Derive raft tick timings and flow-control limits from a
+    /// [`ProfileConfig`] (propsol §7 → §4.2).
+    ///
+    /// `heartbeat_tick` is fixed at 1 (one tick == one heartbeat interval);
+    /// `election_tick` is the election timeout expressed in heartbeat ticks,
+    /// `election_timeout_ms / heartbeat_interval_ms`, clamped to >= 1 (10 for
+    /// the Lan preset, 5 for the Wan preset). `max_size_per_msg` and
+    /// `max_inflight_msgs` are taken from the profile's per-follower inflight
+    /// limits.
+    pub fn from_profile(profile: &ProfileConfig) -> Self {
+        let heartbeat = profile.heartbeat_interval_ms.max(1);
+        Self {
+            heartbeat_tick: 1,
+            election_tick: (profile.election_timeout_ms / heartbeat).max(1),
+            max_size_per_msg: profile.max_inflight_bytes,
+            max_inflight_msgs: profile.max_inflight_msgs,
+        }
+    }
 }
 
 /// A raft consensus node that drives the `RawNode` Ready loop with the frozen
@@ -90,7 +142,8 @@ where
     T: Transport,
     Tr: TransportRx,
 {
-    /// Create a new `RaftNode`.
+    /// Create a new `RaftNode` with the default tick/flow-control timings
+    /// ([`RaftNodeConfig::default`]).
     ///
     /// `self_raft_id` must be non-zero and unique in the group. `applied` is
     /// the last index applied to the state machine (0 for a fresh node). The
@@ -105,25 +158,58 @@ where
         applied: LogIndex,
         logger: &Logger,
     ) -> Result<Self, NodeError<T>> {
+        Self::new_with_config(
+            self_raft_id,
+            peers,
+            storage,
+            transport,
+            rx,
+            applied,
+            RaftNodeConfig::default(),
+            logger,
+        )
+    }
+
+    /// Create a new `RaftNode` with an explicit [`RaftNodeConfig`].
+    ///
+    /// This is the entry point for profile-driven deployments: derive the
+    /// tick timings and flow-control limits from a validated
+    /// [`ProfileConfig`] via [`RaftNodeConfig::from_profile`], then construct
+    /// the node here. See [`Self::new`] for the parameter contract; the only
+    /// addition is `config`, which controls the raft tick rates and per-follower
+    /// inflight limits.
+    // The signature is `new` plus one `config` argument (the mandated API), so
+    // it sits one past the `too_many_arguments` threshold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_config(
+        self_raft_id: RaftId,
+        peers: HashMap<RaftId, NodeId>,
+        storage: S,
+        transport: T,
+        rx: Tr,
+        applied: LogIndex,
+        config: RaftNodeConfig,
+        logger: &Logger,
+    ) -> Result<Self, NodeError<T>> {
         if self_raft_id == 0 {
             return Err(NodeError::Raft(
                 raft::Error::ConfigInvalid("node id must be non-zero".into()),
             ));
         }
 
-        let config = RaftConfig {
+        let raft_config = RaftConfig {
             id: self_raft_id,
-            election_tick: 10,
-            heartbeat_tick: 1,
+            election_tick: config.election_tick as usize,
+            heartbeat_tick: config.heartbeat_tick as usize,
             applied,
-            max_size_per_msg: 1_048_576,
-            max_inflight_msgs: 256,
+            max_size_per_msg: config.max_size_per_msg,
+            max_inflight_msgs: config.max_inflight_msgs as usize,
             check_quorum: true,
             pre_vote: true,
             read_only_option: ReadOnlyOption::LeaseBased,
             ..Default::default()
         };
-        config.validate().map_err(NodeError::Raft)?;
+        raft_config.validate().map_err(NodeError::Raft)?;
 
         // Bootstrap membership: the declared peers plus this node. Without a
         // voter set containing this node, raft has no quorum and can never
@@ -139,7 +225,7 @@ where
         };
 
         let store = RaftStorage::with_conf_state(storage, bootstrap);
-        let raw = RawNode::new(&config, store, logger).map_err(NodeError::Raft)?;
+        let raw = RawNode::new(&raft_config, store, logger).map_err(NodeError::Raft)?;
 
         Ok(Self {
             raw,
@@ -693,5 +779,31 @@ mod tests {
             dropped > 0,
             "a failed send to the unknown peer must be counted; got {dropped}"
         );
+    }
+
+    #[test]
+    fn raft_node_config_default_matches_original_hardcoded_values() {
+        let c = RaftNodeConfig::default();
+        assert_eq!(c.election_tick, 10);
+        assert_eq!(c.heartbeat_tick, 1);
+        assert_eq!(c.max_size_per_msg, 1_048_576);
+        assert_eq!(c.max_inflight_msgs, 256);
+    }
+
+    #[test]
+    fn raft_node_config_from_profile_derives_ticks() {
+        // Lan: 1000 / 100 = 10 ticks.
+        let lan = RaftNodeConfig::from_profile(&crate::profile::Profile::Lan.config());
+        assert_eq!(lan.heartbeat_tick, 1);
+        assert_eq!(lan.election_tick, 10);
+        assert_eq!(lan.max_size_per_msg, 4 * 1024 * 1024);
+        assert_eq!(lan.max_inflight_msgs, 256);
+
+        // Wan: 2500 / 500 = 5 ticks.
+        let wan = RaftNodeConfig::from_profile(&crate::profile::Profile::Wan.config());
+        assert_eq!(wan.heartbeat_tick, 1);
+        assert_eq!(wan.election_tick, 5);
+        assert_eq!(wan.max_size_per_msg, 1024 * 1024);
+        assert_eq!(wan.max_inflight_msgs, 256);
     }
 }

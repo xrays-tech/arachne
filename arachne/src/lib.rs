@@ -19,9 +19,41 @@
 //! (`arachne::seam::*`, `arachne::types::*`, and the root re-exports) so the
 //! public API is unchanged.
 //!
-//! [`arachne_seam`]: https://docs.rs/arachne-seam
+//! # Consistency semantics (propsol §2)
+//!
+//! Arachne is a **CP** (consistency/availability → consistency) embedded KV
+//! store: at most one leader at any time, commits require a quorum, and when
+//! the quorum is lost **every linearizable operation fails** — the system
+//! never degrades to a read-mostly mode or splits the brain.
+//!
+//! | Operation | Semantics | Implementation |
+//! |---|---|---|
+//! | `put` / `delete` | linearizable write | Raft log; committed after quorum persistence, replied after apply |
+//! | `get` | linearizable read (default) | ReadIndex (propsol §5.4); a non-leader node redirects / returns `NotLeader` |
+//! | `get_stale` | arbitrary stale read allowed | direct local state-machine read; **not guaranteed monotone** across calls (declared prominently, propsol §2.1/N1) |
+//! | loss of quorum | writes and linearizable reads return `QuorumUnavailable`; `get_stale` still works | CheckQuorum + automatic leader step-down |
+//!
+//! The **error matrix** (propsol §3.3) — per operation × condition:
+//!
+//! | Condition | `put` / `delete` | `get` (ReadIndex) | `get_stale` |
+//! |---|---|---|---|
+//! | invalid argument | `InvalidArgument` (rejected before propose) | `InvalidArgument` | `InvalidArgument` |
+//! | this node is not the leader | `NotLeader{hint}` | `NotLeader{hint}` | **succeeds** (local read) |
+//! | quorum lost | `QuorumUnavailable` | `QuorumUnavailable` (quorum heartbeat round fails) | succeeds (may be stale) |
+//! | proposal / read queue full | `Busy` | `Busy` | `Busy` (read queue only) |
+//! | bounded wait timeout | `Timeout` (result unknown) | `Timeout` | succeeds |
+//! | session table full / expired | `SessionTableFull` / `SessionExpired` | n/a (reads use no session) | n/a |
+//! | shutting down | `ShuttingDown` | `ShuttingDown` | `ShuttingDown` |
+//! | fatal storage error | `Unrecoverable` | `Unrecoverable` | `Unrecoverable` |
+//!
+//! # Configuration presets (propsol §7)
+//!
+//! [`Profile::Lan`] and [`Profile::Wan`] map to a concrete [`ProfileConfig`]
+//! holding the full §7 field table; individual fields are overridable and the
+//! result is validated with [`ProfileConfig::validate`] (see `profile`).
 
 pub mod consensus;
+pub mod profile;
 pub mod state_machine;
 pub mod storage;
 
@@ -32,6 +64,7 @@ pub use arachne_seam::{
     NodeId, NodeIdError, RaftId, RaftState, Rng, Snapshot, SnapshotMeta, StateMachine, Storage,
     StorageError, Term, Timestamp, Transport, TransportFactory, TransportMessage, TransportRx,
 };
+pub use profile::{Profile, ProfileConfig, ProfileError};
 
 /// Return the current crate version (from `CARGO_PKG_VERSION`).
 pub fn version() -> &'static str {

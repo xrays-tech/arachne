@@ -5,6 +5,15 @@
 //! validate) — once constructed, internal code never re-checks it. Every
 //! validation failure is reported as a `ConfigError`, never a panic.
 //!
+//! # Profile
+//!
+//! A `profile` (`"lan"` / `"wan"`, default `"lan"`) selects the propsol §7
+//! preset. Any individual field may be overridden with a top-level key of the
+//! same name (e.g. `heartbeat_interval_ms`). The profile plus overrides is
+//! folded into a [`ProfileConfig`] and **validated at parse time** — an
+//! invalid combination (e.g. `rpc_timeout_ms >= election_timeout_ms`) is
+//! rejected before any node is built.
+//!
 //! # Raft id mapping
 //!
 //! `node_id` is mapped to its raft [`RaftId`] as its 1-based position in
@@ -17,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use arachne::NodeId;
+use arachne::{Profile, ProfileConfig};
 use serde::Deserialize;
 
 /// The parsed and validated node configuration.
@@ -37,14 +47,19 @@ pub struct Config {
     pub http_listen: SocketAddr,
     /// The bootstrap cluster membership (this node must be a member).
     pub initial_cluster: Vec<NodeId>,
-    /// The raft tick interval in milliseconds (profile override).
+    /// The selected propsol §7 preset (`lan` / `wan`).
+    pub profile: Profile,
+    /// The full, validated tuning table (profile + overrides).
+    pub profile_config: ProfileConfig,
+    /// The effective raft heartbeat interval in milliseconds (profile + any
+    /// override). Drives the node's tick period.
     pub heartbeat_interval_ms: u64,
-    /// The raft election timeout in milliseconds (profile override).
+    /// The effective raft election timeout in milliseconds (profile + any
+    /// override).
     pub election_timeout_ms: u64,
 }
 
-const DEFAULT_HEARTBEAT_MS: u64 = 100;
-const DEFAULT_ELECTION_MS: u64 = 1000;
+const DEFAULT_PROFILE: &str = "lan";
 
 /// Raw, unvalidated TOML shape.
 #[derive(Deserialize)]
@@ -55,18 +70,19 @@ struct RawConfig {
     data_dir: String,
     http_listen: String,
     initial_cluster: Vec<String>,
-    #[serde(default = "default_heartbeat")]
-    heartbeat_interval_ms: u64,
-    #[serde(default = "default_election")]
-    election_timeout_ms: u64,
+    #[serde(default = "default_profile")]
+    profile: String,
+    /// Per-field overrides; absent (None) means "use the profile value".
+    #[serde(default)]
+    heartbeat_interval_ms: Option<u64>,
+    #[serde(default)]
+    election_timeout_ms: Option<u64>,
+    #[serde(default)]
+    rpc_timeout_ms: Option<u64>,
 }
 
-fn default_heartbeat() -> u64 {
-    DEFAULT_HEARTBEAT_MS
-}
-
-fn default_election() -> u64 {
-    DEFAULT_ELECTION_MS
+fn default_profile() -> String {
+    DEFAULT_PROFILE.to_string()
 }
 
 /// Errors from parsing or validating a node config.
@@ -90,6 +106,10 @@ pub enum ConfigError {
     NodeNotInCluster { node: NodeId },
     /// An address field was not a valid `IP:port` (only IP literals parse).
     BadAddress { field: &'static str, value: String },
+    /// The `profile` field was not `lan` or `wan`.
+    UnknownProfile { value: String },
+    /// A profile field (or a profile + override combination) failed validation.
+    ProfileInvalid { message: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -112,6 +132,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::BadAddress { field, value } => {
                 write!(f, "config field `{field}` is not a valid `IP:port`: {value}")
             }
+            ConfigError::UnknownProfile { value } => {
+                write!(f, "unknown profile `{value}` (expected `lan` or `wan`)")
+            }
+            ConfigError::ProfileInvalid { message } => write!(f, "invalid profile config: {message}"),
         }
     }
 }
@@ -177,6 +201,24 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
         }
     }
 
+    // Select the profile preset and apply per-field overrides, then validate
+    // the folded result at the boundary (parse, don't validate).
+    let profile = Profile::parse_name(&raw.profile)
+        .map_err(|e| ConfigError::UnknownProfile { value: e.to_string() })?;
+    let mut profile_config = profile.config();
+    if let Some(v) = raw.heartbeat_interval_ms {
+        profile_config.heartbeat_interval_ms = v;
+    }
+    if let Some(v) = raw.election_timeout_ms {
+        profile_config.election_timeout_ms = v;
+    }
+    if let Some(v) = raw.rpc_timeout_ms {
+        profile_config.rpc_timeout_ms = v;
+    }
+    profile_config
+        .validate()
+        .map_err(|e| ConfigError::ProfileInvalid { message: e.to_string() })?;
+
     Ok(Config {
         cluster_id: raw.cluster_id,
         node_id,
@@ -185,8 +227,10 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
         data_dir: PathBuf::from(raw.data_dir),
         http_listen,
         initial_cluster,
-        heartbeat_interval_ms: raw.heartbeat_interval_ms,
-        election_timeout_ms: raw.election_timeout_ms,
+        profile,
+        heartbeat_interval_ms: profile_config.heartbeat_interval_ms,
+        election_timeout_ms: profile_config.election_timeout_ms,
+        profile_config,
     })
 }
 
@@ -219,17 +263,22 @@ mod tests {
         assert_eq!(config.listen, "127.0.0.1:7000".parse().expect("addr"));
         assert_eq!(config.http_listen, "127.0.0.1:8000".parse().expect("addr"));
         assert_eq!(config.initial_cluster.len(), 1);
-        // Optional profile overrides default to the documented values.
-        assert_eq!(config.heartbeat_interval_ms, DEFAULT_HEARTBEAT_MS);
-        assert_eq!(config.election_timeout_ms, DEFAULT_ELECTION_MS);
+        // No `profile` key defaults to `lan`; the effective tick timings are
+        // the Lan preset values (propsol §7).
+        assert_eq!(config.profile, Profile::Lan);
+        assert_eq!(config.heartbeat_interval_ms, 100);
+        assert_eq!(config.election_timeout_ms, 1000);
     }
 
     #[test]
     fn honors_explicit_profile_overrides() {
-        let toml = format!("heartbeat_interval_ms = 25\nelection_timeout_ms = 250\n{VALID}");
+        let toml = format!(
+            "heartbeat_interval_ms = 25\nelection_timeout_ms = 250\nrpc_timeout_ms = 100\n{VALID}"
+        );
         let config = parse_config(&toml).expect("config with overrides");
         assert_eq!(config.heartbeat_interval_ms, 25);
         assert_eq!(config.election_timeout_ms, 250);
+        assert_eq!(config.profile_config.rpc_timeout_ms, 100);
     }
 
     #[test]
@@ -301,6 +350,61 @@ mod tests {
         let err = parse_config(&toml).expect_err("empty cluster_id must fail");
         assert!(
             matches!(err, ConfigError::EmptyField { field: "cluster_id" }),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_wan_yields_wan_defaults() {
+        let toml = format!("profile = \"wan\"\n{VALID}");
+        let config = parse_config(&toml).expect("wan profile");
+        assert_eq!(config.profile, Profile::Wan);
+        let pc = &config.profile_config;
+        assert_eq!(pc.heartbeat_interval_ms, 500);
+        assert_eq!(pc.election_timeout_ms, 2500);
+        assert_eq!(pc.rpc_timeout_ms, 2000);
+        assert_eq!(pc.max_inflight_bytes, 1024 * 1024);
+        assert_eq!(pc.snapshot_threshold_bytes, 16 * 1024 * 1024);
+        // Q2: read_index_timeout = 2x election timeout.
+        assert_eq!(pc.read_index_timeout_ms, 5000);
+        // Effective tick fields mirror the profile.
+        assert_eq!(config.heartbeat_interval_ms, 500);
+        assert_eq!(config.election_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn profile_override_wins_over_preset() {
+        let toml = format!("profile = \"wan\"\nelection_timeout_ms = 3000\n{VALID}");
+        let config = parse_config(&toml).expect("override config");
+        assert_eq!(config.profile, Profile::Wan);
+        // The override wins over the Wan preset's 2500.
+        assert_eq!(config.profile_config.election_timeout_ms, 3000);
+        // An untouched preset field is preserved.
+        assert_eq!(config.profile_config.heartbeat_interval_ms, 500);
+    }
+
+    #[test]
+    fn rejects_an_unknown_profile() {
+        let toml = format!("profile = \"mars\"\n{VALID}");
+        let err = parse_config(&toml).expect_err("unknown profile must fail");
+        assert!(
+            matches!(err, ConfigError::UnknownProfile { .. }),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_profile_combination() {
+        // `rpc_timeout_ms` must be `< election_timeout_ms`; a value at/above
+        // the heartbeat (and thus the election) is rejected at parse time.
+        let toml = format!("profile = \"wan\"\nrpc_timeout_ms = 3000\n{VALID}");
+        let err = parse_config(&toml).expect_err("rpc >= election must be rejected");
+        assert!(
+            matches!(err, ConfigError::ProfileInvalid { .. }),
+            "error: {err}"
+        );
+        assert!(
+            err.to_string().contains("rpc_timeout_ms"),
             "error: {err}"
         );
     }
