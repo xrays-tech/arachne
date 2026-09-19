@@ -28,11 +28,41 @@ edition = "2021"
 turmoil = "0.7"
 # The async runtime the simulator drives.
 tokio = { version = "1", features = ["full"] }
-# The product core and the seam vocabulary, pulled LEAN (no tonic transport):
-# mirrors the production sim-build rule (`default-features = false`, test-plan
-# §3.2) so the L2 build stays light and never silently pulls in tonic.
+# The product core, pulled LEAN (no tonic transport of its own): the real
+# transport is pulled separately below (M1 stage 3b), so the L2 build is the
+# one place that deliberately wires tonic into the sim.
 arachne = { path = "../arachne", default-features = false }
 arachne-seam = { path = "../arachne-seam" }
+# M1 stage 3b: the REAL production transport, driven over the sim through its
+# `TransportIo` seam (`TurmoilIo`). This is the whole point of stage 3a — the
+# same tonic code that runs over real TCP in production now runs over turmoil.
+arachne-transport-tonic = { path = "../arachne-transport-tonic" }
+# The `TurmoilIo` seam impl names these types directly (the `Service` connector
+# for `connect_with_connector`, hyper's async I/O bounds, the HTTP types, and the
+# incoming-connection stream). All are already in the tree via tonic, so this
+# adds no new transitive weight. `tower` must be 0.4 (the version tonic uses).
+tonic = "0.12"
+prost = "0.13"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.4", features = ["util"] }
+http = "1"
+async-stream = "0.3"
+tokio-stream = "0.1"
+# The node runtime actor is driven by a `slog::Logger`.
+slog = "2"
+# The raft consensus library — needed directly only for the stage-2 hook
+# `raft::set_election_rng_seed`, which seeds the election-timeout RNG so the
+# election is deterministic under a fixed seed.
+raft = "0.7"
 
 # Standalone workspace root (keeps `l2/` out of the root Arachne workspace).
 [workspace]
+
+# l2 is its OWN workspace, so it needs its OWN copy of the root's raft patch:
+# `[patch]` does not propagate through path dependencies. Without this, l2 would
+# resolve `raft` to crates.io's 0.7 (which lacks `set_election_rng_seed`) and the
+# harness could not seed the election RNG. This points at the same vendored copy
+# the root workspace patches to.
+[patch.crates-io]
+raft = { path = "../third_party/raft" }
