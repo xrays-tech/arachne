@@ -8,12 +8,40 @@ rust-version.workspace = true
 
 [dependencies]
 # This crate depends on the SEAM crate (`arachne-seam`), NOT on `arachne`.
-# That is what makes its future `impl Transport` (and friends) implementable
-# without creating a `arachne` -> arachne-transport-tonic -> arachne cycle:
+# That is what makes its `impl Transport` (and friends) implementable without
+# creating an `arachne` -> arachne-transport-tonic -> arachne cycle:
 # `arachne` feature-gatedly depends on THIS crate, and this crate depends only
 # on the leaf `arachne-seam`, which depends on nothing.
-#
-# No external crates yet: `tonic` / `rustls` (the only crates this crate may
-# reference) land in a later phase. Until then it is dependency-free (besides
-# `arachne-seam`) so the whole workspace builds offline.
 arachne-seam = { workspace = true }
+
+# The only crates this crate may reference for the network stack. Everything
+# below is tonic/rustls/prost territory and stays inside this crate:
+tonic = "0.12"
+prost = "0.13"
+# `tokio` for the async server/client, channel, and `CancellationToken`-free
+# shutdown; `tokio-util` for the `CancellationToken` used to stop servers.
+# (Both are already in the dependency tree via tonic, so this adds no new
+# transitive weight.)
+tokio = { version = "1", features = ["full"] }
+# `tokio-stream` provides `TcpListenerStream`, the incoming-connection stream the
+# tonic server drains from a pre-bound listener. `tokio-util` provides the
+# `CancellationToken` used to stop servers on `shutdown`.
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "1"
+
+[build-dependencies]
+# Codegen for the wire protocol (`proto/raft.proto`).
+tonic-build = "0.12"
+# A vendored `protoc` so the build is reproducible and independent of whatever
+# `protoc` (if any) is on the developer/CI PATH. The build script points
+# `PROTOC` at it; see `build.rs`.
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+# Test-only: the integration test (`tests/three_node.rs`) drives real
+# `RaftNode`s + `WalStorage` + `KvStateMachine` over this transport, so it needs
+# the `arachne` core. This is a dev-dependency only (it never leaks into this
+# crate's normal dependency tree). `slog` provides the logger the nodes need.
+arachne = { workspace = true }
+slog = "2"

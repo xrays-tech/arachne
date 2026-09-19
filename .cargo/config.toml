@@ -1,0 +1,9 @@
+# Project-local cargo configuration.
+#
+# `protobuf-build` (used by `raft-proto`, a dependency of the `arachne` core)
+# only accepts a `protoc` whose version is `3.x`; it rejects the
+# calendar-versioned `25.x`/`31.x` that modern distributions ship. This points
+# `PROTOC` at `scripts/find-protoc.sh`, which resolves a usable `protoc` 3.x so
+# the whole workspace builds (see that script for details).
+[env]
+PROTOC = "scripts/find-protoc.sh"

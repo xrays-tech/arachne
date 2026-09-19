@@ -1,31 +1,87 @@
-//! Arachne tonic transport.
+//! Arachne tonic transport — the real network transport (M1).
 //!
-//! This crate is the ONLY crate in the workspace allowed to reference `tonic`
-//! and `rustls` types. All other crates must interact with the network
-//! exclusively through the transport-agnostic core (`arachne`) and its seam
-//! traits (in the leaf `arachne-seam` crate).
+//! This crate is the ONLY crate in the workspace allowed to reference `tonic`,
+//! `prost`, and (later, M4) `rustls` types. Every other crate talks to the
+//! network exclusively through the transport-agnostic seam traits in the leaf
+//! [`arachne_seam`] crate.
 //!
-//! This crate depends on `arachne-seam` (NOT on `arachne`) so that its future
-//! `impl arachne_seam::Transport` can be written here without reintroducing the
-//! `arachne` <-> `arachne-transport-tonic` dependency cycle: `arachne`
-//! feature-gatedly depends on this crate, while this crate depends only on the
-//! leaf `arachne-seam`.
+//! # What this crate provides
 //!
-//! No external dependencies (`tonic`, `rustls`) have been added yet — they land
-//! in a later phase. Until then this crate only depends on `arachne-seam`, so
-//! the whole workspace builds without network access.
+//! * [`TonicTransport`] — the outbound half ([`Transport`]): resolves a
+//!   [`NodeId`] to a `SocketAddr`, lazily opens/reuses a tonic channel, attaches
+//!   the handshake, and maps the result to a typed [`TransportError`].
+//! * [`TonicRx`] — the inbound half ([`TransportRx`]): pulls accepted payloads
+//!   off a channel; `None` once the transport is shut down.
+//! * [`TonicTransportFactory`] — mints the `(Tx, Rx)` halves for a node
+//!   ([`TransportFactory`]), owns the cluster identity (cluster id, protocol
+//!   version), the `NodeId → SocketAddr` map, and a graceful `shutdown()`.
+//! * The gRPC wire protocol ([`proto`]) and its server half, which performs the
+//!   handshake and rejects (`cluster_id` / protocol mismatches) with a counter.
+//!
+//! # M1 scope
+//!
+//! M1 is **plaintext** gRPC — there is no TLS yet (mTLS lands at M4). The
+//! handshake (protocol version, cluster id, node id) IS in M1: it rides on every
+//! message and is validated on the receiving side, so a cross-cluster or
+//! version-incompatible node is rejected with a counter (propsol §5.6).
+//!
+//! All tonic/rustls/prost types stay inside this crate; the public API below
+//! exposes only `NodeId`, `TransportMessage`, and `SocketAddr`.
 
-/// Return the name of this transport.
-pub fn transport_name() -> &'static str {
-    "tonic"
+pub mod error;
+pub mod factory;
+pub mod handshake;
+pub mod rx;
+pub mod server;
+pub mod transport;
+
+/// The generated gRPC wire types (client, server, and message structs) for
+/// [`proto/raft.proto`](crate::proto::raft). These are the only tonic/prost
+/// types in this crate's module tree.
+pub mod proto {
+    tonic::include_proto!("raft");
 }
 
-#[cfg(test)]
-mod tests {
-    use super::transport_name;
+pub use error::TransportError;
+pub use factory::TonicTransportFactory;
+pub use rx::TonicRx;
+pub use transport::TonicTransport;
 
-    #[test]
-    fn transport_name_is_tonic() {
-        assert_eq!(transport_name(), "tonic");
+/// Recover a `Mutex` guard even from a poisoned lock.
+///
+/// A poisoned lock means a prior thread panicked while holding it. The guarded
+/// data here is a simple `HashMap`, so recovering is safe (no invariant is
+/// violated by the map itself). This keeps the transport from turning a stray
+/// panic into a hard failure of every subsequent `send`/`recv`.
+pub(crate) fn unlock<'a, T>(mutex: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Recover a read guard even from a poisoned lock (see [`unlock`]).
+pub(crate) fn unlock_read<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+) -> std::sync::RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Recover a write guard even from a poisoned lock (see [`unlock`]).
+pub(crate) fn unlock_write<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The name of this transport (re-exported by `arachne` when its
+/// `transport-tonic` feature is enabled).
+pub fn transport_name() -> &'static str {
+    "tonic"
 }

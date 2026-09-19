@@ -1,0 +1,50 @@
+// Arachne raft transport wire protocol (M1).
+//
+// A single unary `Send` RPC carries one already-framed raft payload together
+// with the handshake envelope (`Hello`) the sender uses to prove it belongs to
+// the right cluster at a compatible protocol version. The server validates the
+// handshake before accepting the payload.
+//
+// M1 is plaintext gRPC (mTLS lands at M4). The handshake (protocol_version /
+// cluster_id / node_id / feature_flags) belongs to M1: it rides on every
+// message and is validated on the receiving side.
+syntax = "proto3";
+
+package raft;
+
+service RaftTransport {
+  // Deliver one raft payload to this node.
+  rpc Send(RaftEnvelope) returns (SendReply);
+}
+
+// One message in transit: the opaque raft payload plus its handshake.
+message RaftEnvelope {
+  // The already-framed raft wire payload (a serialized raft 0.7 `Message`).
+  bytes payload = 1;
+  // The sender's handshake (protocol version, cluster id, node id, flags).
+  Hello hello = 2;
+}
+
+// The handshake exchanged on every send (propsol §5.6).
+message Hello {
+  // Protocol major version. Receiving nodes reject any *other* major.
+  uint32 protocol_major = 1;
+  // Protocol minor version. Receiving nodes accept only `peer_minor <= self_minor`
+  // (backward-compatible only).
+  uint32 protocol_minor = 2;
+  // The cluster this sender belongs to. Must equal the receiver's cluster id.
+  string cluster_id = 3;
+  // The sender's node id (the authoritative sender tag the receiver trusts).
+  string node_id = 4;
+  // Optional feature flags the sender advertises (empty in M1).
+  repeated string feature_flags = 5;
+}
+
+// The server's verdict on an inbound `Send`.
+message SendReply {
+  // `true` when the handshake passed and the payload was accepted.
+  bool accepted = 1;
+  // Empty on success; otherwise a stable error code
+  // (`cluster_id_mismatch` / `protocol_mismatch` / …).
+  string error_code = 2;
+}
