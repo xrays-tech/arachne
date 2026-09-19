@@ -35,6 +35,20 @@ jobs:
           cargo --version
           rustc --version
 
+      # `raft-proto`'s `protobuf-build` (a dependency of the `arachne` core)
+      # requires a `protoc` whose version is 3.x and rejects the newer
+      # calendar-versioned releases modern distros ship. Install a pinned 3.x
+      # and put it on PATH; `scripts/find-protoc.sh` (pointed at by PROTOC in
+      # .cargo/config.toml) then resolves it.
+      - name: Install protoc 3.x (raft-proto codegen requirement)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v3.20.3/protoc-3.20.3-linux-x86_64.zip
+          unzip -o -q /tmp/protoc.zip -d "$HOME/protoc3"
+          echo "$HOME/protoc3/bin" >> "$GITHUB_PATH"
+          "$HOME/protoc3/bin/protoc" --version
+
       - name: Build workspace
         run: cargo build --workspace
 
