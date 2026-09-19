@@ -2,16 +2,17 @@
 
 > 面向**新会话**。先读本文，再读 `dev-docs/propsol-v0.2.8`（设计权威）与 `dev-docs/test-plan-v0.1.3`（测试方案）。会话态进度见 `.slim/deepwork/arachne-m1.md`（git-local，但 OpenCode 可读）。
 >
-> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**234 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
+> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**271 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
 
 ## 1. 现状总览
 
 - **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
-- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）** 与 **(B) M1-3b ReadIndex 线性一致读（commit 6616827）**；**未完成 M1-4 / M1-5**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。
+- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）** 与 **(C) stage 1 ClientOracle + 线性化检查器（commit a915f6b）**；**未完成 (C) stage 2/3（D-S1 raft RNG 补丁 + SimNetwork/S01/S02/S16/INV）+ M1-5/(D)**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。**待办**：(C) stage 1 的 oracle 确认门禁因 oracle provider 连续失败而未跑（已记录），provider 恢复后补跑。
 
 ### 提交线（新 → 旧）
 ```
-6616827 M1-3b 真实 ReadIndex 线性一致读（Safe 读 + wait applied + 1 重试）      ← HEAD
+a915f6b M1-4 (C) stage 1: ClientOracle v1 + 自建线性化检查器                ← HEAD
+6616827 M1-3b 真实 ReadIndex 线性一致读（Safe 读 + wait applied + 1 重试）
 5081417 M1-5 (A) arachne-node 真实 tonic 3 进程集群 + start_with_bind + config addresses
 8cbc765 M1-3a(3/3) follower 写重定向到 leader（真实 tonic 3 节点）
 ea08dab M1-3a(2/3) arachne-node 接线 lib runtime + /kv HTTP 端点
@@ -52,11 +53,15 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **顺带修复**：`client/mod.rs` 首页语义表与 `arachne-node/main.rs` 的 GET 说明原为"临时 leader-local 读"，已更正为 ReadIndex；`ArachneError::Busy` 文案覆盖读等待队列。
 - **已知缺口/延后**：`read_index_round_latency` 直方图留 M2（无直方图设施）；`redirects_total` 属客户端侧（`Metrics` 无法从 `Handle` 触达）；**"已被废黜但尚未察觉的旧 leader 不得服务陈旧读"这一决定性性质需要分区注入 → 属 (C)/L2（INV14、S02/S16）**。现有 `read_index.rs` 健康集群下无法区分 ReadIndex 与旧 leader-local 读（已记录）。
 
-### (C) M1-4：L2 turmoil + 不变量 + 线性化（M1 验收 ④）
-- `l2/` 铺满 SimNetwork 原语（partition/hold/release/crash/bounce）。
-- `ClientOracle` v1（逐 seq、幻值、one-log-id-per-seq、read-your-writes、单调读、持久性扫描）+ 自建 Wing–Gong 检查器（缩减历史）；stateright 作交叉验证（`model-check/`）。
-- INV3/4/7/8/9 + 场景 S01/S02/S16。
-- **D-S1**：raft 0.7 选举 RNG 不可注入（`raft-0.7.0/src/raft.rs` 的 `reset_randomized_election_timeout` 用 `thread_rng`）→ 视需要打 workspace `[patch.crates-io]` 一行补丁，以上游化为目标。
+### (C) M1-4：L2 turmoil + 不变量 + 线性化（M1 验收 ④）— **分阶段执行中（用户选定：每阶段一个 oracle 门禁）**
+**stage 1（已完成，commit a915f6b）：ClientOracle v1 + 自建线性化检查器**
+- `arachne-testsupport::oracle`：无时钟纯逻辑历史（`ValueId`/`ClientId`/`SeqNo`/`CallId` + 逻辑 ts）、`merge_retries`（记录层保留原多次调用）、检查①幻值（区间语义：Put 可解释读当且仅当 `put.invoke < get.complete`）、②one-log-id-per-seq（含 Put|Delete）、③RYW（latest-mutation-wins）、④单调读，可选⑤丢写/⑥持久性；`History::validate` 对畸形历史（complete 无 invoke／CallId 复用／同 `(client,seq)` op 不一致）**报错而非静默丢弃**；§9 JSONL。
+- `arachne-testsupport::linearizability`：实时偏序上的完备回溯搜索（Wing–Gong 等价）；**required**点（成功 op）+ **optional**点（结果未知/在途写，故 timeout-committed 竞态不再是假违规）；超 `MAX_CHECK_POINTS=12` → `Inconclusive`；witness 贪心最小化；确定性（BTree/Vec、无 HashMap 迭代）。
+- 测试：testsupport 79 项（含每检查一条坏历史元测试、贪心对抗回溯正例、**32 种子与 stateright 差分一致**——stateright 仅 dev-dependency，结构化隔离经 Gate C 验证）。
+- **门禁状态**：初次 oracle 门禁 NO-GO（B1 并发 put/读假阳性、B2 自删 RYW 假阳性、B3 timeout 写被当作未生效）已按门禁处方修复并加回归；**修复后的确认门禁 PENDING**——oracle provider 连续 3 次失败（ora-1/ora-2/ora-4 均 error），provider 恢复后补跑。stateright 交叉验证暂限"全成功"历史（未知结果写不喂 stateright，避免 pending-invocation 建模偏差）——确认门禁需评估此缺口是否可接受。
+
+**stage 2（未开始）：D-S1**：`raft-0.7.0/src/raft.rs` 的 `reset_randomized_election_timeout` 用 `rand::thread_rng` 且无可注入/播种入口；root `Cargo.toml` 无 `[patch.crates-io]`。→ 打 workspace `[patch.crates-io]` 一行 RNG 注入补丁（以上游化为目标），落地双跑复现金丝雀。
+**stage 3（未开始）**：`arachne-transport-tonic` 加 I/O 接缝（注入 listener 工厂 + connector；生产用真实 tokio 实现，L2 用 turmoil 实现）→ `l2/` 铺满 SimNetwork 原语（partition/partition_oneway/repair/hold/release/set_fail_rate/crash/bounce）+ INV3/4/7/8/9 + S01/S02/S16 + 双跑复现门禁。**用户已选定：给 production transport 加 I/O 接缝**（而非独立适配 crate）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
 - (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
