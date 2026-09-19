@@ -25,6 +25,15 @@ raft = "0.7"
 slog = "2"
 thiserror = "1"
 protobuf = "2"
+# The node runtime actor (`runtime`) is an async `tokio` task: it owns the
+# command channel, the tick interval, and its bounded waits. `tokio` is an
+# always-on dependency of the core (the actor genuinely needs a runtime). It is
+# NOT a network dependency, so the lean core (`--no-default-features`) still
+# builds without the tonic transport (check-deps Gate B is unaffected). Both
+# `tokio` and `tokio-util` are already in the dependency tree (via
+# `arachne-transport-tonic`/`arachne-node`), so this adds no new external crate.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Optional: only compiled when the `transport-tonic` feature is enabled.
 # This is the sole edge from the core to a concrete transport, and it is the
@@ -37,6 +46,10 @@ arachne-transport-tonic = { workspace = true, optional = true }
 # scripts/check-deps.sh Gate A: production crates may only pull in
 # arachne-testsupport via [dev-dependencies]).
 arachne-testsupport = { workspace = true }
+# The client/runtime integration tests are async (`#[tokio::test]`) and await
+# commands against a running runtime actor; `tokio` is dev-only (the core itself
+# is runtime-agnostic).
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 # NOTE: integration tests (`tests/`) are part of this package and can therefore
 # use the normal `[dependencies]` directly (`slog`, `raft`, ...). No extra
 # dev-dependency entries are needed for those.

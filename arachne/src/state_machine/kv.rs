@@ -156,6 +156,19 @@ impl KvStateMachine {
         buf.extend_from_slice(key);
         buf
     }
+
+    /// Whether the session `(client_id, seq_no)` has been applied, i.e. its
+    /// result is cached in the session table.
+    ///
+    /// The node runtime uses this to detect that a proposed command has been
+    /// committed and applied (the propose→commit→apply→reply path, propsol §3):
+    /// once the command's session is cached, the write is durable and visible.
+    /// A replayed (deduped) session is reported as applied as soon as it was
+    /// first applied, which is exactly the semantics a waiting caller wants.
+    pub fn applied_session(&self, client_id: u64, seq_no: u64) -> bool {
+        self.sessions
+            .contains_key(&SessionKey { client_id, seq_no })
+    }
 }
 
 impl Default for KvStateMachine {

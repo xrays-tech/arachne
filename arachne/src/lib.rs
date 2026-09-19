@@ -52,10 +52,17 @@
 //! holding the full §7 field table; individual fields are overridable and the
 //! result is validated with [`ProfileConfig::validate`] (see `profile`).
 
+pub mod client;
 pub mod consensus;
+pub mod metrics;
 pub mod profile;
+pub mod runtime;
 pub mod state_machine;
 pub mod storage;
+
+pub use client::ArachneError;
+pub use metrics::Metrics;
+pub use runtime::{Command, Runtime, RuntimeConfig};
 
 pub use arachne_seam::seam;
 pub use arachne_seam::types;

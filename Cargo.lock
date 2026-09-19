@@ -37,6 +37,8 @@ dependencies = [
  "raft",
  "slog",
  "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
