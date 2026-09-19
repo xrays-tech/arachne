@@ -2,17 +2,20 @@
 
 > 面向**新会话**。先读本文，再读 `dev-docs/propsol-v0.2.8`（设计权威）与 `dev-docs/test-plan-v0.1.3`（测试方案）。会话态进度见 `.slim/deepwork/arachne-m1.md`（git-local，但 OpenCode 可读）。
 >
-> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**275 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
+> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**277 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
 
 ## 1. 现状总览
 
 - **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
-- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）** 与 **(C) stage 1 ClientOracle + 线性化检查器（commit a915f6b；自证补强 395fc9a）**；**未完成 (C) stage 2/3（D-S1 raft RNG 补丁 + SimNetwork/S01/S02/S16/INV）+ M1-5/(D)**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。
-- **⚠ 已暂停（用户决定）**：(C) stage 1 的 oracle 确认门禁因 **oracle provider 持续故障（ora-1/2/4/5 连续 5 次 error，读完文件即错）** 无法运行。已按"先补强自证"补足本地证据（见 (C) 节），随后**暂停等待 provider 恢复**；恢复后第一步 = 补跑 stage 1 确认门禁，再继续 stage 2/3。
+- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）** 与 **(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）**；**未完成 (C) stage 3（transport I/O 接缝 + turmoil SimNetwork + S01/S02/S16 + INV3/4/7/8/9 + 双跑门禁）+ M1-5/(D)**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。
+- **✅ 已恢复**：oracle provider 故障（模型 id 无法解析 + 空结果）已解决；(C) stage 1 确认门禁已补跑并 **GO**，stage 2 门禁亦 **GO**。
 
 ### 提交线（新 → 旧）
 ```
-a915f6b M1-4 (C) stage 1: ClientOracle v1 + 自建线性化检查器                ← HEAD
+f132e44 M1-4 (C) stage 2: D-S1 可播种 raft 选举 RNG [patch.crates-io] + 双跑金丝雀     ← HEAD
+9bf857f docs: (C) stage 1 确认门禁 GO
+395fc9a M1-4 (C) stage 1 自证补强（1000 种子差分/witness 回放/optional 单调性）
+a915f6b M1-4 (C) stage 1: ClientOracle v1 + 自建线性化检查器
 6616827 M1-3b 真实 ReadIndex 线性一致读（Safe 读 + wait applied + 1 重试）
 5081417 M1-5 (A) arachne-node 真实 tonic 3 进程集群 + start_with_bind + config addresses
 8cbc765 M1-3a(3/3) follower 写重定向到 leader（真实 tonic 3 节点）
@@ -61,8 +64,8 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - 测试：testsupport 79 项（含每检查一条坏历史元测试、贪心对抗回溯正例、**32 种子与 stateright 差分一致**——stateright 仅 dev-dependency，结构化隔离经 Gate C 验证）。
 - **门禁状态：GO（已通过）**。初次 oracle 门禁 NO-GO（B1 并发 put/读假阳性、B2 自删 RYW 假阳性、B3 timeout 写被当作未生效）已按门禁处方修复并加回归；期间 oracle provider 出过故障（模型 id `zhipuai-coding-plan/GLM-5.3-Flash` 无法解析 + 空结果），先补强本地自证（commit `395fc9a`：1000 种子多键差分对 stateright、witness 回放 500 种子模糊、optional 单调性、500 顺序历史 oracle+checker 双通过）。provider 恢复后**确认门禁经 ora-2 判 **GO****：三个 blocker 均被证明真实修复且回归测试在旧代码上会失败；S1–S5 解决；新增自证被判为实质性。**遗留 nit（L2 阶段跟进）**：(a) 差分生成器均为顺序历史，未对并发/排序搜索做 stateright 交叉验证（现靠手写并发/回溯用例覆盖）；(b) `MAX_CHECK_POINTS=12` 在对抗性全失败历史上仍有 ~12! 最坏情况——L2 接真实交错历史时需降 cap 或加 memoization。stateright 交叉验证暂限"全成功"历史（未知结果写不喂 stateright，避免 pending-invocation 建模偏差），门禁判定为**可接受的已记录缺口**。
 
-**stage 2（未开始）：D-S1**：`raft-0.7.0/src/raft.rs` 的 `reset_randomized_election_timeout` 用 `rand::thread_rng` 且无可注入/播种入口；root `Cargo.toml` 无 `[patch.crates-io]`。→ 打 workspace `[patch.crates-io]` 一行 RNG 注入补丁（以上游化为目标），落地双跑复现金丝雀。
-**stage 3（未开始）**：`arachne-transport-tonic` 加 I/O 接缝（注入 listener 工厂 + connector；生产用真实 tokio 实现，L2 用 turmoil 实现）→ `l2/` 铺满 SimNetwork 原语（partition/partition_oneway/repair/hold/release/set_fail_rate/crash/bounce）+ INV3/4/7/8/9 + S01/S02/S16 + 双跑复现门禁。**用户已选定：给 production transport 加 I/O 接缝**（而非独立适配 crate）。
+**stage 2（已完成，commit f132e44）：D-S1 可播种 raft 选举 RNG**：`arithmetic raft` 0.7.0 唯一 RNG 点（`reset_randomized_election_timeout`）原用不可播种的 `thread_rng`。已 vendor `third_party/raft/`（与 registry 仅差一个最小可上游化 hook：thread-local 可播种选举 RNG + 每节点子流 `base ^ node_id`；未设种子时行为与上游逐字节一致），root `Cargo.toml` 加 `[patch.crates-io]`，`ARACHNE-PATCH.md` 记录 diff 与「需单线程」约束；`arachne/tests/determinism_canary.rs` = 同种子双跑轨迹逐字节一致 + 不同种子→不同选举超时。**门禁 GO**；已知 nit：Cargo.lock 附带把 windows-sys 0.61.2→0.52.0（semver 合法、Windows-only）；hook 需单线程（E8），已在 PATCH.md 记录。
+**stage 3（未开始，下一步）**：`arachne-transport-tonic` 加 I/O 接缝（注入 listener 工厂 + connector；生产用真实 tokio 实现，L2 用 turmoil 实现）→ `l2/` 铺满 SimNetwork 原语（partition/partition_oneway/repair/hold/release/set_fail_rate/crash/bounce）+ INV3/4/7/8/9 + S01/S02/S16 + 双跑复现门禁。**用户已选定：给 production transport 加 I/O 接缝**（而非独立适配 crate）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
 - (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
