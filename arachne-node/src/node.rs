@@ -1,44 +1,43 @@
-//! Assembly of a single-node Arachne node: WAL + KV state machine + `RaftNode`.
+//! Assembly of an Arachne node over the lib runtime actor.
 //!
-//! M0 runs one node over the local placeholder transport (no peers). The drive
-//! loop ticks raft, persists `Ready`s, applies committed entries to the state
-//! machine, and refreshes the metrics registry.
+//! The node is a thin wiring layer (D-ART): it opens the WAL, builds the lib
+//! [`Runtime`] (WAL + state machine + raft node), spawns the actor, and exposes
+//! a client [`Handle`]. All consensus/storage logic lives in the `arachne` lib,
+//! so the process under test is the shipped path.
 //!
-//! The real tonic transport arrives at M1; only [`Arachne::open`] changes then.
+//! M1-3a runs the single-node placeholder transport (no peers). The tonic
+//! transport is wired for real clustering in a later increment.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arachne::consensus::{RaftNode, RaftNodeConfig};
-use arachne::state_machine::KvStateMachine;
+use arachne::client::Handle;
+use arachne::consensus::RaftNodeConfig;
+use arachne::runtime::{Runtime, RuntimeConfig};
 use arachne::storage::{WalConfig, WalOptions, WalStorage};
-use arachne::{StateMachine, StorageError};
+use arachne::{Metrics, StorageError};
 use slog::Logger;
 
 use crate::config::Config;
-use crate::metrics::Metrics;
 use crate::transport::{PlaceholderRx, PlaceholderTx};
 
-/// The concrete raft node type for M0.
-pub type Node = RaftNode<WalStorage, PlaceholderTx, PlaceholderRx>;
+/// The node runtime type for the placeholder (no-peer) transport.
+pub type NodeRuntime = Runtime<PlaceholderTx, PlaceholderRx>;
 
-/// Errors from assembling or driving the node.
+/// Errors from assembling the node.
 #[derive(Debug)]
 pub enum NodeError {
     /// A durable-storage failure (open or I/O).
     Storage(StorageError),
-    /// A raft-core failure.
-    Raft(String),
-    /// A state-machine apply failure (invariant violation — fail-stop).
-    StateMachine(String),
+    /// A runtime-assembly failure.
+    Runtime(String),
 }
 
 impl std::fmt::Display for NodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeError::Storage(e) => write!(f, "storage error: {e}"),
-            NodeError::Raft(e) => write!(f, "raft error: {e}"),
-            NodeError::StateMachine(e) => write!(f, "state machine error: {e}"),
+            NodeError::Runtime(e) => write!(f, "runtime error: {e}"),
         }
     }
 }
@@ -51,21 +50,23 @@ impl From<StorageError> for NodeError {
     }
 }
 
-/// A running single-node Arachne node.
+/// A running Arachne node.
 pub struct Arachne {
-    raft: Node,
-    sm: KvStateMachine,
+    task: tokio::task::JoinHandle<()>,
+    handle: Handle,
     metrics: Arc<Metrics>,
-    raft_id: u64,
 }
 
 impl Arachne {
-    /// Open the node's WAL and assemble the raft node. A fresh node starts with
-    /// `applied = 0` (M0 does not yet replay a persisted state-machine snapshot).
+    /// Open the node's WAL, assemble the lib runtime, and spawn its actor.
     ///
     /// Both the WAL (`fsync_policy`, `segment_bytes`) and the raft tick/flow
-    /// timings are driven by the validated [`ProfileConfig`] (propsol §7).
-    pub fn open(config: &Config, metrics: Arc<Metrics>, logger: &Logger) -> Result<Self, NodeError> {
+    /// timings are driven by the validated [`arachne::ProfileConfig`] (propsol §7).
+    pub async fn open(
+        config: &Config,
+        metrics: Arc<Metrics>,
+        logger: &Logger,
+    ) -> Result<Self, NodeError> {
         let profile = &config.profile_config;
         let wal = WalStorage::open(
             &config.data_dir,
@@ -81,82 +82,48 @@ impl Arachne {
             },
         )?;
 
-        let raft = RaftNode::new_with_config(
-            config.raft_id,
-            // M0 single-node: no peers. Bootstrap voters = {self}.
-            HashMap::new(),
+        // M1-3a: single node, no peers (bootstrap voters = {self}).
+        let runtime_config = RuntimeConfig {
+            self_raft_id: config.raft_id,
+            self_node_id: config.node_id.clone(),
+            peers: HashMap::new(),
+            addresses: HashMap::new(),
+            raft: RaftNodeConfig::from_profile(profile),
+            profile: profile.clone(),
+            metrics: Arc::clone(&metrics),
+        };
+
+        let (runtime, handle) = Runtime::new(
+            runtime_config,
             wal,
             PlaceholderTx,
             PlaceholderRx,
-            0,
-            RaftNodeConfig::from_profile(profile),
             logger,
         )
-        .map_err(|e| NodeError::Raft(e.to_string()))?;
+        .map_err(|e| NodeError::Runtime(e.to_string()))?;
 
-        let node = Self {
-            raft,
-            sm: KvStateMachine::new(),
+        let task = tokio::spawn(runtime.run());
+        Ok(Self {
+            task,
+            handle,
             metrics,
-            raft_id: config.raft_id,
-        };
-        node.refresh_metrics();
-        Ok(node)
+        })
     }
 
-    /// One drive cycle: `tick`, persist a `Ready`, apply committed entries,
-    /// advance the apply progress, and refresh metrics.
-    pub async fn tick(&mut self) -> Result<(), NodeError> {
-        self.raft.tick();
-        let entries = self
-            .raft
-            .step()
-            .await
-            .map_err(|e| NodeError::Raft(e.to_string()))?;
-        for (index, data) in entries {
-            self.sm
-                .apply(index, &data)
-                .map_err(|e| NodeError::StateMachine(e.to_string()))?;
-        }
-        self.raft.advance_apply();
-        self.refresh_metrics();
-        Ok(())
+    /// A cheap-`Clone` client handle for this node.
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
     }
 
-    /// Propose a command to the raft log (only meaningful on the leader).
-    pub fn propose(&mut self, command: &[u8]) -> Result<(), NodeError> {
-        self.raft
-            .propose(command)
-            .map_err(|e| NodeError::Raft(e.to_string()))
+    /// The shared metrics registry.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
-    /// The highest applied log index.
-    pub fn applied_index(&self) -> u64 {
-        self.sm.applied_index()
-    }
-
-    /// Read a key from the applied state machine.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, NodeError> {
-        self.sm
-            .get(key)
-            .map_err(|e| NodeError::StateMachine(e.to_string()))
-    }
-
-    /// Whether the node is ready to serve (a leader is known).
-    pub fn is_ready(&self) -> bool {
-        self.raft.leader_id() != 0
-    }
-
-    fn refresh_metrics(&self) {
-        let hard_state = self.raft.hard_state();
-        self.metrics.set_term(hard_state.term);
-        self.metrics.set_commit_index(hard_state.commit);
-        self.metrics.set_applied_index(self.sm.applied_index());
-        self.metrics.set_leader_id(self.raft.leader_id());
-        self.metrics
-            .set_is_leader(self.raft.leader_id() == self.raft_id);
-        // P4 gate: surface dropped sends so a dead transport is visible.
-        self.metrics.set_dropped_sends(self.raft.dropped_send_count());
+    /// Stop the runtime actor (dropping the WAL, releasing the dir lock).
+    pub async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
     }
 }
 
