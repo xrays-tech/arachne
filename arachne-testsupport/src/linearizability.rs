@@ -909,4 +909,204 @@ mod tests {
             );
         }
     }
+
+    // -- Additional local self-evidence -------------------------------------
+
+    /// A multi-key differential generator: `clients` single-sequencer clients
+    /// issuing `ops` successful ops over `keys` keys. Read results are drawn from
+    /// the values written to that key so far (or `None`), so both linearizable
+    /// and non-linearizable histories arise.
+    fn differential_history_multi(seed: u64, ops: u64, clients: u64, keys: u64) -> History {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut h = History::new();
+        let mut call = 0u64;
+        let mut written: BTreeMap<u64, Vec<ValueId>> = BTreeMap::new();
+        let mut vcounter = 0u64;
+        for j in 0..ops {
+            let client = ClientId(j % clients);
+            let seq = SeqNo(j / clients);
+            let inv = j * 4;
+            let comp = inv + 1 + (next() % clients.max(1));
+            call += 1;
+            let key_idx = next() % keys;
+            let key = format!("k{key_idx}").into_bytes();
+            match next() % 3 {
+                0 => {
+                    let v = ValueId(100 + vcounter);
+                    vcounter += 1;
+                    written.entry(key_idx).or_default().push(v);
+                    h.invoke(crate::oracle::CallId(call), client, seq, Op::Put { key, value: v }, inv)
+                        .complete(crate::oracle::CallId(call), comp, OpResult::Ok(None));
+                }
+                1 => {
+                    h.invoke(crate::oracle::CallId(call), client, seq, Op::Delete { key }, inv)
+                        .complete(crate::oracle::CallId(call), comp, OpResult::Ok(None));
+                }
+                _ => {
+                    let res = {
+                        let list = written.entry(key_idx).or_default();
+                        let r = next() % (list.len() as u64 + 1);
+                        if r == 0 {
+                            None
+                        } else {
+                            Some(list[(r - 1) as usize])
+                        }
+                    };
+                    h.invoke(crate::oracle::CallId(call), client, seq, Op::Get { key }, inv)
+                        .complete(crate::oracle::CallId(call), comp, OpResult::Ok(res));
+                }
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn seeded_differential_multi_key_agrees_with_stateright() {
+        let empty = Vec::<(Vec<u8>, ValueId)>::new();
+        for seed in 1..=1000u64 {
+            let h = differential_history_multi(seed, 8, 4, 2);
+            let mine = matches!(
+                check_linearizable(&h, &KvState::new()),
+                CheckOutcome::Linearizable
+            );
+            let reduced = h.merge_retries();
+            let theirs = stateright_verdict(&reduced.ops, &empty);
+            assert_eq!(
+                mine, theirs,
+                "multi-key differential disagreement (seed {seed}): mine={mine}, stateright={theirs}\nhistory={:?}",
+                reduced
+            );
+        }
+    }
+
+    /// Generate a history from a legal, strictly sequential KV execution (one
+    /// client, non-overlapping intervals, per-key increasing values), so the
+    /// oracle must not flag it and the checker must accept it.
+    fn sequential_history(seed: u64, ops: u64, keys: u64) -> History {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut h = History::new();
+        let mut model: BTreeMap<u64, ValueId> = BTreeMap::new();
+        let mut vcounter = 0u64;
+        let mut ts = 0u64;
+        for j in 0..ops {
+            let key_idx = next() % keys;
+            let key = format!("k{key_idx}").into_bytes();
+            let call = crate::oracle::CallId(j + 1);
+            let seq = SeqNo(j);
+            match next() % 3 {
+                0 => {
+                    let v = ValueId(100 + vcounter);
+                    vcounter += 1;
+                    model.insert(key_idx, v);
+                    h.invoke(call, ClientId(0), seq, Op::Put { key, value: v }, ts)
+                        .complete(call, ts + 1, OpResult::Ok(None));
+                }
+                1 => {
+                    model.remove(&key_idx);
+                    h.invoke(call, ClientId(0), seq, Op::Delete { key }, ts)
+                        .complete(call, ts + 1, OpResult::Ok(None));
+                }
+                _ => {
+                    let res = model.get(&key_idx).copied();
+                    h.invoke(call, ClientId(0), seq, Op::Get { key }, ts)
+                        .complete(call, ts + 1, OpResult::Ok(res));
+                }
+            }
+            ts += 2;
+        }
+        h
+    }
+
+    #[test]
+    fn sequential_histories_pass_oracle_and_checker() {
+        let initial = KvState::new();
+        for seed in 1..=500u64 {
+            let h = sequential_history(seed, 8, 2);
+            let report = h.check();
+            assert!(
+                report.passed(),
+                "oracle flagged a legal sequential history (seed {seed}): {}",
+                report.render()
+            );
+            assert!(
+                matches!(check_linearizable(&h, &initial), CheckOutcome::Linearizable),
+                "checker rejected a legal sequential history (seed {seed})"
+            );
+        }
+    }
+
+    #[test]
+    fn witness_replays_as_violation() {
+        let initial = KvState::new();
+        // Deterministic known violation: its witness must itself replay as one.
+        let reduced = stale_read_after_newer().merge_retries();
+        match check_reduced(&reduced.ops, &initial) {
+            CheckOutcome::Violation { witness } => {
+                let sub: Vec<LogOp> = reduced
+                    .ops
+                    .iter()
+                    .filter(|o| o.calls.iter().any(|c| witness.contains(c)))
+                    .cloned()
+                    .collect();
+                assert!(
+                    matches!(check_reduced(&sub, &initial), CheckOutcome::Violation { .. }),
+                    "the witness must replay as a violation"
+                );
+            }
+            other => panic!("expected a violation, got {other:?}"),
+        }
+        // Fuzz breadth: whenever a violation is found, its witness must replay.
+        for seed in 1..=500u64 {
+            let reduced = differential_history_multi(seed, 8, 4, 2).merge_retries();
+            if let CheckOutcome::Violation { witness } = check_reduced(&reduced.ops, &initial) {
+                let sub: Vec<LogOp> = reduced
+                    .ops
+                    .iter()
+                    .filter(|o| o.calls.iter().any(|c| witness.contains(c)))
+                    .cloned()
+                    .collect();
+                assert!(
+                    matches!(check_reduced(&sub, &initial), CheckOutcome::Violation { .. }),
+                    "the witness must replay as a violation (seed {seed})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_write_only_adds_flexibility() {
+        let initial = KvState::new();
+        let mut base = History::new();
+        base.invoke(crate::oracle::CallId(1), ClientId(0), SeqNo(0), Op::Put { key: b"k".to_vec(), value: ValueId(1) }, 0)
+            .complete(crate::oracle::CallId(1), 10, OpResult::Ok(None));
+        base.invoke(crate::oracle::CallId(2), ClientId(1), SeqNo(0), Op::Get { key: b"k".to_vec() }, 20)
+            .complete(crate::oracle::CallId(2), 30, OpResult::Ok(Some(ValueId(1))));
+        assert!(matches!(
+            check_linearizable(&base, &initial),
+            CheckOutcome::Linearizable
+        ));
+
+        // Adding an unknown-outcome (optional) write cannot make a linearizable
+        // history non-linearizable.
+        let mut with_opt = base.clone();
+        with_opt
+            .invoke(crate::oracle::CallId(3), ClientId(2), SeqNo(0), Op::Put { key: b"k".to_vec(), value: ValueId(9) }, 15)
+            .complete(crate::oracle::CallId(3), 18, OpResult::Err(OracleErrorKind::Timeout));
+        assert!(
+            matches!(check_linearizable(&with_opt, &initial), CheckOutcome::Linearizable),
+            "an optional write cannot turn a linearizable history into a violation"
+        );
+    }
 }
