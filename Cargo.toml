@@ -40,3 +40,13 @@ arachne-transport-tonic = { path = "arachne-transport-tonic" }
 arachne-node = { path = "arachne-node" }
 arachne-testsupport = { path = "arachne-testsupport" }
 arachne-sim = { path = "arachne-sim" }
+
+# D-S1 (test-plan §5 E3): inject a minimal seedable election-RNG hook into the
+# consensus core so the L2 same-seed double-run gate is provable. `raft` 0.7.0
+# otherwise draws its randomized election timeout from the unseedable
+# process-wide `thread_rng`. The vendored copy in `third_party/raft/` is
+# byte-identical to the registry source except for that single hook (see
+# `third_party/raft/ARACHNE-PATCH.md`). `raft-proto` stays on the registry —
+# only `raft` is patched.
+[patch.crates-io]
+raft = { path = "third_party/raft" }
