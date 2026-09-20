@@ -212,11 +212,29 @@ impl Handle {
         let order = self.target_order();
         let mut pos = 0usize;
         let mut redirects = 0u32;
+        let mut unreachable_peers = 0u32;
         loop {
             let target = order[pos].clone();
-            let result = self
+            let result = match self
                 .send_propose(&target, &cmd, client_id, seq_no, deadline)
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                // A *peer* that no longer accepts requests is a node that went
+                // away, not this client's node shutting down: keep looking, and
+                // report the loss of quorum once every peer has failed. (A
+                // closed channel on `self` is a genuine shutdown and is
+                // propagated unchanged.)
+                Err(ArachneError::ShuttingDown) if target != self.inner.self_id => {
+                    unreachable_peers += 1;
+                    if unreachable_peers + 1 >= order.len() as u32 {
+                        return Err(ArachneError::QuorumUnavailable);
+                    }
+                    pos = (pos + 1) % order.len();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match result {
                 Ok(()) => return Ok(()),
                 Err(ArachneError::NotLeader { leader_hint }) => {
@@ -243,9 +261,24 @@ impl Handle {
         let order = self.target_order();
         let mut pos = 0usize;
         let mut redirects = 0u32;
+        let mut unreachable_peers = 0u32;
         loop {
             let target = order[pos].clone();
-            let result = self.send_get(&target, key, deadline).await?;
+            let result = match self.send_get(&target, key, deadline).await {
+                Ok(result) => result,
+                // See `propose_with_redirect`: a peer that cannot accept the
+                // request is unreachable, and unreachable peers mean the
+                // cluster cannot confirm a read index.
+                Err(ArachneError::ShuttingDown) if target != self.inner.self_id => {
+                    unreachable_peers += 1;
+                    if unreachable_peers + 1 >= order.len() as u32 {
+                        return Err(ArachneError::QuorumUnavailable);
+                    }
+                    pos = (pos + 1) % order.len();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match result {
                 Ok(value) => return Ok(value),
                 Err(ArachneError::NotLeader { leader_hint }) => {

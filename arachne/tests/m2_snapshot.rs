@@ -225,6 +225,30 @@ fn snapshot_files(dir: &Path) -> Vec<u64> {
     found
 }
 
+/// Wait until some node believes it is the leader. Returns its vector index.
+async fn wait_for_leader(nodes: &[Node]) -> usize {
+    for _ in 0..800 {
+        if let Some(pos) = nodes.iter().position(|n| n.metrics.is_leader()) {
+            return pos;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+    }
+    panic!("no leader elected within the wait budget");
+}
+
+/// Poll a stale read until it answers. Used after a failover, when the actor
+/// may still be catching up with its own election.
+async fn until_stale(handle: &Handle, k: &[u8]) -> Option<Vec<u8>> {
+    for _ in 0..800 {
+        match handle.get_stale(k).await {
+            Ok(Some(v)) => return Some(v),
+            Ok(None) => tokio::time::sleep(core::time::Duration::from_millis(20)).await,
+            Err(_) => tokio::time::sleep(core::time::Duration::from_millis(20)).await,
+        }
+    }
+    None
+}
+
 fn key(i: u64) -> Vec<u8> {
     format!("k{i}").into_bytes()
 }
@@ -496,4 +520,130 @@ async fn a_restart_rebuilds_the_state_machine_from_the_snapshot() {
     node.kill();
     tokio::time::sleep(core::time::Duration::from_millis(100)).await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M2 exit ②: a leader dying while a lagging follower is catching up must not
+/// interrupt the catch-up.
+///
+/// The follower is restarted *and* the leader is killed in the same breath, so
+/// the snapshot the follower needs can only come from the new leader. The
+/// survivors independently exceeded the threshold themselves, so they too have
+/// compacted, and the follower must still be served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killing_the_leader_does_not_interrupt_a_follower_catching_up() {
+    let profile = test_profile();
+    let factory = InMemoryTransportFactory::new();
+    let addresses = addresses(N);
+
+    let mut nodes: Vec<Node> = Vec::new();
+    for i in 1..=N {
+        let dir = temp_dir(&format!("n{i}"));
+        nodes.push(spawn_node(i, N, dir, &factory, &addresses, &profile).await);
+    }
+    for i in 0..N as usize {
+        for j in 0..N as usize {
+            if i != j {
+                nodes[i].handle.register_peer(nodes[j].handle.clone());
+            }
+        }
+    }
+
+    let leader = wait_for_leader(&nodes).await;
+    let leader_id = (leader + 1) as u64;
+    let leader_handle = nodes[leader].handle.clone();
+    until_put(&leader_handle, &key(0), &value(0))
+        .await
+        .expect("the early write commits");
+
+    // A follower goes down, and the cluster writes past the threshold.
+    let victim = (1..=N)
+        .position(|i| i != leader_id)
+        .expect("a follower exists");
+    let victim_id = (victim + 1) as u64;
+    nodes[victim].kill();
+    tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+    for i in 1..=WRITES {
+        until_put(&leader_handle, &key(i), &value(i))
+            .await
+            .expect("write commits with a live quorum");
+    }
+    assert!(
+        nodes[leader].metrics.snapshots_created_total() > 0,
+        "the leader must have compacted before the follower returns"
+    );
+    // The survivor also compacted on its own (it applied the same volume), so
+    // neither survivor can serve the missing prefix from its log.
+    let survivor = (1..=N)
+        .find(|&i| i != leader_id && (i - 1) as usize != victim)
+        .map(|i| (i - 1) as usize)
+        .expect("a second survivor exists");
+    assert!(
+        nodes[survivor].metrics.snapshots_created_total() > 0,
+        "the other survivor must have compacted too, or this scenario would \
+         not need a snapshot after the failover"
+    );
+
+    // The follower returns, and the leader dies immediately after: whatever
+    // brings the follower up must come from the new leader.
+    let victim_dir = nodes[victim].dir.clone();
+    nodes[victim] = spawn_node(victim_id, N, victim_dir, &factory, &addresses, &profile).await;
+    for j in 0..N as usize {
+        if j != victim {
+            nodes[victim].handle.register_peer(nodes[j].handle.clone());
+            nodes[j].handle.register_peer(nodes[victim].handle.clone());
+        }
+    }
+    nodes[leader].kill();
+
+    // The surviving two elect a new leader and keep serving.
+    let mut new_leader = 0usize;
+    for _ in 0..1_500 {
+        if let Some(pos) = nodes
+            .iter()
+            .enumerate()
+            .find(|(pos, n)| *pos != leader && n.is_running() && n.metrics.is_leader())
+            .map(|(pos, _)| pos)
+        {
+            new_leader = pos;
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        nodes[new_leader].metrics.is_leader(),
+        "a new leader must emerge after the old one dies"
+    );
+    let new_leader_handle = nodes[new_leader].handle.clone();
+    assert_ne!(new_leader, leader, "the dead node cannot be the new leader");
+
+    // ...including new writes (the failover must leave a working quorum).
+    let after_failover = WRITES + 1;
+    until_put(&new_leader_handle, &key(after_failover), &value(after_failover))
+        .await
+        .expect("the new leader accepts writes");
+
+    // The lagging follower converges on everything, from both eras.
+    assert_eq!(
+        until_stale(&nodes[victim].handle, &key(0)).await,
+        Some(value(0)),
+        "the pre-compaction write must reach the follower across the failover"
+    );
+    assert_eq!(
+        until_stale(&nodes[victim].handle, &key(after_failover)).await,
+        Some(value(after_failover)),
+        "the post-failover write must reach the follower"
+    );
+    assert!(
+        nodes[victim].metrics.snapshots_installed_total() > 0,
+        "the follower must have installed a snapshot, despite the failover"
+    );
+
+    let dirs: Vec<PathBuf> = nodes.iter().map(|n| n.dir.clone()).collect();
+    for node in nodes.iter_mut() {
+        node.kill();
+    }
+    tokio::time::sleep(core::time::Duration::from_millis(100)).await;
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -202,6 +202,12 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 **测试**：存储单测 +13（快照编解码 8、META 指针 1、WAL 水位/回退/剪枝/越界拒绝/段粒度删除 + 安装 3）；端到端 2 项（新 `arachne/tests/m2_snapshot.rs`，真实 `Runtime` actor + 3 节点内存传输）：
 - `lagging_follower_catches_up_through_a_snapshot`（**M2 验收 ①**）：杀掉一个 follower → leader 写入远超阈值（自动落 2 次快照并压缩）→ follower 带旧 WAL 重启 → 断言它**装上了快照**（`snapshots_installed_total > 0` + 盘上有快照文件）、追平最新值、且**只可能来自快照**的那个 key（写于 follower 宕机之前、已被 leader 压缩）仍在；最后线性一致读与全节点 applied index 一致。
 - `a_restart_rebuilds_the_state_machine_from_the_snapshot`：单节点写入跨阈值 → 重启后**启动即从快照恢复**（`applied_index >= newest snapshot index`，空状态机这里必然是 0）、压缩掉的早期 key 与日志尾部 key 都能读回。
+- `killing_the_leader_does_not_interrupt_a_follower_catching_up`（**M2 验收 ②**）：lagging follower 重启与旧 leader 被杀的**同时**发生，两个存活节点各自都已压缩过日志 → follower 只能从**新 leader** 拿快照；断言新 leader 产生、写入恢复、follower 装上快照并追平两个时代的 key。
+- `arachne/tests/quorum_loss.rs`（**M2 验收 ④**）：3 节点杀掉 leader + 一个 follower → 唯一存活节点**永远无法组成多数派**；断言 `put` 与线性一致 `get` 都在有界时间内返回 **`QuorumUnavailable`**（既不成功也不挂死），`get_stale` 仍从本地状态机正常返回值（N1 弱读），并且两个 peer 恢复后集群重新选主、继续写入、断电前的写入仍在。
+
+**该 ④ 测试暴露并修掉一个客户端错误映射缺陷（`client/handle.rs`）**：重定向链里若某个 peer 已经消失（其命令通道关闭），原实现把该 peer 的 **`ShuttingDown`**（"本节点正在关闭"）原样抛给调用方——语义完全错位，且与 §2.1 承诺的 `QuorumUnavailable` 不符。现在：目标不是自己且报 `ShuttingDown` → 视为"该 peer 不可达"，继续尝试下一个候选；所有 peer 都不可达 → `QuorumUnavailable`。目标是**自己**时的 `ShuttingDown` 仍原样上抛（那才是真的本节点在关闭）。`put`/`get` 两条重定向路径同改。
+
+**M2 验收进度**：①（快照/压缩/追赶）与 ②（追赶中杀 leader）已证；④（杀多数派：写与线性读 `QuorumUnavailable`、`get_stale` 仍可用）已证；③（任意分区拓扑下 `get` 线性一致，INV14 S02/S16）由 stage 3c 的 9 种形态覆盖；⑤（apply 独立任务下写洪峰时 `get` p99 有界 + 延迟预算基准入 CI）**未做**。
 
 **如实声明（M2 仍未做）**：
 - 快照传输仍是**单条 `Ready` 承载**，未分片流式（§5.5.4 的 server-streaming 分片随传输层快照 RPC 落地）；安装期间本地读返回 `Busy` 也未实现（v1 安装是同步阻塞的）。
