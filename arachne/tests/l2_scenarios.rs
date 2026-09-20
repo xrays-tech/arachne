@@ -897,6 +897,10 @@ fn inv4_concurrent_ops_spanning_failover_linearizable() {
     let mut leader = elect(&mut c);
     let initial_leader = leader;
 
+    // A pre-failover committed entry on a separate key, to pin retention across
+    // the leadership change (the recorded history only covers key "k").
+    commit_put(&mut c, leader, b"old", ValueId(1000), 1000);
+
     let mut h = History::new();
     let mut ts = 0u64;
     let mut version = 0u64;
@@ -918,6 +922,12 @@ fn inv4_concurrent_ops_spanning_failover_linearizable() {
         if r == 2 {
             c.faults.isolate(leader);
             leader = wait_new_leader(&mut c, leader);
+            // INV: the new leader retains the pre-failover committed entry.
+            assert_eq!(
+                c.sms[(leader - 1) as usize].get(b"old").expect("sm get"),
+                Some(vbytes(ValueId(1000))),
+                "the new leader must retain the pre-failover committed entry"
+            );
         }
 
         commit_put(&mut c, leader, b"k", value, r * 4 + 1);
@@ -932,6 +942,7 @@ fn inv4_concurrent_ops_spanning_failover_linearizable() {
         c.leader_obs.iter().any(|&(_, l)| l != initial_leader),
         "the trace must show a leader change caused by the failover"
     );
+    assert_single_leader_per_term(&c.leader_obs);
     let report = h.check();
     assert!(report.passed(), "oracle failures (spanning failover): {}", report.render());
     let outcome = check_linearizable(&h, &KvState::new());
@@ -941,4 +952,3 @@ fn inv4_concurrent_ops_spanning_failover_linearizable() {
     );
     c.cleanup();
 }
-
