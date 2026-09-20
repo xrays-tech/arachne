@@ -207,7 +207,22 @@ rev O 把洪峰中的写/读 p99 从 ~100ms 降到 38–53ms（批持久化周�
 | 读在 flush 期间能否推进 | 依赖 raft-rs 允许**多个 ready 在途**（records 队列 + `on_persist_ready(number)` 顺序推进）：actor 在 flush 在途时仍可 `step()` 并发出 ReadIndex 心跳，只是其消息要等各自 ready 落盘后才发 | 只允许一个 ready 在途 | 单在途时读仍被当前 flush 阻塞，等于没解决问题（rev O 已把 flush 成本压到每次 ~2 次/批，读 p99 仍 38–53ms）。 |
 | 分阶段（每阶段独立可验证、各自保持全绿） | **P1（本次已完成）** `Segment::try_clone_file()` + `WalStorage::flush_handle()`（dup fd + 段号），单测证明"取 handle 之后写入的字节也被这次 flush 覆盖"。**P2** `WalStorage` 增"只写不刷"路径（inherent，seam 的 `sync_entries` 语义一行不改）。**P3** `RaftNode::step` 拆 submit/complete 两相（`pending: Option<PendingReady{number,…}>`），消息与 `committed`/`read_states` 在完成相产出。**P4** runtime 增"持久化完成"事件分支，读/提案在 flush 在途时仍可推进。**P5** 更新**所有直接驱动 `step()` 的 harness**（`l2_scenarios` 3 处、`m2_durability` 3 处、`force_recovery` 等）、fault-injection 两个阶段（`AfterPersist`/`AfterDeliver`）的语义，并新增"flush 在途时崩溃"的 INV2 场景 | 一次性重构 | `step()` 的 outcome 形状会被每一个直接驱动它的 harness 观察到；必须分阶段、每阶段跑全绿，才能保证 INV1/INV2 的回归被当场抓住。 |
 
-**预期收益**：读不再等 actor 当前那次 flush，洪峰读 p99 应从 38–53ms 降到接近弱读量级（sub-ms）；写的 p99 由 flush 决定的部分不变（I1 不允许把它藏起来）。
+**实测结论（本设计最重要的一条，已推翻上面那句预期）**：P1–P4 全部落地后实测，pipeline **没有降低 p99**，反而略差：
+
+| 场景（`read_latency`，p99 / 120 次读） | 同步（默认） | 离线程 pipeline（in-flight=8 / 2 / 1） |
+|---|---|---|
+| 洪峰线性读 | 38–53ms | 47–55 / 50 / 52ms |
+| 洪峰写 | 38–53ms | 49–64 / 54 / 57ms |
+| 弱读 | 0.17ms | 0.14–8.5ms |
+
+原因：`FsyncPolicy::Always` 下每个周期都要一次真实设备 flush（本机 ~10ms），**设备就是瓶颈**。把 flush 挪到别的线程只改变"谁在等"，不改变"要等多久"；而 in-flight 窗口一大，客户端操作还要排在更多次 flush 之后（FIFO），所以更差。**能降低 p99 的只有"减少 flush 次数"**（rev O 的批周期已做，rev P 的这条做不到）。
+
+因此 pipeline 的定位改为**可用性而非延迟**：它保证磁盘慢时 actor 仍能 tick/心跳/服务（`slow_fsync` 这类场景下，actor 不会因为一次 500ms 的 fsync 而停摆到丢选票）。据此：
+- pipeline **默认关闭**（`WalStorage::enable_offloaded_durability()` 显式开启），默认路径与引入前逐字节一致；
+- **不**在 node binary 里默认打开，也不把 `read_latency` 门槛切到 pipeline 上（门槛测的是默认路径）；
+- 端到端正确性由 `lagging_follower_catches_up_with_offloaded_durability` 覆盖（同一套"写洪峰 → 快照 → follower 安装 → 重启 → 换主"场景跑在 pipeline 上）。
+
+**实现中发现的第二个要点**：不要像同步路径那样在 `land_records` 里显式写"commit 前进"的 HardState。raft 的 `prev_hs` 在 async 路径下不会被 `gen_light_ready` 更新，所以下一次 `ready()` 会自己带上这个 hs；若我们再显式写一次，磁盘上就会出现**重复的 HardState 记录**，并直接打破"末条撕裂=合法截断"的判定（实测：`structural tear at estimated index 3 (within committed window commit=2)`，`m2_wal_faults::torn_tail_recovers_and_still_serves_the_acked_write` 抓到）。删掉显式写入后，每个周期恰好一次 flush，状态机也简化成单阶段。
 
 ## 1. 目标与非目标
 

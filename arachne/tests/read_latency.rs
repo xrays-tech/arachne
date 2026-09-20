@@ -167,6 +167,12 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
     let mut dirs = Vec::new();
     for i in 1..=N {
         let dir = temp_dir(&format!("n{i}"));
+        // The gate measures the **default** (synchronous) durability path: the
+        // offloaded pipeline is opt-in, and measurement showed it does not move
+        // these numbers — under `Always` the device flush is the bound, so
+        // moving it off the actor changes where the wait happens, not how long
+        // it is (see propsol v0.2.13 P and the handoff). Its value is that the
+        // actor keeps ticking and serving while a slow disk is busy.
         let wal = WalStorage::open(&dir, wal_opts(i)).expect("open wal");
         let (tx, rx) = factory.create(node_id(i));
         let m = Arc::new(Metrics::new());

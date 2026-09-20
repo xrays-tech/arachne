@@ -155,8 +155,16 @@ async fn spawn_node(
     factory: &InMemoryTransportFactory,
     addresses: &HashMap<NodeId, SocketAddr>,
     profile: &ProfileConfig,
+    offloaded_durability: bool,
 ) -> Node {
-    let wal = open_wal(&dir, i).await;
+    let mut wal = open_wal(&dir, i).await;
+    if offloaded_durability {
+        // Exercise the asynchronous durability pipeline (propsol v0.2.13 P)
+        // through the whole scenario: writes, snapshots, a follower install and
+        // a restart.
+        wal.enable_offloaded_durability()
+            .expect("enable offloaded durability");
+    }
     let (tx, rx) = factory.create(node_id(i));
     let metrics = Arc::new(Metrics::new());
     let config = RuntimeConfig {
@@ -257,8 +265,8 @@ fn value(i: u64) -> Vec<u8> {
     format!("v{i}").into_bytes()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lagging_follower_catches_up_through_a_snapshot() {
+/// The full catch-up scenario, run against either durability path.
+async fn catch_up_scenario(offloaded: bool) {
     let profile = test_profile();
     let factory = InMemoryTransportFactory::new();
     let addresses = addresses(N);
@@ -266,7 +274,7 @@ async fn lagging_follower_catches_up_through_a_snapshot() {
     let mut nodes: Vec<Node> = Vec::new();
     for i in 1..=N {
         let dir = temp_dir(&format!("n{i}"));
-        nodes.push(spawn_node(i, N, dir, &factory, &addresses, &profile).await);
+        nodes.push(spawn_node(i, N, dir, &factory, &addresses, &profile, false).await);
     }
     // In-process redirects: every handle knows every peer (propsol §3.3).
     for i in 0..N as usize {
@@ -357,7 +365,16 @@ async fn lagging_follower_catches_up_through_a_snapshot() {
     //    (it stopped before the writes above), so the leader's next attempt to
     //    replicate lands below `first_index` and switches to a snapshot.
     let victim_dir = nodes[victim].dir.clone();
-    nodes[victim] = spawn_node(victim_id, N, victim_dir, &factory, &addresses, &profile).await;
+    nodes[victim] = spawn_node(
+        victim_id,
+        N,
+        victim_dir,
+        &factory,
+        &addresses,
+        &profile,
+        offloaded,
+    )
+    .await;
     for j in 0..N as usize {
         if j != victim {
             nodes[victim]
@@ -439,6 +456,21 @@ async fn lagging_follower_catches_up_through_a_snapshot() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lagging_follower_catches_up_through_a_snapshot() {
+    catch_up_scenario(false).await;
+}
+
+/// The same scenario through the **asynchronous durability pipeline**
+/// (propsol v0.2.13 P): every record is written by the actor and flushed by
+/// the WAL's flusher thread, so the whole path — commit advance, snapshot,
+/// follower install, restart — is exercised without the actor ever waiting for
+/// the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lagging_follower_catches_up_with_offloaded_durability() {
+    catch_up_scenario(true).await;
+}
+
 /// A restart must rebuild the applied state from the **durable snapshot**, not
 /// from the log: raft's applied index starts at `first_index - 1`, which is the
 /// snapshot index, so the compacted prefix is never replayed. If the runtime
@@ -452,7 +484,7 @@ async fn a_restart_rebuilds_the_state_machine_from_the_snapshot() {
     let addresses = addresses(1);
     let dir = temp_dir("solo");
 
-    let mut node = spawn_node(1, 1, dir.clone(), &factory, &addresses, &profile).await;
+    let mut node = spawn_node(1, 1, dir.clone(), &factory, &addresses, &profile, false).await;
     for _ in 0..800 {
         if node.metrics.is_leader() {
             break;
@@ -481,7 +513,7 @@ async fn a_restart_rebuilds_the_state_machine_from_the_snapshot() {
 
     node.kill();
     let node = {
-        let restarted = spawn_node(1, 1, dir.clone(), &factory, &addresses, &profile).await;
+        let restarted = spawn_node(1, 1, dir.clone(), &factory, &addresses, &profile, false).await;
         // The snapshot is the only possible source for `k0`: the log's window
         // starts above it.
         assert!(
@@ -538,7 +570,7 @@ async fn killing_the_leader_does_not_interrupt_a_follower_catching_up() {
     let mut nodes: Vec<Node> = Vec::new();
     for i in 1..=N {
         let dir = temp_dir(&format!("n{i}"));
-        nodes.push(spawn_node(i, N, dir, &factory, &addresses, &profile).await);
+        nodes.push(spawn_node(i, N, dir, &factory, &addresses, &profile, false).await);
     }
     for i in 0..N as usize {
         for j in 0..N as usize {
@@ -586,7 +618,7 @@ async fn killing_the_leader_does_not_interrupt_a_follower_catching_up() {
     // The follower returns, and the leader dies immediately after: whatever
     // brings the follower up must come from the new leader.
     let victim_dir = nodes[victim].dir.clone();
-    nodes[victim] = spawn_node(victim_id, N, victim_dir, &factory, &addresses, &profile).await;
+    nodes[victim] = spawn_node(victim_id, N, victim_dir, &factory, &addresses, &profile, false).await;
     for j in 0..N as usize {
         if j != victim {
             nodes[victim].handle.register_peer(nodes[j].handle.clone());

@@ -358,6 +358,10 @@ enum Outcome {
     Inbound(Option<(NodeId, TransportMessage)>),
     /// The apply task published new progress (or stopped).
     Progress(Result<(), watch::error::RecvError>),
+    /// A durable-storage flush completed (propsol v0.2.13 P). The completion
+    /// itself is picked up by the next `drive_cycle`; this event is what wakes
+    /// the actor instead of making it wait for a tick.
+    Durability,
     Command(Option<Command>),
 }
 
@@ -372,6 +376,8 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     reads: mpsc::Sender<ReadRequest>,
     /// The apply task's published progress.
     progress: watch::Receiver<ApplyProgress>,
+    /// Woken by the storage when an offloaded flush completes (propsol P).
+    durability: Arc<tokio::sync::Notify>,
     /// A batch that did not fit the apply channel, retried next cycle. At most
     /// one, so a full channel cannot grow the actor's memory without bound.
     deferred: Option<ApplyBatch>,
@@ -505,12 +511,14 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         voters.dedup();
 
         let period = Duration::from_millis(config.profile.heartbeat_interval_ms.max(1));
+        let durability = node.durability_notifier();
         let runtime = Self {
             node,
             apply_task: Some(apply_task),
             applies,
             reads,
             progress,
+            durability,
             deferred: None,
             snapshot_wait: None,
             applied_index,
@@ -552,6 +560,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 biased;
                 _ = self.tick.tick() => Outcome::Tick,
                 progress = self.progress.changed() => Outcome::Progress(progress),
+                _ = self.durability.notified() => Outcome::Durability,
                 cmd = self.commands.recv() => Outcome::Command(cmd),
                 msg = self.node.rx().recv() => Outcome::Inbound(msg),
             };
@@ -570,6 +579,9 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }
                 }
                 Outcome::Inbound(None) => break,
+                // Durability completions are consumed by `drive_cycle` (which
+                // runs after every event); waking is the whole point.
+                Outcome::Durability => {}
                 // Progress is absorbed at the top of `drive_cycle`; this event
                 // just wakes the loop so replies and reads see it promptly.
                 Outcome::Progress(Ok(())) => {}

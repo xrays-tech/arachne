@@ -240,6 +240,18 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 
 **如实声明（接线到此为止的部分）**：阻塞式存储 I/O（fsync）仍在 async worker 线程上同步执行，是洪峰中一切客户端延迟的共同上界；把 WAL 落盘挪到专用阻塞线程/`spawn_blocking`（或异步 I/O 后端）是**下一步**的独立增量，本轮未做也未宣称。另：本轮未改 `BatchMs` 语义（其注释仍写 "advisory until P4"）。
 
+### 1.11 异步持久化流水线（propsol v0.2.13 P）——做完了，但**没有降低延迟**（重要结论）
+
+动机：rev O 之后洪峰读 p99 仍 38–53ms，因为 fsync 是 actor 线程上的同步等待。于是把"写"留在 actor、"刷"交给 worker（dup fd，`fsync` 刷 inode），用 raft-rs 自带的异步 Ready 协议（`Ready::number` + `advance_append_async` + `on_persist_ready`），消息/apply 全部推迟到 flush 完成之后（I2/I4 语义不变）。
+
+**落地**：`Segment::try_clone_file` + `WalStorage::flush_handle/append_buffered/set_hard_state_buffered/note_flushed`（P1/P2，各带单测）→ `RaftNode::step` 拆 submit/finish 两相 + `MAX_IN_FLIGHT_READIES` 窗口 + 每节点一个 flusher 线程与 `Arc<Notify>` 唤醒（P3）→ runtime 增 `Outcome::Durability` 分支（P4）→ 端到端场景跑在 pipeline 上（P5）。**默认关闭**（`enable_offloaded_durability()` 显式开启），默认路径逐字节不变：这是能一次跑绿全部既有测试（含 INV1 台账对账、INV2 崩溃扫描、`l2_scenarios` 双跑确定性、`force_recovery`）的原因——`StepOutcome` 形状一行没动。
+
+**实测（`read_latency`，p99）：同步 38–53ms vs pipeline 47–55ms（in-flight 8）/ 50（2）/ 52（1）；写 38–53 vs 49–64；弱读 0.17ms vs 0.14–8.5ms。** 结论：`Always` 下每周期一次真实设备 flush，**设备就是瓶颈**，换线程只改变"谁在等"；窗口越大客户端操作排得越靠后，反而更差。要降 p99 只能减少 flush 次数（rev O 的批周期已做）。所以把 pipeline 的定位改成**可用性**：磁盘慢时 actor 仍能 tick/心跳/服务（对应 `slow_fsync` 这类 L4 场景），并据此保持默认关闭、不切 `read_latency` 门槛、不在 node binary 里默认打开。
+
+**顺带修掉一个实现陷阱**：不要在 async 路径里显式写"commit 前进"的 HardState——raft 的 `prev_hs` 不会被 async advance 更新，下一次 `ready()` 自带该 hs；显式再写一次会在盘上留下**重复 HardState 记录**，并打破"末条撕裂=合法截断"的判定（`m2_wal_faults::torn_tail_recovers_and_still_serves_the_acked_write` 抓到，报 `structural tear at estimated index 3 (within committed window commit=2)`）。删掉后每周期恰好一次 flush，状态机也简化成单阶段。
+
+**新增覆盖**：`m2_snapshot.rs` 的追赶场景参数化后跑两遍——`lagging_follower_catches_up_through_a_snapshot`（默认同步）与 `lagging_follower_catches_up_with_offloaded_durability`（pipeline：写洪峰 → 快照 → follower 安装 → 重启 → 换主，全绿）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

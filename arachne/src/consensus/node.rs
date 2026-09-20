@@ -141,8 +141,6 @@ const MAX_IN_FLIGHT_READIES: usize = 8;
 struct PendingPersist {
     /// raft's `Ready` number, for `on_persist_ready`.
     number: u64,
-    /// What this cycle is waiting for.
-    stage: PersistStage,
     /// The flush covering the records, if the storage offloaded it.
     token: Option<FlushToken>,
     /// Leader fast-path messages, still to be sent in the synchronous path
@@ -157,15 +155,6 @@ struct PendingPersist {
     read_states: Vec<(Vec<u8>, LogIndex)>,
     /// An installed snapshot this cycle carried.
     snapshot: Option<SeamSnapshot>,
-}
-
-/// Which flush a pending cycle is waiting on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PersistStage {
-    /// The entries (and the Ready's hard state).
-    Records,
-    /// The commit advance written after the records landed.
-    Commit,
 }
 
 /// The result of one [`RaftNode::step`] `Ready` cycle.
@@ -215,9 +204,6 @@ where
     /// Woken by the storage when an offloaded flush completes, so the actor
     /// does not have to wait for its next tick to notice durability.
     durability: Arc<tokio::sync::Notify>,
-    /// The commit index already written to the hard state, so a commit advance
-    /// is persisted once and not once per cycle.
-    persisted_commit: LogIndex,
     /// Raft id → transport `NodeId` for outbound resolution. Peers not present
     /// here are not yet part of this node's membership and are skipped.
     peers: HashMap<RaftId, NodeId>,
@@ -334,26 +320,22 @@ where
         let store = RaftStorage::with_conf_state(storage, bootstrap);
         let raw = RawNode::new(&raft_config, store, logger).map_err(NodeError::Raft)?;
 
-        // Whatever the store already holds is durable: the commit it reports is
-        // the baseline for "has the commit advanced?".
-        let persisted_commit = raw.raft.hard_state().commit;
-
         Ok(Self {
             raw,
             transport,
             rx,
             pending: VecDeque::new(),
             durability,
-            persisted_commit,
             peers,
             dropped_sends: 0,
         })
     }
 
-    /// Resolves when an offloaded flush completes, so a caller can wake instead
-    /// of polling on a timer (propsol v0.2.13 P).
-    pub async fn durability_notified(&self) {
-        self.durability.notified().await;
+    /// The notifier the storage pings when an offloaded flush completes
+    /// (propsol v0.2.13 P). Cloned rather than awaited so a caller can select on
+    /// it while still driving the node.
+    pub fn durability_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.durability)
     }
 
     /// Whether a cycle is waiting for durability.
@@ -441,7 +423,6 @@ where
             .map(RaftStorage::<S>::from_raft_entry)
             .collect();
         let hard_state = ready.hs().map(RaftStorage::<S>::to_seam_hard_state);
-        let commit_hint = hard_state.as_ref().map(|hs| hs.commit);
 
         // A snapshot is a separate file and stays synchronous: it is rare, and
         // it is what lets the log below it be released (propsol §5.5.4).
@@ -472,13 +453,8 @@ where
                 self.deliver(msg).await;
             }
         }
-        if let Some(commit) = commit_hint {
-            self.persisted_commit = self.persisted_commit.max(commit);
-        }
-
         self.pending.push_back(PendingPersist {
             number,
-            stage: PersistStage::Records,
             token: match submitted {
                 PersistSubmit::Durable => None,
                 PersistSubmit::Offloaded(token) => Some(token),
@@ -494,97 +470,56 @@ where
 
     /// Complete the oldest queued cycle if its flush has landed. `None` = it is
     /// still in the air.
+    ///
+    /// Cycles complete in submission order, which is what raft's
+    /// `on_persist_ready` requires and what keeps a follower from acknowledging
+    /// entries an earlier cycle has not yet made durable.
     async fn finish_persisted(&mut self) -> Result<Option<StepOutcome>, NodeError<T>> {
-        let Some(token) = self.pending.front().and_then(|pending| pending.token) else {
-            // Nothing queued, or the oldest cycle is already durable.
-            return match self.pending.front().map(|p| p.stage) {
-                Some(PersistStage::Records) => self.land_records().await,
-                Some(PersistStage::Commit) => self.finish_cycle().await,
-                None => Ok(None),
-            };
-        };
-        match self
-            .raw
-            .mut_store()
-            .poll_flush(&token)
-            .map_err(NodeError::Raft)?
-        {
-            None => Ok(None),
-            Some(Err(e)) => Err(NodeError::Storage(format!(
-                "offloaded flush failed: {e} (durability cannot be claimed)"
-            ))),
-            Some(Ok(())) => {
-                if let Some(front) = self.pending.front_mut() {
-                    front.token = None;
-                }
-                match self.pending.front().map(|p| p.stage) {
-                    Some(PersistStage::Records) => self.land_records().await,
-                    _ => self.finish_cycle().await,
-                }
-            }
-        }
-    }
-
-    /// The records are durable: tell raft, run the persist hook, send the
-    /// messages whose payload is now safe, and write any commit advance.
-    async fn land_records(&mut self) -> Result<Option<StepOutcome>, NodeError<T>> {
         let Some(number) = self.pending.front().map(|pending| pending.number) else {
             return Ok(None);
         };
-        self.raw.on_persist_ready(number);
-        // `advance` used to keep raft's applied index moving; the async path
-        // must do it explicitly now that the records are durable.
-        self.raw.advance_apply();
-        if let Some(front) = self.pending.front_mut() {
-            front.stage = PersistStage::Commit;
-            front.token = None;
-        }
-
-        // INV2 crash injection (propsol v0.2.9 L): the records are durable and
-        // nothing has been sent yet.
-        #[cfg(feature = "fault-injection")]
-        crate::fault_injection::check(crate::fault_injection::Stage::AfterPersist);
-
-        // The synchronous path defers these too, so the hook above keeps its
-        // meaning ("durable, nothing sent yet") in both paths.
-        let immediate = self
-            .pending
-            .front_mut()
-            .map(|front| std::mem::take(&mut front.immediate))
-            .unwrap_or_default();
-        for msg in &immediate {
-            self.deliver(msg).await;
-        }
-
-        // Persist a commit advance once, not once per cycle.
-        let commit = self.raw.raft.hard_state().commit;
-        if commit > self.persisted_commit {
-            let hs = RaftStorage::<S>::to_seam_hard_state(&self.raw.raft.hard_state());
-            let submitted = self
+        if let Some(token) = self.pending.front().and_then(|pending| pending.token) {
+            match self
                 .raw
                 .mut_store()
-                .persist_ready_records(&[], Some(&hs))
-                .map_err(NodeError::Raft)?;
-            self.persisted_commit = commit;
-            if let PersistSubmit::Offloaded(token) = submitted {
-                if let Some(front) = self.pending.front_mut() {
-                    front.token = Some(token);
+                .poll_flush(&token)
+                .map_err(NodeError::Raft)?
+            {
+                None => return Ok(None),
+                Some(Err(e)) => {
+                    return Err(NodeError::Storage(format!(
+                        "offloaded flush failed: {e} (durability cannot be claimed)"
+                    )));
                 }
-                return Ok(None);
+                Some(Ok(())) => {}
             }
         }
-        self.finish_cycle().await
-    }
 
-    /// Every record the oldest cycle covers is durable: send what waited on it
-    /// and report the cycle's outcome.
-    async fn finish_cycle(&mut self) -> Result<Option<StepOutcome>, NodeError<T>> {
+        // The records are durable: raft may treat everything up to this cycle as
+        // persisted, and a commit advance it recorded since then is carried by
+        // the hard state of a later `Ready` (writing it here as well would make
+        // raft surface the same hard state twice, leaving a duplicate record on
+        // disk for no gain).
+        self.raw.on_persist_ready(number);
+        // `advance` used to keep raft's applied index moving; the phased path
+        // must do it explicitly now that the records are durable.
+        self.raw.advance_apply();
+
         let Some(mut pending) = self.pending.pop_front() else {
             return Ok(None);
         };
+
+        // INV2 crash injection (propsol v0.2.9 L): records durable, nothing sent.
+        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::check(crate::fault_injection::Stage::AfterPersist);
+
+        for msg in &pending.immediate {
+            self.deliver(msg).await;
+        }
         for msg in &pending.persisted {
             self.deliver(msg).await;
         }
+
         let mut committed = pending.committed;
         if let Some(snapshot) = &pending.snapshot {
             // An installed snapshot supersedes everything at or below its index,
