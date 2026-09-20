@@ -2,7 +2,7 @@
 
 > 面向**新会话**。先读本文，再读 `dev-docs/propsol-v0.2.8`（设计权威）与 `dev-docs/test-plan-v0.1.3`（测试方案）。会话态进度见 `.slim/deepwork/arachne-m1.md`（git-local，但 OpenCode 可读）。
 >
-> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**285 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
+> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**287 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
 
 ## 1. 现状总览
 
@@ -12,10 +12,10 @@
 
 ### 提交线（新 → 旧）
 ```
-2b3e3b0 M1-4 (C) stage 3c inc.3: 并发 INV4 + ReadIndex 局部性                    ← HEAD
-ed3622c M1-4 (C) stage 3c inc.2: 门禁 P3 诚实性修正
-d895d1c M1-4 (C) stage 3c inc.2: S16 非对称分区 + 换主 INV4
-46a8328 M1-4 (C) stage 3c inc.1: 断言分区被观测（门禁 P2）
+dfc92be M1-4 (C) stage 3c inc.4: 多键 INV4 + 分区下并发                          ← HEAD
+cfb1bd3 docs: (C) stage 3c inc.3 门禁 GO
+777fd6f M1-4 (C) stage 3c inc.3: 修 EOF 空白（门禁 P4）
+2b3e3b0 M1-4 (C) stage 3c inc.3: 并发 INV4 + ReadIndex 局部性
 6815bef M1-4 (C) stage 3c inc.1: 内存传输确定性 L2 场景（S01/S02+INV3/4/7/8/9）
 76df587 M1-4 (C) stage 3b spike: 真实 tonic over turmoil（部分；commit 路径卡住）
 377f3ce fix(runtime): actor 截止时间改用模拟 tokio::time::Instant（确定性）
@@ -85,7 +85,8 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - 门禁 NO-GO 风险已修：分区此前只"配置"未被断言，现已断言（P2）；四测 4/4、workspace 281 绿。
 - **增量 2（已完成，commit d895d1c）**：`Faults` 增单向丢包；**S16**（丢所有 follower→leader 消息 → CheckQuorum 将 leader 降级；INV7 仍成立）+ **换主 INV4**（历史中隔离 leader、幸存者选新主、客户端改投新主，整段 put/get 历史经 oracle+checker 判定线性一致；断言恰有一次换主）。`l2_scenarios` 6/6。
 - **增量 3（已完成，commit 2b3e3b0；门禁 GO，ora-9；P4 空白已修 777fd6f）**：**并发 INV4**（两客户端 put/get 实时区间重叠 → 真正驱动检查器的并发搜索路径；oracle+checker 双通过）+ **ReadIndex 局部性**（leader 的 `read_index` 经全量投递产生读状态；follower 在不投递时不自服务读，只转发）。harness 记录全量读状态 `(node,ctx,index)`；`l2_scenarios` 8/8。
-- **增量 4（未开始）候选**：真实 crash+WAL 重启（当前 crash 用隔离建模，volatile 丢失已在 M0 覆盖）、多键/更大规模并发历史、绑定 ClientOracle 的失败注入断言；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
+- **增量 4（已完成，commit dfc92be）：多键 INV4 + 分区下并发**：多键（"a"/"b"）写读交替 + 读一个从未写过的键断言为 `None`（驱动 oracle 的逐键幻值检查）；两客户端实时重叠区间在隔离一个 follower 的 2+1 分区下由多数侧服务、历史仍线性一致（并断言被隔离者确实饥饿）。`l2_scenarios` 10/10。
+- **增量 5（未开始）候选**：把 ReadIndex 完成的读接入 oracle/checker（客户端读路径尚未串起）；真实 crash+WAL 重启（当前 crash 用隔离建模，volatile 丢失已在 M0 覆盖）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
 - (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
