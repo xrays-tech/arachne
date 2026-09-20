@@ -124,7 +124,22 @@ echo "PASS (Gate B): default release binary excludes the markers (sha256 ${defau
 # set just built — mtime is unreliable because the default and feature variants
 # coexist in `release/deps/`.
 build_core_rlib() {
-  cargo build -p arachne --release "$@" --message-format=json 2>/dev/null | python3 -c '
+  # Cargo reports *build errors* on stdout when `--message-format=json` is on
+  # (as `compiler-message`/`build-finished` records), so discarding stderr would
+  # make a failed build look like an empty result. Keep stderr in a file and
+  # echo it on failure: a gate that fails silently is worse than no gate.
+  local err
+  err="$(mktemp)"
+  local out
+  if ! out="$(cargo build -p arachne --release "$@" --message-format=json 2>"${err}")"; then
+    echo "FAIL (Gate C): cargo build -p arachne --release $* failed" >&2
+    cat "${err}" >&2
+    printf '%s\n' "${out}" | grep -F '"reason":"compiler-message"' >&2 || true
+    rm -f "${err}"
+    return 1
+  fi
+  rm -f "${err}"
+  printf '%s\n' "${out}" | python3 -c '
 import sys, json
 for line in sys.stdin:
     line = line.strip()
