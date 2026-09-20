@@ -23,7 +23,8 @@ use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne::{NodeId, RaftId, StateMachine, TransportFactory};
 use arachne_testsupport::{
     block_on, check_linearizable, CallId, CheckOutcome, ClientId, History, InMemoryRx,
-    InMemoryTransportFactory, InMemoryTx, Invariant, KvState, Op, OpResult, SeqNo, ValueId,
+    InMemoryTransportFactory, InMemoryTx, Invariant, KvState, Op, OpResult, OracleErrorKind,
+    SeqNo, ValueId,
 };
 use raft::{clear_election_rng_seed, set_election_rng_seed};
 use slog::{o, Drain, Logger};
@@ -1088,3 +1089,73 @@ fn inv4_reads_via_read_index_are_linearizable() {
     );
     c.cleanup();
 }
+
+/// A ReadIndex read that is in flight when its leader is isolated cannot
+/// complete (the client records a failure, not a stale value); after failover
+/// the new leader serves a fresh read. The history (with the failed read) must
+/// remain linearizable.
+#[test]
+fn inv4_read_index_under_failover_yields_failure_then_recovers() {
+    let _seed = ElectionSeed::enter(0x1_700);
+    let mut c = Cluster::new(3);
+    let leader0 = elect(&mut c);
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+
+    // Put v1 (acked).
+    h.invoke(CallId(1), ClientId(0), SeqNo(1), Op::Put { key: b"k".to_vec(), value: ValueId(1) }, ts);
+    ts += 1;
+    commit_put(&mut c, leader0, b"k", ValueId(1), 1);
+    h.complete(CallId(1), ts, OpResult::Ok(None));
+    ts += 1;
+
+    // A read starts on leader0, which is then isolated: it must NOT complete
+    // (no stale value is served).
+    let ctx = vec![0xB0, 0];
+    h.invoke(CallId(2), ClientId(0), SeqNo(2), Op::Get { key: b"k".to_vec() }, ts);
+    ts += 1;
+    c.nodes[(leader0 - 1) as usize]
+        .as_mut()
+        .expect("leader present")
+        .read_index(ctx.clone());
+    c.faults.isolate(leader0);
+    let mut completed = false;
+    for _ in 0..300 {
+        c.round();
+        if c.read_states
+            .iter()
+            .any(|(n, x, _)| *n == leader0 && *x == ctx)
+        {
+            completed = true;
+        }
+    }
+    assert!(!completed, "the isolated leader must not complete the read");
+    h.complete(CallId(2), ts, OpResult::Err(OracleErrorKind::Timeout));
+    ts += 1;
+
+    // Failover, then a fresh read is served by the new leader.
+    let leader1 = wait_new_leader(&mut c, leader0);
+
+    h.invoke(CallId(3), ClientId(0), SeqNo(3), Op::Put { key: b"k".to_vec(), value: ValueId(2) }, ts);
+    ts += 1;
+    commit_put(&mut c, leader1, b"k", ValueId(2), 3);
+    h.complete(CallId(3), ts, OpResult::Ok(None));
+    ts += 1;
+
+    let ctx2 = vec![0xB0, 1];
+    h.invoke(CallId(4), ClientId(0), SeqNo(4), Op::Get { key: b"k".to_vec() }, ts);
+    ts += 1;
+    let read = read_via_read_index(&mut c, leader1, b"k", ctx2);
+    h.complete(CallId(4), ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (read under fault): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (read under fault): {outcome:?}"
+    );
+    c.cleanup();
+}
+
