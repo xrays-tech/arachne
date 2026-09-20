@@ -105,6 +105,7 @@ body = (
     f"initial_cluster = {json.dumps([node_id])}\n"
     f"heartbeat_interval_ms = 50\n"
     f"election_timeout_ms = 500\n"
+    f"rpc_timeout_ms = 200\n"
 )
 with open(config_path, "w") as f:
     f.write(body)

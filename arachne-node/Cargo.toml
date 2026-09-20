@@ -6,6 +6,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# D-ART-testobs (test-plan §3.3): the ONE recorded exception to the "no test
+# code in production" rule. Enabling it adds structured stdout markers
+# (`ready` / `shutdown`) that the L4 fault injector uses for phase-precise kills;
+# it changes nothing else (no extra state, no behavior change). It is NOT a
+# default feature — CI (`scripts/check-release-features.sh`) enforces that
+# release/publish builds exclude it.
+test-observability = []
+
 [dependencies]
 # The LEAN core (no transport): the node composes the transport explicitly.
 # The workspace default for `arachne` is lean, so the core itself never links

@@ -1318,3 +1318,59 @@ fn s01_true_crash_wal_restart_recovers() {
     assert_single_leader_per_term(&c.leader_obs);
     c.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// M1 acceptance ① (deterministic, tick-counted): new leader after leader loss
+// ---------------------------------------------------------------------------
+
+/// The harness's raft election timeout in ticks. `Cluster::new` builds nodes
+/// with `RaftNode::new`, which uses `RaftNodeConfig::default()`
+/// (`election_tick = 10`, `heartbeat_tick = 1`), and one `Cluster::round` is
+/// one tick.
+const ELECTION_TICK: usize = 10;
+
+/// M1 acceptance ① in its deterministic form: after the leader is lost, a new
+/// leader must emerge within **2 × the election timeout**, measured in raft
+/// ticks.
+///
+/// raft randomizes the election timeout in `[election_tick, 2 × election_tick)`,
+/// so a survivor campaigns within that window; the campaign and the leader's
+/// first heartbeat then fit inside the same budget for this scenario (measured:
+/// 16 rounds for the fixed seed below, against a bound of 20). The bound is
+/// sharp on purpose — it is a regression detector for election liveness.
+///
+/// This is the clock-free counterpart of the L3 process test
+/// (`killing_the_leader_elects_a_new_one_and_writes_never_hang`), which cannot
+/// assert a wall-clock bound because Gate C forbids real-time imports in
+/// `tests/`.
+#[test]
+fn new_leader_within_two_election_windows_after_leader_loss() {
+    let _seed = ElectionSeed::enter(0x5EED_0011);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+
+    // Lose the leader (task death, WAL retained): the survivors stop hearing
+    // heartbeats and must campaign.
+    c.crash(leader);
+
+    let budget = 2 * ELECTION_TICK;
+    let mut rounds = 0usize;
+    let mut new_leader = None;
+    while rounds < budget {
+        c.round();
+        rounds += 1;
+        if let Some(l) = (1..=c.n).find(|&i| i != leader && c.leader_of(i)) {
+            new_leader = Some(l);
+            break;
+        }
+    }
+
+    assert!(
+        new_leader.is_some(),
+        "no new leader within 2×election_timeout ({budget} rounds); \
+         gave up after {rounds} rounds"
+    );
+    // The failover must not violate one-leader-per-term.
+    assert_single_leader_per_term(&c.leader_obs);
+    c.cleanup();
+}

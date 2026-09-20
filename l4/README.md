@@ -6,9 +6,9 @@ L4 是测试分层的**最底层、也是模拟无法替代的一层**（`test-p
 
 1. **进程级崩溃恢复**：节点被 `SIGKILL`（无优雅关闭、无 fsync 排空）后，在**同一 data dir** 上重启，必须能起来并重新就绪。
 2. **WAL 打开干净（fail-start 即信号）**：重启时 `WalStorage::open` 回放 WAL——若 `kill -9` 造成落在**已提交区间**内的撕裂/静默损坏，节点会 `Unrecoverable` **fail-start**（在 `/readyz` 之前非零退出）。`kill_loop.sh` 把"重启后始终就绪"当作 WAL 完整性的证据；一旦节点起不来，脚本判 **FAIL**。
-3. **持久进度不回退（当前真实验证范围）**：每次重启后 `/metrics` 的 `arachne_commit_index` / `arachne_applied_index` 不得**低于**上次观测值。
+3. **已 ack 的写入跨崩溃不丢（M1）**：每轮先发起一次真实写入（`PUT /kv/<key>/<value>` 返回 `200` = 已提交且已 apply），`kill -9` 后重启，用线性一致 `GET` 读回该 key，必须等于 ack 的值。同一轮还校验 `/metrics` 的 `arachne_commit_index` / `arachne_applied_index` 不得**低于**上次观测值（INV12/INV13）。
 
-   > **如实声明（M0 边界）**：`kill_loop.sh` **不发起任何应用层写入**——M0 节点尚无写路径（无 `propose` / admin 入口）。因此此刻的 commit / applied 只反映**自选举产生的 no-op 条目**，"不回退"目前**对已 ack 的写入是空命题**（vacuous）。本门禁要能对"已 ack 数据不丢"负责，**M1 必须先补写路径（admin propose）**，再以真实 acked 写入复验本条。
+   > **M0 边界已消化**：M0 时节点无写路径，故"不回退"只约束自选举 no-op 条目，**对已 ack 写入是空命题**。M1 已补写路径（`PUT /kv/...`），`kill_loop.sh` 现每轮发起真实 acked 写入并在崩溃后读回复验——本条**不再是空命题**。最后一次写入也会在循环结束后的额外一次重启中复验。
 
 > 模拟（L2）能证明崩溃/分区/磁盘故障下的**逻辑**不变量，但**无法**证明真实 fsync 语义下的持久性——那是 L4 的专属职责。
 
@@ -17,13 +17,13 @@ L4 是测试分层的**最底层、也是模拟无法替代的一层**（`test-p
 | 文件 | 作用 |
 |---|---|
 | `node.toml` | `arachne-node` 的**模板**配置：temp-ish data dir、ephemeral 端口、短 heartbeat（快速自选举）。既可独立运行（`arachne-node --config l4/node.toml`），也是两个脚本读取稳定设置（cluster_id / node_id / initial_cluster / heartbeat / election）的来源 |
-| `kill_loop.sh` | 主 harness：`set -euo pipefail`。起节点 → 等 `/readyz` → 循环 N 次「`kill -9` → 同 data dir 重启 → 校验 (a) 进程起来 (b) `/readyz` 就绪 (c) WAL 打开干净 + commit/applied 不回退」→ 打印 PASS/FAIL，失败即非零退出。清理 temp data dir |
+| `kill_loop.sh` | 主 harness：`set -euo pipefail`。起节点 → 等 `/readyz` → 循环 N 次「校验上次 acked 写入仍在 → 发起新的 acked 写入并读回 → `kill -9` → 同 data dir 重启 → 校验 (a) 进程起来 (b) `/readyz` 就绪 (c) WAL 打开干净 + commit/applied 不回退」→ 再额外重启一次复验最后一次 acked 写入 → 打印 PASS/FAIL，失败即非零退出。清理 temp data dir |
 | `verify_wal.sh` | 独立探针：给定一个 data dir，起节点重开它。WAL 完好 → 就绪（PASS）；WAL 损坏 → 节点 fail-start（非零退出）→ **FAIL**。用于离线变异（S04/S05/S06）后复验，或作为可复用工具 |
 
 ## 运行
 
 ```sh
-# 本地（M0 脚手架，5 轮）：
+# 本地（M1：3 轮，每轮一次真实 acked 写入 + 崩溃后复验）：
 bash l4/kill_loop.sh
 
 # 覆盖节点二进制路径与迭代次数：
@@ -58,6 +58,6 @@ bash l4/verify_wal.sh /path/to/data-dir ./node-bin
 ## 边界（如实声明）
 
 - L4 **不覆盖运行中的在线腐蚀**（那是 L2 `FaultyStorage` 的职责，`test-plan` §3.3）；L4 的磁盘故障 = 真盘 `kill -9` + **离线变异**（停机 → WAL 位翻转/截断 → 重启，对应 S04/S05/S06，可用 `verify_wal.sh` 复验）。
-- **M0 无写路径**：`kill_loop.sh` 不发起应用层写入（节点尚无 `propose` / admin 入口），故"持久进度不回退"目前只约束自选举 no-op 条目，**对已 ack 写入是空命题**。**M1 义务**：补写路径（admin propose）后，以真实 acked 写入复验 INV12/INV13。
+- **M1 写路径已就位**：`kill_loop.sh` 每轮发起真实 acked 写入（`PUT /kv/...` → 200）并在 `kill -9` 后读回复验，INV12/INV13 对已 ack 写入**不再是空命题**。**剩余**：专用真实磁盘 runner 上的起跑冒烟（M1）与 Release 门禁的 30min 预算（M4）尚未接线到 CI。
 - 真实磁盘坏扇区/静默腐蚀（企业级 scrub）超出本体系范围（`test-plan` §11 缺口 1）。
 - 本目录（`l4/`）**不是**根 workspace 成员，`scripts/check-deps.sh` / `check-entropy.sh` 不扫描它；它只依赖已构建的 `arachne-node` 二进制 + `curl` + `python3`，**不新增任何 crate**。

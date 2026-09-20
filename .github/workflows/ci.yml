@@ -67,6 +67,13 @@ jobs:
       - name: Entropy gate
         run: bash scripts/check-entropy.sh
 
+      - name: Release-feature gate (D-ART-testobs)
+        # Proves the shipped `arachne-node` artifact excludes the
+        # `test-observability` feature (the one recorded "test code in
+        # production" exception): the release binary must not contain markers,
+        # while a feature-on build must.
+        run: bash scripts/check-release-features.sh
+
       - name: Build examples
         # The examples are the consumer-facing demo and the compile gate for
         # the embedder API (D-ART): `arachne/examples/single_node.rs` is a

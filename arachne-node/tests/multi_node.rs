@@ -2,18 +2,24 @@
 //! processes form a tonic cluster and are driven over HTTP.
 //!
 //! Each process is spawned from the compiled binary with its own TOML config
-//! (a distinct raft `listen` port, HTTP port, and WAL dir). The test then:
+//! (a distinct raft `listen` port, HTTP port, and WAL dir). Covered here:
 //!
-//! 1. waits until all three report `ready` (a leader is known),
-//! 2. writes a key/value through whichever node is the leader (followers
-//!    answer `409`/`503` — expected, and must not hang),
-//! 3. reads the value back from the leader, and
-//! 4. verifies the write **replicates** to all three via stale reads.
+//! * `three_processes_form_a_cluster_and_replicate_over_http` — the cluster
+//!   forms, a write commits on the leader, reads back, and replicates to every
+//!   node via stale reads; a non-leader answers `409` with a leader hint
+//!   (M1 acceptance ③, the cross-process redirect contract).
+//! * `killing_the_leader_elects_a_new_one_and_writes_never_hang` — SIGKILL the
+//!   leader process: a survivor takes over and requests issued during the
+//!   leadership window return a bounded `409`/`503` instead of hanging
+//!   (M1 acceptance ①②).
 //!
 //! Gate C forbids real-time and network imports in `tests/`, so all waiting
 //! uses `core::time::Duration` + `std::thread::sleep` and every wait loop is
-//! bounded (count-based, no `Instant`). A `Drop` guard kills every child and
-//! removes the temp tree even if a later step panics.
+//! bounded (count-based, no clock reading). The strict
+//! `≤ 2×election_timeout` new-leader bound cannot be asserted here without a
+//! clock; it is proven deterministically (in raft ticks) by the L2 scenario
+//! harness in `arachne/tests/l2_scenarios.rs`. A `Drop` guard kills every child
+//! and removes the temp tree even if a later step panics.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -105,8 +111,10 @@ fn is_ready(addr: SocketAddr) -> bool {
         .unwrap_or(false)
 }
 
-#[test]
-fn three_processes_form_a_cluster_and_replicate_over_http() {
+/// Spawn a 3-process cluster in a fresh temp root. Returns the drop guard
+/// (which owns the child processes and the temp tree) and the HTTP addresses
+/// (parallel to the node index).
+fn spawn_cluster() -> (Cleanup, Vec<SocketAddr>) {
     let root = std::env::temp_dir().join(format!(
         "arachne-node-multi-{}-{}",
         std::process::id(),
@@ -176,8 +184,12 @@ fn three_processes_form_a_cluster_and_replicate_over_http() {
         .iter()
         .map(|p| format!("127.0.0.1:{p}").parse().expect("http addr"))
         .collect();
+    (cleanup, http_addrs)
+}
 
-    // 1. Ready: all three report 200 on /readyz (a leader is known).
+/// Wait until all three nodes report ready (a leader is known). Panics with the
+/// log tails on timeout.
+fn wait_ready(root: &Path, http_addrs: &[SocketAddr]) {
     let mut ready = [false; NUM_NODES];
     for _ in 0..300 {
         for i in 0..NUM_NODES {
@@ -186,44 +198,86 @@ fn three_processes_form_a_cluster_and_replicate_over_http() {
             }
         }
         if ready.iter().all(|&r| r) {
-            break;
+            return;
         }
         std::thread::sleep(core::time::Duration::from_millis(STEP_MS));
     }
     assert!(
         ready.iter().all(|&r| r),
         "all three nodes must become ready (a leader must be known); log tails:\n{}",
-        log_tails(&root, &ready)
+        log_tails(root, &ready)
     );
+}
 
-    // 2. Write: retry until the (current) leader accepts the PUT. Followers
-    //    answer 409 (not leader) / 503 (no quorum) — expected, and the bounded
-    //    window (plus the per-request read timeout) means a slow node never
-    //    wedges the test.
-    let mut writer: Option<usize> = None;
+/// Poll every node with `PUT path` until one answers `200`; that node is the
+/// leader. `None` if no node accepts within the window.
+fn find_leader(http_addrs: &[SocketAddr], path: &str) -> Option<usize> {
     for _ in 0..200 {
         for i in 0..NUM_NODES {
-            if http_request(http_addrs[i], "PUT", "/kv/k/v")
+            if http_request(http_addrs[i], "PUT", path)
                 .map(|(status, _)| status == 200)
                 .unwrap_or(false)
             {
-                writer = Some(i);
-                break;
+                return Some(i);
             }
-        }
-        if writer.is_some() {
-            break;
         }
         std::thread::sleep(core::time::Duration::from_millis(STEP_MS));
     }
+    None
+}
+
+/// Wait until a non-leader answers `409` with a hint naming `leader`, and
+/// return that body. Proves the cross-process `NotLeader → 409 + hint` contract
+/// (M1 acceptance ③), which is only reachable because the node's HTTP surface
+/// uses a single-shot (non-redirecting) client handle.
+fn wait_for_leader_hint(http_addrs: &[SocketAddr], leader: usize) -> String {
+    let expected = format!("leader=n{}", leader + 1);
+    for _ in 0..200 {
+        for i in 0..NUM_NODES {
+            if i == leader {
+                continue;
+            }
+            // The probe key is never written: a follower rejects it with 409.
+            // The path must be a well-formed `PUT /kv/<key>/<value>` (a missing
+            // value segment is a 400, not a 409).
+            if let Some((status, body)) = http_request(http_addrs[i], "PUT", "/kv/hint-probe/v") {
+                if status == 409 && body.contains(&expected) {
+                    return body;
+                }
+            }
+        }
+        std::thread::sleep(core::time::Duration::from_millis(STEP_MS));
+    }
+    panic!("a non-leader must answer 409 with a `{expected}` hint");
+}
+
+#[test]
+fn three_processes_form_a_cluster_and_replicate_over_http() {
+    let (cleanup, http_addrs) = spawn_cluster();
+    let root = cleanup.root.clone();
+    wait_ready(&root, &http_addrs);
+
+    // 1. Write: retry until the (current) leader accepts the PUT. Followers
+    //    answer 409 (not leader) / 503 (no quorum) — expected, and the bounded
+    //    window (plus the per-request read timeout) means a slow node never
+    //    wedges the test.
+    let writer = find_leader(&http_addrs, "/kv/k/v");
     assert!(
         writer.is_some(),
         "a leader must accept the PUT within the window; log tails:\n{}",
-        log_tails(&root, &ready)
+        log_tails(&root, &[true; NUM_NODES])
     );
     let writer = writer.expect("a leader accepted the PUT");
 
-    // 3. Read back from the writer (a linearizable ReadIndex read on the leader).
+    // 1b. Cross-process redirect contract: a non-leader must answer `409` with
+    //     a hint naming the actual leader (M1 acceptance ③).
+    let hint_body = wait_for_leader_hint(&http_addrs, writer);
+    assert!(
+        hint_body.contains("addr=127.0.0.1:"),
+        "the hint must carry the leader's address; got {hint_body:?}"
+    );
+
+    // 2. Read back from the writer (a linearizable ReadIndex read on the leader).
     let mut read_ok = false;
     for _ in 0..100 {
         if let Some((status, body)) = http_request(http_addrs[writer], "GET", "/kv/k") {
@@ -237,10 +291,10 @@ fn three_processes_form_a_cluster_and_replicate_over_http() {
     assert!(
         read_ok,
         "the writer must read back `v`; log tails:\n{}",
-        log_tails(&root, &ready)
+        log_tails(&root, &[true; NUM_NODES])
     );
 
-    // 4. Replication: all three eventually serve the value via a stale read.
+    // 3. Replication: all three eventually serve the value via a stale read.
     let mut replicated = [false; NUM_NODES];
     for _ in 0..200 {
         for i in 0..NUM_NODES {
@@ -261,5 +315,90 @@ fn three_processes_form_a_cluster_and_replicate_over_http() {
         replicated.iter().all(|&r| r),
         "all three nodes must replicate `v` via stale reads; log tails:\n{}",
         log_tails(&root, &replicated)
+    );
+}
+
+/// M1 acceptance ①②: SIGKILL the leader process; a survivor must take over,
+/// and every request issued during the leadership window must return a bounded
+/// status (`409`/`503`) rather than hanging.
+///
+/// `http_request` returns `None` on read timeout, so a `None` from a *living*
+/// node is the "hung" failure this test exists to catch.
+#[test]
+fn killing_the_leader_elects_a_new_one_and_writes_never_hang() {
+    let (mut cleanup, http_addrs) = spawn_cluster();
+    let root = cleanup.root.clone();
+    wait_ready(&root, &http_addrs);
+
+    // Commit one write through the leader, so we can prove the survivor's new
+    // leader still serves it after the failover.
+    let leader = find_leader(&http_addrs, "/kv/before/v");
+    assert!(
+        leader.is_some(),
+        "a leader must accept the initial PUT; log tails:\n{}",
+        log_tails(&root, &[true; NUM_NODES])
+    );
+    let leader = leader.expect("a leader accepted the initial PUT");
+
+    // SIGKILL the leader process: no graceful step-down, its listener dies.
+    cleanup.children[leader]
+        .kill()
+        .expect("kill the leader process");
+    let _ = cleanup.children[leader].wait();
+
+    // A survivor must become leader; requests during the window must be bounded.
+    let survivors: Vec<usize> = (0..NUM_NODES).filter(|i| *i != leader).collect();
+    let mut new_leader = None;
+    for _ in 0..200 {
+        for &i in &survivors {
+            match http_request(http_addrs[i], "PUT", "/kv/after/v") {
+                Some((200, _)) => {
+                    new_leader = Some(i);
+                    break;
+                }
+                Some((status, _)) => assert!(
+                    matches!(status, 409 | 503),
+                    "a write during the leadership window must be a bounded 409/503, \
+                     got {status} from node {}; log tails:\n{}",
+                    i + 1,
+                    log_tails(&root, &[true; NUM_NODES])
+                ),
+                None => panic!(
+                    "a write to living node {} must complete within the HTTP read \
+                     timeout, but it hung; log tails:\n{}",
+                    i + 1,
+                    log_tails(&root, &[true; NUM_NODES])
+                ),
+            }
+        }
+        if new_leader.is_some() {
+            break;
+        }
+        std::thread::sleep(core::time::Duration::from_millis(STEP_MS));
+    }
+    assert!(
+        new_leader.is_some(),
+        "a survivor must take over as leader within the bounded window; log tails:\n{}",
+        log_tails(&root, &[true; NUM_NODES])
+    );
+    let new_leader = new_leader.expect("a new leader emerged");
+    assert_ne!(new_leader, leader, "the killed node cannot be the new leader");
+
+    // The new leader still serves the pre-kill committed value: the write
+    // survived the failover on a quorum.
+    let mut read_ok = false;
+    for _ in 0..100 {
+        if let Some((status, body)) = http_request(http_addrs[new_leader], "GET", "/kv/before") {
+            if status == 200 && body.trim() == "v" {
+                read_ok = true;
+                break;
+            }
+        }
+        std::thread::sleep(core::time::Duration::from_millis(STEP_MS));
+    }
+    assert!(
+        read_ok,
+        "the new leader must serve the pre-kill committed value; log tails:\n{}",
+        log_tails(&root, &[true; NUM_NODES])
     );
 }

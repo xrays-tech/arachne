@@ -19,6 +19,11 @@
 //! redirects are followed, bounded by a total deadline of one election timeout,
 //! after which the call returns [`ArachneError::Timeout`]. No leader known /
 //! quorum lost returns [`ArachneError::QuorumUnavailable`].
+//!
+//! [`Handle::without_redirect`] yields a single-shot clone that skips the whole
+//! redirect policy and returns `NotLeader{hint}` verbatim; the node's HTTP
+//! surface uses it so a multi-process follower can answer `409` + leader hint
+//! instead of collapsing to `QuorumUnavailable`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -40,6 +45,11 @@ const MAX_REDIRECTS: u32 = 3;
 #[derive(Clone)]
 pub struct Handle {
     inner: Arc<HandleInner>,
+    /// The redirect budget for **this** handle (a clone-local setting, not part
+    /// of the shared [`HandleInner`]). [`Handle::MAX_REDIRECTS`] for a normal
+    /// client handle; `0` for a single-shot handle ([`Handle::without_redirect`])
+    /// that returns `NotLeader{hint}` verbatim.
+    max_redirects: u32,
 }
 
 impl Handle {
@@ -65,12 +75,28 @@ impl Handle {
                 peers: RwLock::new(HashMap::new()),
                 max_key_bytes: profile.max_key_bytes,
                 max_value_bytes: profile.max_value_bytes,
-                max_redirects: MAX_REDIRECTS,
                 // A single attempt is bounded by one election timeout: a write
                 // that does not commit within one election window is stalled
                 // (propsol §2.4 N3) and is reported as a Timeout.
                 timeout: Duration::from_millis(profile.election_timeout_ms.max(1)),
             }),
+            max_redirects: MAX_REDIRECTS,
+        }
+    }
+
+    /// A clone of this handle that performs a **single attempt** against this
+    /// node and returns [`ArachneError::NotLeader`] (hint included) verbatim
+    /// instead of following the hint to a peer (propsol §3.3).
+    ///
+    /// A node's own HTTP surface uses this. In a multi-process deployment there
+    /// are no in-process peer handles to redirect to, so the leader hint must
+    /// reach the external caller — the node renders it as `409 Conflict` with a
+    /// leader body — rather than being collapsed into
+    /// [`ArachneError::QuorumUnavailable`].
+    pub fn without_redirect(&self) -> Handle {
+        Handle {
+            inner: Arc::clone(&self.inner),
+            max_redirects: 0,
         }
     }
 
@@ -181,9 +207,13 @@ impl Handle {
             match result {
                 Ok(()) => return Ok(()),
                 Err(ArachneError::NotLeader { leader_hint }) => {
+                    if self.max_redirects == 0 {
+                        // Single-shot handle: surface the hint unchanged.
+                        return Err(ArachneError::NotLeader { leader_hint });
+                    }
                     pos = self.redirect_pos(&order, pos, leader_hint)?;
                     redirects += 1;
-                    if redirects > self.inner.max_redirects {
+                    if redirects > self.max_redirects {
                         return Err(ArachneError::Timeout);
                     }
                 }
@@ -203,9 +233,13 @@ impl Handle {
             match result {
                 Ok(value) => return Ok(value),
                 Err(ArachneError::NotLeader { leader_hint }) => {
+                    if self.max_redirects == 0 {
+                        // Single-shot handle: surface the hint unchanged.
+                        return Err(ArachneError::NotLeader { leader_hint });
+                    }
                     pos = self.redirect_pos(&order, pos, leader_hint)?;
                     redirects += 1;
-                    if redirects > self.inner.max_redirects {
+                    if redirects > self.max_redirects {
                         return Err(ArachneError::Timeout);
                     }
                 }
@@ -371,8 +405,6 @@ struct HandleInner {
     /// Key/value size limits (validated before propose).
     max_key_bytes: u64,
     max_value_bytes: u64,
-    /// The redirect cap for a single operation.
-    max_redirects: u32,
     /// The total deadline for a single operation (across redirects).
     timeout: Duration,
 }
