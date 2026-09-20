@@ -28,9 +28,9 @@ use raft::storage::{GetEntriesContext, RaftState, Storage as RaftStorageTrait};
 use raft::{Error as RaftError, Result as RaftResult, StorageError as RaftStorageError};
 
 use arachne_seam::storage::{
-    ConfState as SeamConfState, EntryType as SeamEntryType, HardState as SeamHardState,
-    LogEntry, Snapshot as SeamSnapshot, SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage,
-    StorageError as SeamStorageError,
+    ConfState as SeamConfState, EntryType as SeamEntryType, FlushToken,
+    HardState as SeamHardState, LogEntry, PersistSubmit, Snapshot as SeamSnapshot,
+    SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage, StorageError as SeamStorageError,
 };
 use arachne_seam::types::LogIndex;
 use crate::storage::WalStorage;
@@ -81,6 +81,24 @@ impl<S: SeamStorage> RaftStorage<S> {
     /// are durable (invariant I2/I4).
     pub fn sync_entries(&mut self) -> RaftResult<()> {
         self.inner.sync_entries().map_err(map_error)
+    }
+
+    /// Persist one `Ready`'s records: entries first, then the optional hard
+    /// state (propsol v0.2.13 P). Returns [`PersistSubmit::Offloaded`] when the
+    /// storage is flushing off-thread and the caller should keep working.
+    pub fn persist_ready_records(
+        &mut self,
+        entries: &[LogEntry],
+        hard_state: Option<&SeamHardState>,
+    ) -> RaftResult<PersistSubmit> {
+        self.inner
+            .persist_ready_records(entries, hard_state)
+            .map_err(map_error)
+    }
+
+    /// Non-blocking completion check for an offloaded flush.
+    pub fn poll_flush(&mut self, token: &FlushToken) -> RaftResult<Option<Result<(), String>>> {
+        self.inner.poll_flush(token).map_err(map_error)
     }
 
     /// Persist the hard state. The seam guarantees this fsyncs on every call

@@ -52,10 +52,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arachne_seam::storage::{
-    FsyncObserver, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
+    FlushToken, FlushWaker, FsyncObserver, HardState, LogEntry, PersistSubmit, RaftState,
+    Snapshot, Storage, StorageError,
 };
 use arachne_seam::types::{LogIndex, Term};
 
@@ -272,9 +273,54 @@ pub struct WalStorage {
     stats: StorageStats,
     /// Optional fsync observer (zero-overhead when `None`).
     fsync_observer: Option<Arc<dyn FsyncObserver>>,
+    /// Off-thread durability, once enabled (propsol v0.2.13 P). `None` = the
+    /// synchronous path, byte-for-byte the behaviour before the pipeline.
+    offloaded: Option<Offloaded>,
+    /// A waker installed before offloading was enabled, applied on enable.
+    pending_flush_waker: Option<FlushWaker>,
     /// The data-dir lock file (held for the lifetime of this struct).
     /// Dropping it releases the lock.
     _lock: File,
+}
+
+/// Off-thread durability: one flusher thread per storage (propsol v0.2.13 P).
+///
+/// Jobs are flushed **in submission order** by a single thread, so completions
+/// form a FIFO the caller can rely on. The thread owns a duplicated descriptor
+/// per job: `fsync` flushes the inode, so a job covers every record written
+/// before it was submitted.
+struct Offloaded {
+    /// `None` only while dropping: taking it is what ends the thread.
+    jobs: Option<std::sync::mpsc::Sender<FlushJob>>,
+    /// Completed jobs, oldest first.
+    done: Arc<Mutex<std::collections::VecDeque<FlushJobResult>>>,
+    /// Installed by the node; called after each completion.
+    waker: Arc<Mutex<FlushWaker>>,
+    next_id: u64,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct FlushJob {
+    id: u64,
+    segment_first_index: LogIndex,
+    file: File,
+}
+
+struct FlushJobResult {
+    id: u64,
+    segment_first_index: LogIndex,
+    result: Result<(), String>,
+}
+
+impl Drop for Offloaded {
+    fn drop(&mut self) {
+        // Dropping the sender ends the thread's receive loop; joining it means
+        // no flush can outlive the storage.
+        self.jobs.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl WalStorage {
@@ -426,6 +472,8 @@ impl WalStorage {
             segment_bytes: opts.config.segment_bytes,
             stats,
             fsync_observer: opts.fsync_observer,
+            offloaded: None,
+            pending_flush_waker: None,
             _lock: lock_file,
         })
     }
@@ -943,6 +991,85 @@ impl WalStorage {
         })
     }
 
+    /// Switch this WAL to **off-thread durability** (propsol v0.2.13 P).
+    ///
+    /// From here on, `persist_ready_records` writes records and hands back a
+    /// [`FlushToken`] instead of blocking on the device: one flusher thread
+    /// flushes jobs in submission order, and `poll_flush` reports completion.
+    /// Until this is called the storage behaves exactly as it did before the
+    /// pipeline existed, which is what keeps the deterministic harnesses
+    /// (and every storage double) on the synchronous path.
+    pub fn enable_offloaded_durability(&mut self) -> Result<(), StorageError> {
+        if self.offloaded.is_some() {
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<FlushJob>();
+        let done: Arc<Mutex<std::collections::VecDeque<FlushJobResult>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let waker: Arc<Mutex<FlushWaker>> = Arc::new(Mutex::new(FlushWaker::default()));
+        let thread_done = Arc::clone(&done);
+        let thread_waker = Arc::clone(&waker);
+        let thread = std::thread::Builder::new()
+            .name(format!("arachne-wal-flush-{}", self.meta.node_id))
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let result = job.file.sync_all().map_err(|e| e.to_string());
+                    if let Ok(mut queue) = thread_done.lock() {
+                        queue.push_back(FlushJobResult {
+                            id: job.id,
+                            segment_first_index: job.segment_first_index,
+                            result,
+                        });
+                    }
+                    if let Ok(waker) = thread_waker.lock() {
+                        waker.wake();
+                    }
+                }
+            })
+            .map_err(StorageError::Io)?;
+        let waker = match self.pending_flush_waker.take() {
+            Some(pending) => Arc::new(Mutex::new(pending)),
+            None => waker,
+        };
+        self.offloaded = Some(Offloaded {
+            jobs: Some(tx),
+            done,
+            waker,
+            next_id: 0,
+            thread: Some(thread),
+        });
+        Ok(())
+    }
+
+    /// Queue an off-thread flush of the active segment and return its token.
+    fn submit_flush(&mut self) -> Result<FlushToken, StorageError> {
+        let file = self.segment.try_clone_file().map_err(StorageError::Io)?;
+        let segment_first_index = self.segment_first_index;
+        let offloaded = self.offloaded.as_mut().ok_or_else(|| {
+            StorageError::Unrecoverable {
+                detail: "off-thread durability is not enabled".into(),
+            }
+        })?;
+        let id = offloaded.next_id;
+        offloaded.next_id += 1;
+        let sender = offloaded
+            .jobs
+            .as_ref()
+            .ok_or_else(|| StorageError::Unrecoverable {
+                detail: "the WAL flusher has been shut down".into(),
+            })?;
+        sender
+            .send(FlushJob {
+                id,
+                segment_first_index,
+                file,
+            })
+            .map_err(|_| StorageError::Unrecoverable {
+                detail: "the WAL flusher thread stopped".into(),
+            })?;
+        Ok(FlushToken(id))
+    }
+
     /// Append entries **without** flushing them (propsol v0.2.13 P).
     ///
     /// The records become readable to raft (and to recovery) but are only
@@ -1402,6 +1529,82 @@ impl Storage for WalStorage {
         self.compacted_to = snapshot.meta.index;
         self.replace_log_with_snapshot(snapshot.meta.index)?;
         Ok(())
+    }
+
+    fn persist_ready_records(
+        &mut self,
+        entries: &[LogEntry],
+        hard_state: Option<&HardState>,
+    ) -> Result<PersistSubmit, StorageError> {
+        if self.offloaded.is_none() {
+            // Synchronous path: exactly the sequence every caller used before
+            // the pipeline existed.
+            if !entries.is_empty() {
+                self.append(entries)?;
+                self.sync_entries()?;
+            }
+            if let Some(hs) = hard_state {
+                self.set_hard_state(hs)?;
+            }
+            return Ok(PersistSubmit::Durable);
+        }
+        // Off-thread path: write (immediately readable to raft, not yet
+        // durable), then let the flusher thread pay for the device.
+        if !entries.is_empty() {
+            self.append_buffered(entries)?;
+        }
+        if let Some(hs) = hard_state {
+            self.set_hard_state_buffered(hs)?;
+        }
+        if self.pending_entry_fsync {
+            self.submit_flush().map(PersistSubmit::Offloaded)
+        } else {
+            Ok(PersistSubmit::Durable)
+        }
+    }
+
+    fn poll_flush(
+        &mut self,
+        token: &FlushToken,
+    ) -> Result<Option<Result<(), String>>, StorageError> {
+        let Some(offloaded) = self.offloaded.as_mut() else {
+            return Ok(Some(Ok(())));
+        };
+        let finished = {
+            let mut done = offloaded
+                .done
+                .lock()
+                .map_err(|_| StorageError::Unrecoverable {
+                    detail: "the WAL flusher state is poisoned".into(),
+                })?;
+            match done.iter().position(|job| job.id == token.0) {
+                Some(position) => done.remove(position),
+                None => None,
+            }
+        };
+        let Some(finished) = finished else {
+            return Ok(None);
+        };
+        // A failed flush leaves the bytes unsynced: report it without claiming
+        // durability, so the node fail-stops instead of acknowledging.
+        if finished.result.is_ok() {
+            self.stats.offloaded_fsyncs += 1;
+            if finished.segment_first_index == self.segment_first_index {
+                self.pending_entry_fsync = false;
+                self.notify_fsynced();
+            }
+        }
+        Ok(Some(finished.result))
+    }
+
+    fn set_flush_waker(&mut self, waker: FlushWaker) {
+        if let Some(offloaded) = &self.offloaded {
+            if let Ok(mut slot) = offloaded.waker.lock() {
+                *slot = waker;
+            }
+            return;
+        }
+        self.pending_flush_waker = Some(waker);
     }
 
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError> {
@@ -2490,6 +2693,76 @@ mod tests {
         drop(storage);
         let storage = WalStorage::open(&dir, opts).unwrap();
         assert_eq!(storage.initial_state().unwrap().hard_state.commit, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offloaded_durability_defers_the_flush_until_polled() {
+        use arachne_testsupport::FsyncLedger;
+
+        let dir = temp_dir();
+        let ledger = Arc::new(FsyncLedger::new());
+        let opts = WalOptions {
+            fsync_observer: Some(Arc::clone(&ledger) as Arc<dyn FsyncObserver>),
+            ..test_opts()
+        };
+        let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+
+        // Before enabling, the storage takes the synchronous path.
+        assert_eq!(
+            storage
+                .persist_ready_records(&[make_entry(1, 1, b"a")], None)
+                .unwrap(),
+            PersistSubmit::Durable
+        );
+
+        storage.enable_offloaded_durability().unwrap();
+        let hs = HardState {
+            term: 1,
+            vote: None,
+            commit: 2,
+        };
+        let submitted = storage
+            .persist_ready_records(&[make_entry(2, 1, b"b")], Some(&hs))
+            .unwrap();
+        let PersistSubmit::Offloaded(token) = submitted else {
+            panic!("the offloaded path must hand back a flush token, got {submitted:?}");
+        };
+        assert!(
+            !ledger.union_covers(2, 2),
+            "an off-thread flush cannot already be durable"
+        );
+
+        // The actor polls; the flusher thread reports back. A device flush is
+        // milliseconds of real work, so the wait needs a deadline rather than a
+        // spin budget.
+        let mut completed = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Some(result) = storage.poll_flush(&token).unwrap() {
+                completed = Some(result);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(completed, Some(Ok(())), "the flush must complete");
+        assert!(
+            ledger.union_covers(2, 2),
+            "the offloaded flush must make both records durable for INV1's ledger"
+        );
+        assert_eq!(storage.stats().offloaded_fsyncs, 1);
+        assert_eq!(
+            storage.stats().entry_fsyncs,
+            1,
+            "only the pre-enable synchronous flush should be counted"
+        );
+        assert_eq!(storage.stats().hard_state_fsyncs, 0);
+
+        // The buffered HardState is durable once the flush completed.
+        drop(storage);
+        let storage = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(storage.last_index().unwrap(), 2);
+        assert_eq!(storage.initial_state().unwrap().hard_state.commit, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

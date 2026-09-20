@@ -108,6 +108,50 @@ pub struct Snapshot {
     pub data: Vec<u8>,
 }
 
+/// A pending **off-thread flush** of records a storage has already written.
+///
+/// Opaque to the caller: only the storage that minted it knows what it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlushToken(pub u64);
+
+/// What [`Storage::persist_ready_records`] did with a `Ready`'s records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistSubmit {
+    /// The records are durable: a synchronous storage, or nothing to persist.
+    Durable,
+    /// The records are written and readable but not yet durable; the token
+    /// reports completion through [`Storage::poll_flush`].
+    Offloaded(FlushToken),
+}
+
+/// A callback a storage invokes when an offloaded flush completes.
+///
+/// The runtime installs one so it can wake as soon as durability lands instead
+/// of waiting for its next tick (propsol v0.2.13 P). Kept as a plain closure so
+/// this leaf crate stays dependency-free.
+#[derive(Clone, Default)]
+pub struct FlushWaker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
+
+impl FlushWaker {
+    /// Wrap a callback.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Some(std::sync::Arc::new(wake)))
+    }
+
+    /// Signal completion. Cheap and callable from any thread.
+    pub fn wake(&self) {
+        if let Some(wake) = &self.0 {
+            wake();
+        }
+    }
+}
+
+impl core::fmt::Debug for FlushWaker {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("FlushWaker").field(&self.0.is_some()).finish()
+    }
+}
+
 /// The durable raft state: the hard state plus the membership configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RaftState {
@@ -233,6 +277,49 @@ pub trait Storage: Send + 'static {
     /// P2 may return [`StorageError::Unrecoverable`] or be a no-op until real
     /// compaction lands (M2).
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError>;
+
+    /// Persist one `Ready`'s records, entries first and then the optional hard
+    /// state, in the order raft requires.
+    ///
+    /// The default is the synchronous sequence every storage already
+    /// implements. A storage that can flush off-thread overrides it to write
+    /// both records and return [`PersistSubmit::Offloaded`], so the caller can
+    /// keep serving reads while the device catches up (propsol v0.2.13 P).
+    fn persist_ready_records(
+        &mut self,
+        entries: &[LogEntry],
+        hard_state: Option<&HardState>,
+    ) -> Result<PersistSubmit, StorageError> {
+        if !entries.is_empty() {
+            self.append(entries)?;
+            // I2/I4: the entries are durable once this returns.
+            self.sync_entries()?;
+        }
+        if let Some(hs) = hard_state {
+            // I1: always fsynced, never batched.
+            self.set_hard_state(hs)?;
+        }
+        Ok(PersistSubmit::Durable)
+    }
+
+    /// Non-blocking completion check for a token from
+    /// [`persist_ready_records`](Storage::persist_ready_records).
+    ///
+    /// `Ok(None)` means "still in flight, ask again"; `Ok(Some(result))`
+    /// reports the outcome exactly once. Storages that never return a token
+    /// inherit a "already complete" answer.
+    fn poll_flush(
+        &mut self,
+        token: &FlushToken,
+    ) -> Result<Option<Result<(), String>>, StorageError> {
+        let _ = token;
+        Ok(Some(Ok(())))
+    }
+
+    /// Install the callback to wake when an offloaded flush completes.
+    fn set_flush_waker(&mut self, waker: FlushWaker) {
+        let _ = waker;
+    }
 
     /// Persist `snapshot` durably and make it this store's latest snapshot.
     ///
