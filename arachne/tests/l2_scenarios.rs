@@ -217,6 +217,23 @@ impl Cluster {
         reads
     }
 
+    /// Tick+step only node `i` (no delivery) and apply what it emits. Used to
+    /// isolate pure WAL replay from leader resync.
+    fn step_local_apply(&mut self, i: RaftId) {
+        let idx = (i - 1) as usize;
+        let committed = {
+            let node = self.nodes[idx].as_mut().expect("node present");
+            node.tick();
+            let out = block_on(node.step()).expect("step");
+            node.advance_apply();
+            out.committed
+        };
+        for (ix, data) in committed {
+            self.sms[idx].apply(ix, &data).expect("apply");
+            self.committed[idx].push((ix, data));
+        }
+    }
+
     /// Crash node `i` (task death): drop the node; its WAL dir is retained.
     fn crash(&mut self, i: RaftId) {
         self.nodes[(i - 1) as usize] = None;
@@ -1274,6 +1291,19 @@ fn s01_true_crash_wal_restart_recovers() {
 
     // Restart the follower from its WAL (volatile state lost).
     c.bounce(follower);
+
+    // Pure WAL replay (no delivery): the restarted node alone must recover the
+    // pre-crash committed value v1 from its durable log — isolating replay from
+    // the leader's later resync of v2.
+    for _ in 0..10 {
+        c.step_local_apply(follower);
+    }
+    assert_eq!(
+        c.sms[(follower - 1) as usize].get(b"k").expect("sm get"),
+        Some(vbytes(ValueId(1))),
+        "WAL replay alone must recover the pre-crash committed value"
+    );
+
     for _ in 0..1000 {
         c.round();
     }
