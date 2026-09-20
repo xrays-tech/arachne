@@ -75,10 +75,23 @@ impl Handle {
                 peers: RwLock::new(HashMap::new()),
                 max_key_bytes: profile.max_key_bytes,
                 max_value_bytes: profile.max_value_bytes,
-                // A single attempt is bounded by one election timeout: a write
+                // A write attempt is bounded by one election timeout: a write
                 // that does not commit within one election window is stalled
                 // (propsol §2.4 N3) and is reported as a Timeout.
                 timeout: Duration::from_millis(profile.election_timeout_ms.max(1)),
+                // A **read** must outlive the runtime actor's own ReadIndex
+                // budget, or the client would give up while the actor was still
+                // resolving the read. The actor waits `read_index_timeout`
+                // (= 2 × election) per attempt and retries once, so the client's
+                // bound is two such waits plus one election timeout of
+                // scheduling margin.
+                read_timeout: Duration::from_millis(
+                    profile
+                        .read_index_timeout_ms
+                        .max(1)
+                        .saturating_mul(2)
+                        .saturating_add(profile.election_timeout_ms.max(1)),
+                ),
             }),
             max_redirects: MAX_REDIRECTS,
         }
@@ -223,7 +236,10 @@ impl Handle {
     }
 
     async fn get_with_redirect(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ArachneError> {
-        let deadline = Instant::now() + self.inner.timeout;
+        // Reads use the longer read budget (the actor's ReadIndex wait plus its
+        // one retry); using the write budget here made the client give up before
+        // the actor could resolve the read.
+        let deadline = Instant::now() + self.inner.read_timeout;
         let order = self.target_order();
         let mut pos = 0usize;
         let mut redirects = 0u32;
@@ -405,8 +421,11 @@ struct HandleInner {
     /// Key/value size limits (validated before propose).
     max_key_bytes: u64,
     max_value_bytes: u64,
-    /// The total deadline for a single operation (across redirects).
+    /// The total deadline for a single **write** operation (across redirects).
     timeout: Duration,
+    /// The total deadline for a single **read** operation. Must exceed the
+    /// runtime actor's ReadIndex budget (see [`Handle::new_local`]).
+    read_timeout: Duration,
 }
 
 /// The next per-handle `client_id`: the process id in the high bits (so
