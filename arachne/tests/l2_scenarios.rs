@@ -780,4 +780,3 @@ fn read_index_is_served_only_on_the_leader() {
 
     c.cleanup();
 }
-
