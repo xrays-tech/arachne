@@ -598,6 +598,10 @@ fn s16_asymmetric_partition_steps_down_leader() {
         !c.leader_of(leader),
         "an asymmetric partition must step the leader down (CheckQuorum)"
     );
+    assert!(
+        c.any_leader().is_some(),
+        "the survivors must elect a new leader after the step-down"
+    );
     assert_single_leader_per_term(&c.leader_obs);
     c.cleanup();
 }
@@ -610,17 +614,16 @@ fn inv4_failover_mid_history_is_linearizable() {
     let _seed = ElectionSeed::enter(0x1_4F0);
     let mut c = Cluster::new(3);
     let mut leader = elect(&mut c);
+    let initial_leader = leader;
 
     let mut h = History::new();
     let mut ts = 0u64;
     let mut version = 0u64;
-    let mut failovers = 0u32;
 
     for round in 0..6u64 {
         if round == 2 {
             c.faults.isolate(leader);
             leader = wait_new_leader(&mut c, leader);
-            failovers += 1;
         }
 
         version += 1;
@@ -646,7 +649,12 @@ fn inv4_failover_mid_history_is_linearizable() {
         ts += 1;
     }
 
-    assert_eq!(failovers, 1, "the scenario must exercise one mid-history failover");
+    // Observational (system-derived, not counter bookkeeping): the trace must
+    // show a leader other than the initial one after the failover.
+    assert!(
+        c.leader_obs.iter().any(|&(_, l)| l != initial_leader),
+        "a new leader must appear in the observed trace after the failover"
+    );
     let report = h.check();
     assert!(report.passed(), "oracle failures after failover: {}", report.render());
     let outcome = check_linearizable(&h, &KvState::new());
@@ -657,7 +665,3 @@ fn inv4_failover_mid_history_is_linearizable() {
 
     c.cleanup();
 }
-
-
-
-
