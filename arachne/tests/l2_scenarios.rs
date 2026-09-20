@@ -1156,6 +1156,72 @@ fn inv4_read_index_under_failover_yields_failure_then_recovers() {
         matches!(outcome, CheckOutcome::Linearizable),
         "checker (read under fault): {outcome:?}"
     );
+    assert_single_leader_per_term(&c.leader_obs);
     c.cleanup();
 }
+
+/// A client retries the SAME `(client, seq)` after a failover: the first attempt
+/// times out on the isolated leader (no commit), the retry commits on the new
+/// leader. The oracle's retry-merge must collapse the two attempts into one
+/// logical op (at-most-once), and the history must stay linearizable.
+#[test]
+fn inv4_same_seq_retry_across_failover_merges() {
+    let _seed = ElectionSeed::enter(0x1_800);
+    let mut c = Cluster::new(3);
+    let leader0 = elect(&mut c);
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+
+    // Attempt put (client 0, seq 1) on leader0, then isolate before any round.
+    let cmd = KvStateMachine::encode_put(1, 1, b"k", &vbytes(ValueId(1)));
+    h.invoke(CallId(1), ClientId(0), SeqNo(1), Op::Put { key: b"k".to_vec(), value: ValueId(1) }, ts);
+    ts += 1;
+    c.nodes[(leader0 - 1) as usize]
+        .as_mut()
+        .expect("leader present")
+        .propose(&cmd)
+        .expect("propose accepted");
+    c.faults.isolate(leader0);
+    for _ in 0..300 {
+        c.round();
+    }
+    assert!(
+        !c.committed[(leader0 - 1) as usize].iter().any(|(_, d)| d == &cmd),
+        "the attempt must not commit on the isolated leader"
+    );
+    h.complete(CallId(1), ts, OpResult::Err(OracleErrorKind::Timeout));
+    ts += 1;
+
+    // Retry the SAME (client 0, seq 1) on the new leader.
+    let leader1 = wait_new_leader(&mut c, leader0);
+    h.invoke(CallId(2), ClientId(0), SeqNo(1), Op::Put { key: b"k".to_vec(), value: ValueId(1) }, ts);
+    ts += 1;
+    commit_put(&mut c, leader1, b"k", ValueId(1), 1);
+    h.complete(CallId(2), ts, OpResult::Ok(None));
+    ts += 1;
+
+    // A read observes the committed value.
+    let ctx = vec![0xC0, 0];
+    h.invoke(CallId(3), ClientId(0), SeqNo(2), Op::Get { key: b"k".to_vec() }, ts);
+    ts += 1;
+    let read = read_via_read_index(&mut c, leader1, b"k", ctx);
+    h.complete(CallId(3), ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (same-seq retry): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (same-seq retry): {outcome:?}"
+    );
+    // The two attempts of (client 0, seq 1) merge to ONE logical op; + the get.
+    assert_eq!(
+        h.merge_retries().ops.len(),
+        2,
+        "same (client, seq) retries must merge into one logical op"
+    );
+    c.cleanup();
+}
+
 
