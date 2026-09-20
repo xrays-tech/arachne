@@ -252,6 +252,20 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 
 **新增覆盖**：`m2_snapshot.rs` 的追赶场景参数化后跑两遍——`lagging_follower_catches_up_through_a_snapshot`（默认同步）与 `lagging_follower_catches_up_with_offloaded_durability`（pipeline：写洪峰 → 快照 → follower 安装 → 重启 → 换主，全绿）。
 
+### 1.12 未结案：空闲时 `get` 的延迟 = 一个 heartbeat interval（**待修**）
+
+在追 rev P 的 idle p99（~11ms）时查到一个**可复现的具体问题**，尚未修复，记录如下。
+
+**现象**：3 节点内存传输集群、空闲（无写洪峰）时，线性一致 `get` 的延迟几乎**每次都**等于一个 heartbeat interval（`read_latency` 的 idle 基线：interval=10ms → 样本 9.2–10.7ms；把 interval 改成 50ms → 44–50ms，**严格随周期线性缩放**）。同一轮里 `get_stale`（弱读）是 ~0.2ms、写是 ~1–2ms，所以不是 actor/apply 通道、也不是设备。
+
+**定位**：临时给 `PendingRead` 加时间戳后测得，10ms **全部在一个阶段**——ReadIndex 的 quorum 确认（`quorum=9.27ms`，`apply=166ns`，且 `read_index == applied == 2`，没有等 apply）。即：`read_index()` 发出的带 ctx 心跳→follower 回包→leader 确认这一轮，要到下一个 heartbeat tick 才算完。
+
+**已排除**：不是测试文件（`git diff cb4a704 HEAD -- arachne/tests/read_latency.rs` 只有一行注释）、不是 profile（一直是 heartbeat 10ms）、不是 rev O 的 `CYCLE_BURST` 批量（设成 1 仍然 46–49ms@50ms）、不是专用线程（`read_latency` 至今用 `tokio::spawn(runtime.run())`，没走 `spawn_dedicated`）；也不是传输唤醒问题（写路径的完整往返只要 1–2ms，同一套 mpsc 唤醒）。
+
+**结论**：区间落在 `cb4a704`（那时 idle p99 = **372µs**）→ `0bcac99`（现在 ~10ms）之间的 runtime 改动里；`CYCLE_BURST` 与专用线程已排除，剩下的嫌疑集中在 P3 的 `step` 两相改造（`submit_ready` 捕获 + `finish_persisted` 产出 read_states，以及 `advance_apply` 的调用时机）与 `88ab876` 的 busy-loop 修复。
+
+**下一步（很便宜，约 15 分钟）**：把上面那个"改 interval 看是否线性缩放"的探针当判据，对 `cb4a704..0bcac99` 之间 7 个提交做二分（每次只重建 arachne + 该测试）；定位后修，并在 `read_latency` 里**补一条 idle 门槛断言**（当前门槛只比 storm/写比值，所以这条退化完全看不见——这正是它藏了这么久的原因）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
