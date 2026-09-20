@@ -842,7 +842,7 @@ fn inv4_multi_key_history_linearizable() {
 /// must still be linearizable.
 #[test]
 fn inv4_concurrent_ops_during_partition_linearizable() {
-    let _seed = ElectionSeed::enter(0x1_4F0);
+    let _seed = ElectionSeed::enter(0x1_4F1);
     let mut c = Cluster::new(3);
     let leader = elect(&mut c);
     let victim = (1..=3).find(|&i| i != leader).expect("a follower exists");
@@ -886,4 +886,3 @@ fn inv4_concurrent_ops_during_partition_linearizable() {
     );
     c.cleanup();
 }
-
