@@ -11,9 +11,15 @@ use arachne_l2::harness::run_three_node;
 const SEED: u64 = 0x5EED_3B;
 
 #[test]
-#[ignore = "stage 3b spike: real tonic over turmoil stalls (leader elected, \
-            followers ack, but the client propose never completes because the \
-            actor loop wedges in the commit path). See handoff-m1.md stage 3b."]
+#[ignore = "stage 3b spike (refined diagnosis): an outbound raft RPC \
+            (leader -> follower) connects but its response never arrives, so \
+            the single-task runtime actor stops between ticks (it is awaiting \
+            the send inside `step`). Leadership then churns — check-quorum \
+            step-downs with terms 1->2->3... — and a client `put` times out and \
+            then returns `quorum unavailable`. This is NOT an actor-logic \
+            deadlock: the command is received and answered. See the stage 3b \
+            entry in dev-docs/handoff-m1.md for the full evidence and the \
+            fixes that were tried and ruled out."]
 fn three_node_cluster_elects_commits_and_replicates() {
     let obs = run_three_node(SEED);
     assert_eq!(obs.len(), 3, "one observation per node: {obs:?}");

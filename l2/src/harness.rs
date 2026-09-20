@@ -151,6 +151,17 @@ pub fn run_three_node(seed: u64) -> Vec<NodeObservation> {
                     Vec::new(),
                     addrs.clone(),
                 );
+                // Match the transport's per-request / connect deadlines to the
+                // node's **simulated** RPC timeout. The factory defaults (5s
+                // request, 2s connect) are wall-clock-shaped: under the simulator
+                // a stalled cached channel would hold the single-task runtime
+                // actor for 5s of simulated time — far past the election window —
+                // so the cluster looks wedged (no ticks, no inbound, no commit).
+                // Bounding the send at `rpc_timeout` keeps the actor responsive
+                // and lets raft retry on a fresh connection.
+                let rpc_timeout = Duration::from_millis(profile().rpc_timeout_ms.max(1));
+                let _ = factory.request_timeout(rpc_timeout);
+                let _ = factory.connect_timeout(rpc_timeout);
                 // Bind `0.0.0.0:port` (turmoil only allows unspecified/loopback
                 // binds); peers dial this node at its `host_ip:port` entry.
                 let bind = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 7000 + i as u16);

@@ -110,9 +110,27 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 **stage 3a（已完成，commit edd913d）：transport I/O 接缝**：`arachne-transport-tonic` 新增 `TransportIo` 接缝 + `TokioIoProvider`（真实 tokio）+ `TcpConnector`；`TonicTransportFactory`/`TonicTransport` 对 `Io = TokioIoProvider` 泛型，server 经 `io.bind`/`io.incoming`、client 经 `Endpoint::connect_with_connector`。既有 API 不变（默认类型参数保住 `arachne-node` 用法）；`hyper/hyper-util/tower(util)/http` 均经 tonic 已传递，无新包。**门禁 NO-GO→修 `TcpConnector` 丢 `TCP_NODELAY`（tonic 默认连接器会设、自定义连接器绕过）→GO**。
 **stage 3b（部分完成 → 记为 spike，commit 76df587）：真实 tonic over turmoil + SimNetwork**。已落地并可编译：`l2/` 的 `TurmoilIo`（`turmoil::net` listener/stream + `Accepted` newtype 实现 tonic `Connected` + `TokioIo` connector）、`SimNetwork`（partition/partition_oneway/repair/hold/release/crash/bounce/set_fail_rate/set_link_latency）、3 节点 in-sim 真实 tonic 集群；两个 `in_sim` 测试标 `#[ignore]`（原因见下）以保 `l2` suite 绿。
 - **已证明可用**：3 节点全部启动（WAL+bind+Runtime actor）；在 turmoil 承载的真实 tonic 上**成功选出 leader**；follower 学到 leader；消息双向健康（`MsgHeartbeat`/`MsgHeartbeatResponse` 双向、term 1）。
-- **卡点（未解）**：客户端 `put` 永不提交。经临时探针（已回退）诊断：transport 所有 `send` 均成功；**即使关掉 `check_quorum` 让 leader 稳定，actor 也收不到 `Command::Propose`**——actor 循环卡在 commit 路径上某个永不返回的 `await`（疑为 turmoil 下某次 `send`/`step` await 悬挂或跨 host 死锁）。相同 Runtime/RaftNode/Handle 路径在进程内内存传输下已证明可用（m0/client_runtime）。
+- **卡点（未解；**2025 复诊见 §1.6**）**：客户端 `put` 永不提交。**旧记录的两处结论已被复诊推翻**：(a) 不是"actor 收不到 `Command::Propose`"——命令会被收到并被答复；(b) 不是 actor 逻辑死锁。真实机制见 §1.6。
 - **附带修复**：`Runtime` 的 propose/ReadIndex 截止时间原用 `std::time::Instant`（真实墙钟）→ 在模拟器下是确定性泄漏，已改 `tokio::time::Instant`（commit 377f3ce，root 仍 277 绿）。
-- **下一步建议（待用户决定）**：(a) 继续攻 3b：给 `TonicTransport::send`/`step` 加临时超时定位悬挂点，或做最小 tonic 双向 echo-under-turmoil 实验对照；(b) 3b 暂缓，3c 先用**内存传输**跑 INV3/4/7/8/9 + S01/S02/S16（保留 stage 3a seam，real-tonic 作为已记录 spike）。
+- **现状**：3b 仍为已记录 spike（`l2/tests/in_sim.rs` 两个测试 `#[ignore]`，理由已按复诊结论更新）；L2 不变量/场景继续跑在**内存传输**（`arachne/tests/l2_scenarios.rs`，20 项）。
+
+### 1.6 stage 3b 复诊（`l2` · real tonic over turmoil）
+
+复诊方法：在 `Runtime::run`（select 分支计数 + 事件序列）、`TonicTransport::send`（dial/connect/reply 三段日志）、`l2` 的 accept 循环上加重放探针（**全部已回退**），跑 `cargo test --test in_sim -- --ignored`。
+
+**证据链**
+1. **actor 停在 `drive_cycle` 内，而这里只有一处 `await`**：日志为 `[actor n2] begin tick seq=239` 后**没有** `drive-ok seq=239`；同一时刻 actor n3 继续跑到 seq=250。`drive_cycle` 中唯一的 `await` 是 `deliver → transport.send`（`step()` 其余部分、`advance`、apply、reply 都是同步）。
+2. **悬挂方向明确**：`[send] n2->n3 dialing … connected` 之后**没有** `replied`；该方向此前成功 7 次（8 dialing / 7 replied）。`n2->n1`、`n3->n2`、`n1->n2` 均正常。
+3. **对端没死**：n3 的 actor 在 n2 停住后继续 tick；`l2` 的 accept 循环**未报错**（探针无输出），故不是"服务器停止 accept"。
+4. **不是"actor 收不到命令"**：占位日志显示 `begin cmd seq=318` 紧跟 `Propose rejected as non-leader: leader_id=2 raft_id=1`——命令被收到、被答复。
+5. **客户端可见后果**：`put` 先 `operation timed out`（propose 截止 = election_timeout），随后 `quorum unavailable`；`leader_id` 反复归 0、term 1→2→3→…（**check-quorum 降级 + 重新选举的抖动**），因为 leader 处理不到 follower 响应（`recent_active` 永不置位）。
+
+**已尝试并排除的修法**（均在 `l2` 复跑，结果仍 FAIL）
+- 把 transport 的 `request_timeout`/`connect_timeout` 从工厂默认（5s/2s，墙钟形状）对齐到节点的**模拟** `rpc_timeout`（该对齐已在 `l2/src/harness.rs` 保留：模拟器下用模拟截止时间才是正确的）。
+- **失效通道逐出**：`send` 失败时从缓存删除该 peer 的 `Channel`（生产侧健壮性改动；未证明能修复 3b，**已回退**，列为建议）。
+- **完全绕过通道缓存**（每次 send 重新 dial）：仍 FAIL → 排除"缓存通道半开"作为唯一根因。
+
+**当前结论**：3b 的失败是 **leader→follower 的某次 gRPC 请求/响应在半开或已失效的 HTTP/2 连接上永不返回**，把单任务 actor 卡在 `step()` 内；actor 卡住 → leader 收不到 follower 响应 → check-quorum 降级 → 选举抖动 → 客户端看到 Timeout/QuorumUnavailable。**根因所在层未定位**（turmoil TCP 半开语义 vs hyper/tonic 连接复用 vs 服务端连接任务），**未修复**。下一步：(a) 加"服务端 handler 计数 + 连接生命周期"探针，确认请求是否到达服务端；(b) 做最小 **tonic 双向 unary echo under turmoil** 对照（无 raft/WAL），把变量收敛到传输层；(c) 若对照复现，查 hyper 连接任务在 turmoil 下的唤醒路径。
 
 **stage 3c（增量 1 已完成，commit 6815bef + 46a8328；门禁 GO）：内存传输上的确定性 L2 场景**。新增 `arachne/tests/l2_scenarios.rs`：进程内 3 节点 harness（沿用 `m0_determinism` 的同步 `RaftNode` 模式：手工 `tick`+`block_on(step)`+`on_message`，harness 自控消息投递），用 harness 级 `Faults{isolated}` 丢弃隔离节点往返消息来注入分区/崩溃；选举 RNG 用 stage-2 的 `raft::set_election_rng_seed` 保证 leader 身份可复现。
 - 场景/不变量：**S02**（2+1 分区，并断言隔离节点确实未收到多数侧写、多数两侧都提交）+ **INV7**（全轨迹每 term ≤1 leader）；**S01**（隔离=崩溃旧 leader → 幸存者选新主 → 复活收敛）+ **INV9**（新主含已提交条目）+ **INV8**（重叠 index 日志一致）+ **INV3**（收敛后状态快照逐字节一致）；**INV4**（M1 验收④：分区下客户端 put/get 历史经 stage-1 ClientOracle **与** 自建检查器判定为线性一致）；**双跑确定性**（同种子 → leader 轨迹与日志逐字节一致）。
