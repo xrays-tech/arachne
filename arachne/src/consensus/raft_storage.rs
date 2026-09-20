@@ -29,9 +29,11 @@ use raft::{Error as RaftError, Result as RaftResult, StorageError as RaftStorage
 
 use arachne_seam::storage::{
     ConfState as SeamConfState, EntryType as SeamEntryType, HardState as SeamHardState,
-    LogEntry, Snapshot as SeamSnapshot, Storage as SeamStorage,
+    LogEntry, Snapshot as SeamSnapshot, SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage,
     StorageError as SeamStorageError,
 };
+use arachne_seam::types::LogIndex;
+use crate::storage::WalStorage;
 
 /// A `raft::storage::Storage` adapter over an `arachne_seam::Storage`.
 pub struct RaftStorage<S: SeamStorage> {
@@ -85,6 +87,30 @@ impl<S: SeamStorage> RaftStorage<S> {
     /// (invariant I1).
     pub fn set_hard_state(&mut self, hs: &SeamHardState) -> RaftResult<()> {
         self.inner.set_hard_state(hs).map_err(map_error)
+    }
+
+    /// Persist a snapshot produced from the local state machine and point the
+    /// store's snapshot at it (propsol §5.5.4, invariant I3).
+    pub fn save_snapshot(&mut self, snapshot: &SeamSnapshot) -> RaftResult<()> {
+        self.inner.save_snapshot(snapshot).map_err(map_error)
+    }
+
+    /// Adopt a snapshot received from the leader, discarding the local log
+    /// (see [`SeamStorage::install_snapshot`]).
+    pub fn install_snapshot(&mut self, snapshot: &SeamSnapshot) -> RaftResult<()> {
+        self.inner.install_snapshot(snapshot).map_err(map_error)
+    }
+
+    /// Release log entries at or below `compact_to`, which a durable snapshot
+    /// must already cover.
+    pub fn compact(&mut self, compact_to: LogIndex) -> RaftResult<()> {
+        self.inner.compact(compact_to).map_err(map_error)
+    }
+
+    /// The term of the entry at `index`, answered from the snapshot once the
+    /// entry itself has been compacted away.
+    pub fn term(&self, index: LogIndex) -> RaftResult<u64> {
+        self.inner.term(index).map_err(map_error)
     }
 
     // ---- type conversions (pure functions of their inputs) ----
@@ -159,6 +185,25 @@ impl<S: SeamStorage> RaftStorage<S> {
         meta.set_conf_state(cs);
         raft_snap
     }
+
+    /// The inverse of [`to_raft_snapshot`](Self::to_raft_snapshot): adopt a
+    /// snapshot handed over by raft (a transfer from the leader) into the seam
+    /// representation the storage persists.
+    pub fn from_raft_snapshot(snap: &Snapshot) -> SeamSnapshot {
+        let meta = snap.get_metadata();
+        let cs = meta.get_conf_state();
+        SeamSnapshot {
+            meta: SeamSnapshotMeta {
+                index: meta.get_index(),
+                term: meta.get_term(),
+                conf_state: SeamConfState {
+                    voters: cs.get_voters().to_vec(),
+                    learners: cs.get_learners().to_vec(),
+                },
+            },
+            data: snap.get_data().to_vec(),
+        }
+    }
 }
 
 impl<S: SeamStorage> RaftStorageTrait for RaftStorage<S> {
@@ -226,6 +271,18 @@ impl<S: SeamStorage> RaftStorageTrait for RaftStorage<S> {
             // snapshot to).
             None => Err(RaftError::Store(RaftStorageError::SnapshotTemporarilyUnavailable)),
         }
+    }
+}
+
+impl RaftStorage<WalStorage> {
+    /// Bytes the durable log occupies on disk.
+    ///
+    /// Only the concrete production storage can answer this: "how much space
+    /// the log holds" is a property of a segmented on-disk WAL, not of the
+    /// seam contract. It is the input to the snapshot trigger
+    /// (propsol §5.5.4).
+    pub fn log_bytes(&self) -> RaftResult<u64> {
+        self.inner.log_bytes().map_err(map_error)
     }
 }
 

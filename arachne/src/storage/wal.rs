@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arachne_seam::storage::{
-    ConfState, FsyncObserver, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
+    FsyncObserver, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
 };
 use arachne_seam::types::{LogIndex, Term};
 
@@ -895,6 +895,83 @@ impl WalStorage {
             discarded_entries: discarded,
         })
     }
+    /// Bytes the durable log currently occupies on disk.
+    ///
+    /// Sums the segment files (not the in-memory index), which is what the
+    /// snapshot trigger budgets against and what the `wal_bytes` metric
+    /// reports. Segment files are few, so this is a handful of `stat` calls.
+    pub fn log_bytes(&self) -> Result<u64, StorageError> {
+        let mut total = 0u64;
+        for index in list_segment_indices(&self.data_dir).map_err(StorageError::Io)? {
+            let path = segment_path(&self.data_dir, index);
+            match fs::metadata(&path) {
+                Ok(meta) => total += meta.len(),
+                // A segment listed and then unlinked by another handle: count
+                // nothing rather than fail the trigger.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Io(e)),
+            }
+        }
+        Ok(total)
+    }
+
+    /// Replace the physical log with a single empty segment starting at
+    /// `snapshot_index + 1`.
+    ///
+    /// An installed snapshot supersedes the entire log, so every segment —
+    /// including ones whose first index lies *above* the snapshot — holds
+    /// entries from a diverged branch and must go. Leaving them behind would
+    /// also make recovery see a hole (stale entries, then entries re-sent by
+    /// the leader after the snapshot), so this is a fresh-start rotation
+    /// rather than a prefix trim.
+    fn replace_log_with_snapshot(&mut self, snapshot_index: LogIndex) -> Result<(), StorageError> {
+        let next = snapshot_index + 1;
+        let old = list_segment_indices(&self.data_dir).map_err(StorageError::Io)?;
+        // Unlink first, then rotate: the successor segment is named by `next`,
+        // which an old segment may already occupy, and POSIX keeps the old
+        // active segment's handle valid until it is replaced below.
+        for index in &old {
+            let path = segment_path(&self.data_dir, *index);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                // A missing file is not a failure: the active segment is
+                // always present, but the listing races nothing else.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Io(e)),
+            }
+        }
+        self.segment = open_segment_at(&self.data_dir, next, self.segment_bytes)?;
+        self.segment_first_index = next;
+        self.max_entry_in_segment = 0;
+        self.pending_entry_fsync = false;
+        if !old.is_empty() {
+            fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Delete every segment **wholly** below `watermark`.
+    ///
+    /// A segment is wholly below iff its successor starts at or before
+    /// `watermark + 1`; the loop only considers segments that have a successor,
+    /// so the active segment is never removed.
+    fn delete_segments_below(&self, watermark: LogIndex) -> Result<(), StorageError> {
+        let keep_from = watermark + 1;
+        let indices = list_segment_indices(&self.data_dir).map_err(StorageError::Io)?;
+        let mut removed = 0u32;
+        for window in indices.windows(2) {
+            let (this, next) = (window[0], window[1]);
+            if next <= keep_from && this != self.segment_first_index {
+                fs::remove_file(segment_path(&self.data_dir, this)).map_err(StorageError::Io)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
     /// Delete all but the newest [`SNAPSHOT_RETENTION`] snapshot files.
     ///
     /// One older snapshot is kept so that open can fall back when the newest
@@ -930,9 +1007,18 @@ impl WalStorage {
 
 impl Storage for WalStorage {
     fn initial_state(&self) -> Result<RaftState, StorageError> {
+        // A snapshot carries the membership it was taken under, so a node that
+        // installed one (or restarted after doing so) recovers membership from
+        // it. Without a snapshot the durable membership log is still M3 work,
+        // and the caller falls back to the bootstrap voter set.
+        let conf_state = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.meta.conf_state.clone())
+            .unwrap_or_default();
         Ok(RaftState {
             hard_state: self.hard_state.clone(),
-            conf_state: ConfState::default(),
+            conf_state,
         })
     }
 
@@ -1016,9 +1102,24 @@ impl Storage for WalStorage {
         // truncate to the first incoming index before appending — exactly what
         // `MemStorage` does, and what keeps the log contiguous.
         if let Some(first) = entries.first() {
-            let last = self.entries.last().map(|e| e.index).unwrap_or(0);
+            // `last_index` — not `entries.last()` — because the log's tail is
+            // `compacted_to` once every retained entry has been dropped by a
+            // snapshot install or a compaction through the last index.
+            let last = self.last_index()?;
             if first.index <= last {
-                let keep = first.index.saturating_sub(1);
+                let keep = first.index - 1;
+                // An entry at or below the watermark has been compacted away:
+                // raft must not re-send it, and re-appending it would punch a
+                // hole in the log.
+                if keep < self.compacted_to {
+                    return Err(StorageError::Unrecoverable {
+                        detail: format!(
+                            "append at index {} is at or below the compaction \
+                             watermark {}",
+                            first.index, self.compacted_to
+                        ),
+                    });
+                }
                 // A committed entry is never overwritten by a correct leader;
                 // truncating one would be a safety violation, so fail-stop
                 // rather than silently discard committed data.
@@ -1034,14 +1135,19 @@ impl Storage for WalStorage {
             }
         }
         for entry in entries {
-            // Continuity hardening: the next entry must be last_index + 1.
-            let last = self.entries.last().map(|e| e.index).unwrap_or(0);
-            debug_assert!(
-                entry.index == last + 1,
-                "append continuity violation: expected {}, got {}",
-                last + 1,
-                entry.index
-            );
+            // Continuity hardening: the next entry must be `last_index + 1`.
+            // A gap would silently turn the durable log into a log with a
+            // hole, so this is a hard error, not a debug assertion.
+            let last = self.last_index()?;
+            if entry.index != last + 1 {
+                return Err(StorageError::Unrecoverable {
+                    detail: format!(
+                        "append continuity violation: expected {}, got {}",
+                        last + 1,
+                        entry.index
+                    ),
+                });
+            }
 
             // Reject records larger than MAX_RECORD_BYTES.
             let payload = encode_entry(
@@ -1174,6 +1280,37 @@ impl Storage for WalStorage {
         Ok(())
     }
 
+    /// Adopt an installed snapshot and reset the log to it.
+    ///
+    /// See [`Storage::install_snapshot`]: the snapshot is authoritative, so
+    /// every locally retained entry is dropped. Segments below the new
+    /// watermark are reclaimed as well.
+    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError> {
+        if snapshot.meta.index < self.compacted_to {
+            return Err(StorageError::Unrecoverable {
+                detail: format!(
+                    "installed snapshot at {} is older than the local watermark {}",
+                    snapshot.meta.index, self.compacted_to
+                ),
+            });
+        }
+        // Already exactly here (raft can hand the same snapshot twice): the
+        // log is empty and the watermark matches, so there is nothing to do.
+        if snapshot.meta.index == self.compacted_to && self.entries.is_empty() {
+            return Ok(());
+        }
+
+        // Persist (fsync, rename, META pointer) before touching the log: a
+        // crash in between must leave the store readable, and a repeated
+        // install of the same snapshot is a no-op.
+        self.save_snapshot(snapshot)?;
+
+        self.entries.clear();
+        self.compacted_to = snapshot.meta.index;
+        self.replace_log_with_snapshot(snapshot.meta.index)?;
+        Ok(())
+    }
+
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError> {
         if compact_to <= self.compacted_to {
             return Ok(()); // already compacted at least this far
@@ -1204,23 +1341,7 @@ impl Storage for WalStorage {
             }
         }
 
-        // Delete every segment **wholly** below the watermark. A segment is
-        // wholly below iff its successor starts at or before `compact_to + 1`;
-        // the loop only ever considers segments that have a successor, so the
-        // active segment is never removed.
-        let keep_from = compact_to + 1;
-        let indices = list_segment_indices(&self.data_dir).map_err(StorageError::Io)?;
-        let mut removed = 0u32;
-        for window in indices.windows(2) {
-            let (this, next) = (window[0], window[1]);
-            if next <= keep_from && this != self.segment_first_index {
-                fs::remove_file(segment_path(&self.data_dir, this)).map_err(StorageError::Io)?;
-                removed += 1;
-            }
-        }
-        if removed > 0 {
-            fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
-        }
+        self.delete_segments_below(compact_to)?;
 
         // The snapshot covers everything at or below the watermark.
         self.entries.retain(|e| e.index > compact_to);
@@ -1303,7 +1424,7 @@ fn seam_entry_type_to_u8(ety: arachne_seam::storage::EntryType) -> u8 {
 mod tests {
     use super::*;
     use crate::storage::segment_name;
-    use arachne_seam::storage::SnapshotMeta;
+    use arachne_seam::storage::{ConfState, SnapshotMeta};
     use std::fs;
 
     /// Create a unique temp directory for a test.
@@ -2116,6 +2237,106 @@ mod tests {
         // Newest two survive; superseded files are gone.
         assert_eq!(snapshot_files(&dir), vec![4, 5]);
         assert_eq!(storage.snapshot().unwrap().unwrap().meta.index, 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_snapshot_replaces_the_local_log() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+
+        // The leader is far ahead and sends a snapshot past everything local.
+        let installed = make_snapshot(8, 3, b"state@8");
+        storage.install_snapshot(&installed).unwrap();
+
+        assert_eq!(storage.last_index().unwrap(), 8);
+        assert_eq!(storage.first_index().unwrap(), 9);
+        assert_eq!(storage.snapshot().unwrap().unwrap().meta.index, 8);
+        assert!(matches!(
+            storage.entries(1, 9, None),
+            Err(StorageError::Compacted)
+        ));
+
+        // Membership travels with the snapshot, so a node that installs one
+        // recovers the configuration from it rather than from the bootstrap
+        // voter set.
+        let state = storage.initial_state().unwrap();
+        assert_eq!(state.conf_state.voters, vec![1, 2, 3]);
+
+        // The leader resumes replication directly after the snapshot.
+        storage
+            .append(&[make_entry(9, 3, b"d")])
+            .unwrap();
+        storage.sync_entries().unwrap();
+        assert_eq!(storage.last_index().unwrap(), 9);
+        drop(storage);
+
+        // Restart: the installed snapshot and the resumed tail both survive.
+        let storage = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 9);
+        assert_eq!(storage.last_index().unwrap(), 9);
+        assert_eq!(storage.term(8).unwrap(), 3);
+        let replayed = storage.entries(9, 10, None).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].data, b"d");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_snapshot_discards_a_diverged_tail() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        // A local branch that was never committed anywhere.
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 2, b"local-1"),
+                make_entry(4, 2, b"local-2"),
+                make_entry(5, 2, b"local-3"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+
+        storage
+            .install_snapshot(&make_snapshot(4, 3, b"state@4"))
+            .unwrap();
+
+        // Nothing of the local branch survives, not even above the snapshot:
+        // raft re-sends what it still needs.
+        assert_eq!(storage.last_index().unwrap(), 4);
+        assert_eq!(storage.first_index().unwrap(), 5);
+        assert!(storage.entries(3, 6, None).is_err());
+        // and the store is immediately usable for the leader's next append
+        storage.append(&[make_entry(5, 3, b"remote")]).unwrap();
+        storage.sync_entries().unwrap();
+        assert_eq!(storage.term(5).unwrap(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_snapshot_rejects_a_stale_snapshot() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        storage
+            .install_snapshot(&make_snapshot(6, 2, b"state@6"))
+            .unwrap();
+        assert!(matches!(
+            storage.install_snapshot(&make_snapshot(5, 2, b"state@5")),
+            Err(StorageError::Unrecoverable { .. })
+        ));
+        assert_eq!(storage.last_index().unwrap(), 6);
         let _ = fs::remove_dir_all(&dir);
     }
 

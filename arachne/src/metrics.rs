@@ -24,6 +24,17 @@ pub struct Metrics {
     read_index_timeout_total: AtomicU64,
     /// Number of ReadIndex reads currently pending confirmation/apply.
     read_index_pending: AtomicU64,
+    /// Bytes the durable WAL occupies on disk.
+    wal_bytes: AtomicU64,
+    /// Wall-clock milliseconds the most recent local snapshot took
+    /// (propsol §8: the >1s budget alarm, Q4).
+    snapshot_last_duration_ms: AtomicU64,
+    /// Size in bytes of the most recent locally created snapshot.
+    snapshot_last_size_bytes: AtomicU64,
+    /// Snapshots created locally.
+    snapshots_created_total: AtomicU64,
+    /// Snapshots received from a leader and installed.
+    snapshots_installed_total: AtomicU64,
 }
 
 impl Metrics {
@@ -73,6 +84,60 @@ impl Metrics {
     /// apply.
     pub fn set_read_index_pending(&self, value: u64) {
         self.read_index_pending.store(value, Ordering::Relaxed);
+    }
+
+    /// Record the on-disk WAL size.
+    pub fn set_wal_bytes(&self, value: u64) {
+        self.wal_bytes.store(value, Ordering::Relaxed);
+    }
+
+    /// Record how long the most recent local snapshot took, and its size.
+    pub fn set_snapshot_last(&self, duration_ms: u64, size_bytes: u64) {
+        self.snapshot_last_duration_ms
+            .store(duration_ms, Ordering::Relaxed);
+        self.snapshot_last_size_bytes
+            .store(size_bytes, Ordering::Relaxed);
+    }
+
+    /// Increment the locally-created snapshot counter.
+    pub fn inc_snapshots_created(&self) {
+        self.snapshots_created_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the installed-snapshot counter.
+    pub fn inc_snapshots_installed(&self) {
+        self.snapshots_installed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The on-disk WAL size in bytes.
+    pub fn wal_bytes(&self) -> u64 {
+        self.wal_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The highest applied log index.
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index.load(Ordering::Relaxed)
+    }
+
+    /// Snapshots created locally.
+    pub fn snapshots_created_total(&self) -> u64 {
+        self.snapshots_created_total.load(Ordering::Relaxed)
+    }
+
+    /// Snapshots received from a leader and installed.
+    pub fn snapshots_installed_total(&self) -> u64 {
+        self.snapshots_installed_total.load(Ordering::Relaxed)
+    }
+
+    /// Wall-clock milliseconds the most recent local snapshot took.
+    pub fn snapshot_last_duration_ms(&self) -> u64 {
+        self.snapshot_last_duration_ms.load(Ordering::Relaxed)
+    }
+
+    /// Size in bytes of the most recently created local snapshot.
+    pub fn snapshot_last_size_bytes(&self) -> u64 {
+        self.snapshot_last_size_bytes.load(Ordering::Relaxed)
     }
 
     /// Whether this node currently believes it is the leader.
@@ -150,6 +215,36 @@ impl Metrics {
             "ReadIndex reads currently pending confirmation or apply.",
             self.read_index_pending.load(Ordering::Relaxed),
         );
+        gauge(
+            &mut out,
+            "arachne_wal_bytes",
+            "Bytes the durable WAL occupies on disk.",
+            self.wal_bytes.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "arachne_snapshot_last_duration_ms",
+            "Wall-clock milliseconds the most recent local snapshot took.",
+            self.snapshot_last_duration_ms.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "arachne_snapshot_last_size_bytes",
+            "Size in bytes of the most recent locally created snapshot.",
+            self.snapshot_last_size_bytes.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "arachne_snapshots_created_total",
+            "Snapshots created locally.",
+            self.snapshots_created_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "arachne_snapshots_installed_total",
+            "Snapshots received from a leader and installed.",
+            self.snapshots_installed_total.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -200,6 +295,11 @@ mod tests {
         m.inc_read_index_timeout();
         m.inc_read_index_timeout();
         m.set_read_index_pending(5);
+        m.set_wal_bytes(4096);
+        m.set_snapshot_last(12, 1024);
+        m.inc_snapshots_created();
+        m.inc_snapshots_installed();
+        m.inc_snapshots_installed();
         let text = m.render();
         for name in [
             "arachne_term",
@@ -210,6 +310,11 @@ mod tests {
             "arachne_dropped_sends",
             "arachne_read_index_timeout_total",
             "arachne_read_index_pending",
+            "arachne_wal_bytes",
+            "arachne_snapshot_last_duration_ms",
+            "arachne_snapshot_last_size_bytes",
+            "arachne_snapshots_created_total",
+            "arachne_snapshots_installed_total",
         ] {
             assert!(text.contains(name), "missing {name}");
         }
@@ -221,6 +326,14 @@ mod tests {
         assert!(text.contains("arachne_read_index_timeout_total 2"));
         assert!(text.contains("# TYPE arachne_read_index_pending gauge"));
         assert!(text.contains("arachne_read_index_pending 5"));
+        assert!(text.contains("# TYPE arachne_wal_bytes gauge"));
+        assert!(text.contains("arachne_wal_bytes 4096"));
+        assert!(text.contains("arachne_snapshot_last_duration_ms 12"));
+        assert!(text.contains("arachne_snapshot_last_size_bytes 1024"));
+        assert!(text.contains("# TYPE arachne_snapshots_created_total counter"));
+        assert!(text.contains("arachne_snapshots_created_total 1"));
+        assert!(text.contains("arachne_snapshots_installed_total 2"));
+        assert_eq!(m.wal_bytes(), 4096);
         assert!(m.is_leader());
         assert_eq!(m.leader_id(), 1);
         assert_eq!(m.dropped_sends(), 4);

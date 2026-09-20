@@ -32,12 +32,13 @@ use slog::Logger;
 use arachne_seam::seam::{Transport, TransportMessage, TransportRx};
 use arachne_seam::storage::{
     ConfState as SeamConfState, HardState as SeamHardState, LogEntry, RaftId,
-    Storage as SeamStorage,
+    Snapshot as SeamSnapshot, SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage,
 };
-use arachne_seam::types::{LogIndex, NodeId};
+use arachne_seam::types::{LogIndex, NodeId, Term};
 
 use super::raft_storage::RaftStorage;
 use crate::profile::ProfileConfig;
+use crate::storage::WalStorage;
 
 /// Errors reported by the consensus node.
 ///
@@ -56,6 +57,14 @@ pub enum NodeError<T: Transport> {
     /// A raft wire-message codec error (encode/decode of `Message` bytes).
     #[error("codec error: {0}")]
     Codec(String),
+    /// A durable-storage failure outside the `Ready` loop: startup recovery or
+    /// local snapshot creation. A fail-start condition (propsol §5.5.3).
+    #[error("storage error: {0}")]
+    Storage(String),
+    /// The state machine could not be rebuilt from a durable snapshot. A
+    /// fail-start condition: every later apply would be against wrong state.
+    #[error("state machine error: {0}")]
+    StateMachine(String),
 }
 
 /// Raft tick and flow-control timings for a [`RaftNode`].
@@ -109,6 +118,17 @@ impl RaftNodeConfig {
     }
 }
 
+impl<T: Transport, Tr: TransportRx> RaftNode<WalStorage, T, Tr> {
+    /// Bytes the durable WAL occupies on disk.
+    ///
+    /// This is the input to the snapshot trigger (propsol §5.5.4): the runtime
+    /// does not need to know how segments are laid out, only how much space
+    /// the log is holding.
+    pub fn log_bytes(&self) -> Result<u64, NodeError<T>> {
+        self.raw.store().log_bytes().map_err(NodeError::Raft)
+    }
+}
+
 /// The result of one [`RaftNode::step`] `Ready` cycle.
 ///
 /// `committed` are the entries to apply to the state machine; `read_states`
@@ -118,7 +138,14 @@ impl RaftNodeConfig {
 #[derive(Debug, Default)]
 pub struct StepOutcome {
     /// Committed entries `(index, data)` to apply, in ascending index order.
+    ///
+    /// When `snapshot` is set, every entry here is strictly newer than it: an
+    /// installed snapshot supersedes everything at or below its index.
     pub committed: Vec<(LogIndex, Vec<u8>)>,
+    /// A snapshot this node installed during the cycle (it arrived from the
+    /// leader). The caller **must** restore the state machine from
+    /// `snapshot.data` before applying `committed`.
+    pub snapshot: Option<SeamSnapshot>,
     /// Quorum-confirmed ReadIndex results `(request_ctx, read_index)`.
     pub read_states: Vec<(Vec<u8>, LogIndex)>,
 }
@@ -296,7 +323,7 @@ where
 
         // I1/I2: persist entries, hard state, and snapshot durably BEFORE any
         // message is sent.
-        self.persist_ready(&ready)?;
+        let installed = self.persist_ready(&ready)?;
         // INV2 crash injection (propsol v0.2.9 L; test-only, compiled out by
         // default): the boundary where entries + HardState are durable but no
         // message has been sent yet.
@@ -384,6 +411,13 @@ where
                 .iter()
                 .map(|e| (e.get_index(), e.get_data().to_vec())),
         );
+        if let Some(snapshot) = &installed {
+            // An installed snapshot supersedes everything at or below its
+            // index, including entries that were already committed before this
+            // cycle. The state machine is restored to `snapshot.index` first,
+            // so applying one of those would be an index violation.
+            committed.retain(|(index, _)| *index > snapshot.meta.index);
+        }
         // INV2 crash injection: messages have been sent, committed entries have
         // not been applied yet (the caller applies after `step` returns).
         #[cfg(feature = "fault-injection")]
@@ -391,6 +425,7 @@ where
 
         Ok(StepOutcome {
             committed,
+            snapshot: installed,
             read_states,
         })
     }
@@ -481,14 +516,61 @@ where
         &mut self.rx
     }
 
+    /// Persist a snapshot of the local state machine, then release the log it
+    /// covers.
+    ///
+    /// The snapshot must be taken at the **applied** index, so that compaction
+    /// can never drop an entry the snapshot does not already contain. Ordering
+    /// is durability-first (propsol §5.5.4): the snapshot file and its META
+    /// pointer are fsynced before `compact` removes anything.
+    pub fn create_snapshot(
+        &mut self,
+        index: LogIndex,
+        term: Term,
+        conf_state: SeamConfState,
+        data: Vec<u8>,
+    ) -> Result<(), NodeError<T>> {
+        let snapshot = SeamSnapshot {
+            meta: SeamSnapshotMeta {
+                index,
+                term,
+                conf_state,
+            },
+            data,
+        };
+        let store = self.raw.mut_store();
+        store.save_snapshot(&snapshot).map_err(NodeError::Raft)?;
+        store.compact(index).map_err(NodeError::Raft)?;
+        Ok(())
+    }
+
+    /// The term of the entry at `index`, answered from the durable snapshot
+    /// once the entry itself has been compacted away.
+    pub fn term_at(&mut self, index: LogIndex) -> Result<Term, NodeError<T>> {
+        self.raw.mut_store().term(index).map_err(NodeError::Raft)
+    }
+
     /// Persist a `Ready`'s entries, hard state, and snapshot durably.
     ///
     /// Entries are appended then `sync_entries`ed (I2/I4 barrier); the hard
-    /// state is persisted via `set_hard_state` (I1, always fsyncs). A
-    /// non-empty snapshot is a fault: this storage does not support snapshot
-    /// transfer, so we fail loudly rather than silently drop it.
-    fn persist_ready(&mut self, ready: &Ready) -> Result<(), NodeError<T>> {
+    /// state is persisted via `set_hard_state` (I1, always fsyncs).
+    ///
+    /// A snapshot received from the leader is installed **first**, because it
+    /// replaces the whole log and `ready.entries()` (when present) starts at
+    /// `snapshot.index + 1`. Returns the installed snapshot so the caller can
+    /// restore the state machine from it.
+    fn persist_ready(&mut self, ready: &Ready) -> Result<Option<SeamSnapshot>, NodeError<T>> {
         let store = self.raw.mut_store();
+
+        let installed = if ready.snapshot().is_empty() {
+            None
+        } else {
+            let snapshot = RaftStorage::<S>::from_raft_snapshot(ready.snapshot());
+            // I3: durable before the log is released and before any message
+            // acknowledging it goes out.
+            store.install_snapshot(&snapshot).map_err(NodeError::Raft)?;
+            Some(snapshot)
+        };
 
         if !ready.entries().is_empty() {
             let entries: Vec<LogEntry> =
@@ -503,15 +585,7 @@ where
             store.set_hard_state(&seam_hs).map_err(NodeError::Raft)?;
         }
 
-        if !ready.snapshot().is_empty() {
-            return Err(NodeError::Raft(
-                raft::Error::ConfigInvalid(
-                    "snapshot transfer is not supported by this storage".into(),
-                ),
-            ));
-        }
-
-        Ok(())
+        Ok(installed)
     }
 
     /// Deliver one raft message, counting any failure in `dropped_sends`.

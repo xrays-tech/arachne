@@ -28,6 +28,10 @@ use tokio::time::Instant;
 use slog::Logger;
 use tokio::sync::{mpsc, oneshot};
 
+/// Approximate per-entry durable overhead (record header, type byte, and the
+/// index/term fields) used to size the snapshot trigger.
+const ENTRY_FRAMING_BYTES: u64 = 24;
+
 use crate::client::{ArachneError, Handle};
 use crate::consensus::{NodeError, RaftNode, RaftNodeConfig};
 use crate::metrics::Metrics;
@@ -35,6 +39,7 @@ use crate::profile::ProfileConfig;
 use crate::state_machine::KvStateMachine;
 use crate::storage::WalStorage;
 use crate::{LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx};
+use arachne_seam::storage::{ConfState as SeamConfState, Storage as _};
 
 /// A request from a client [`Handle`] to the node runtime.
 pub enum Command {
@@ -147,6 +152,22 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     /// Monotonic source of ReadIndex tokens (8-byte big-endian `ctx`).
     next_read_token: u64,
     propose_timeout: Duration,
+    /// The voting membership this node was started with. It travels into every
+    /// local snapshot so that a node restored from one knows the configuration
+    /// (propsol §5.5.4); ConfChange is M3.
+    voters: Vec<RaftId>,
+    /// Log growth that triggers a local snapshot and compaction
+    /// (`snapshot_threshold`, propsol §7). 0 disables the trigger.
+    snapshot_threshold_bytes: u64,
+    /// Bytes of applied log written since the last snapshot — the trigger's
+    /// input. This is the *logical* growth of the log, not the physical size
+    /// of the segment files: v1 compacts whole segments, so a segment holding
+    /// a compacted prefix keeps its bytes until it rolls over, and using
+    /// physical size would re-fire the trigger on every entry.
+    bytes_since_snapshot: u64,
+    /// The index of the newest snapshot this node created or installed. Guards
+    /// against re-taking a snapshot at an index that is already covered.
+    snapshot_index: LogIndex,
 }
 
 impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
@@ -158,6 +179,29 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         rx: Tr,
         logger: &Logger,
     ) -> Result<(Self, Handle), NodeError<T>> {
+        // Rebuild the applied state from the durable snapshot before raft
+        // starts delivering entries. raft derives its applied index from
+        // `first_index - 1`, which is exactly the snapshot index, so the two
+        // stay in step and the log tail replays on top of the restored state
+        // (propsol §5.5.3 steps 3 and 7).
+        let mut sm = KvStateMachine::new();
+        let (snapshot_index, snapshot_data) = match storage.snapshot() {
+            Ok(Some(snapshot)) => (snapshot.meta.index, Some(snapshot.data)),
+            Ok(None) => (0, None),
+            Err(e) => {
+                return Err(NodeError::Storage(format!(
+                    "cannot read the durable snapshot: {e}"
+                )));
+            }
+        };
+        if let Some(data) = &snapshot_data
+            && let Err(e) = sm.restore(data)
+        {
+            return Err(NodeError::StateMachine(format!(
+                "cannot restore the state machine from the snapshot at {snapshot_index}: {e}"
+            )));
+        }
+
         let node = RaftNode::new_with_config(
             config.self_raft_id,
             config.peers.clone(),
@@ -183,10 +227,15 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         let (tx, commands) = mpsc::channel(1024);
         let handle = Handle::new_local(config.self_node_id.clone(), tx, &config.profile);
 
+        let mut voters: Vec<RaftId> = config.peers.keys().copied().collect();
+        voters.push(config.self_raft_id);
+        voters.sort_unstable();
+        voters.dedup();
+
         let period = Duration::from_millis(config.profile.heartbeat_interval_ms.max(1));
         let runtime = Self {
             node,
-            sm: KvStateMachine::new(),
+            sm,
             metrics: config.metrics,
             raft_id: config.self_raft_id,
             self_node: config.self_node_id,
@@ -202,6 +251,10 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             ),
             next_read_token: 0,
             propose_timeout: Duration::from_millis(config.profile.election_timeout_ms.max(1)),
+            voters,
+            snapshot_threshold_bytes: config.profile.snapshot_threshold_bytes,
+            bytes_since_snapshot: 0,
+            snapshot_index,
         };
         runtime.refresh_metrics();
         Ok((runtime, handle))
@@ -247,12 +300,33 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         };
 
+        if let Some(snapshot) = outcome.snapshot {
+            // An installed snapshot replaces the *entire* state, including the
+            // idempotency session table (propsol §5.5.4): a follower that
+            // restored without it would re-apply retried writes. The storage
+            // already persisted the snapshot and reset the log, so this is the
+            // in-memory half of the install.
+            if let Err(e) = self.sm.restore(&snapshot.data) {
+                self.fail_all_pending(&format!(
+                    "state machine restore failed for the snapshot at {}: {e}",
+                    snapshot.meta.index
+                ));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
+            self.snapshot_index = self.snapshot_index.max(snapshot.meta.index);
+            self.metrics.inc_snapshots_installed();
+        }
+
         for (index, data) in outcome.committed {
             if let Err(e) = self.sm.apply(index, &data) {
                 self.fail_all_pending(&format!("state machine apply failed: {e}"));
                 self.metrics.set_is_leader(false);
                 return false;
             }
+            // Approximate the durable footprint of this entry (framing, type
+            // byte, index/term header, payload) for the snapshot trigger.
+            self.bytes_since_snapshot += data.len() as u64 + ENTRY_FRAMING_BYTES;
         }
 
         // Quorum-confirmed read states (propsol §5.4 step 2): record the read
@@ -273,7 +347,76 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         self.node.advance_apply();
         self.resolve_reads();
         self.reply_pendings();
+        if !self.maybe_snapshot() {
+            return false;
+        }
         self.refresh_metrics();
+        true
+    }
+
+    /// Take a local snapshot and compact the log once the WAL outgrows
+    /// `snapshot_threshold` (propsol §5.5.4, §7). Returns `false` on a
+    /// fail-stop error.
+    ///
+    /// Two guards keep this from firing in a loop: the threshold itself, and
+    /// [`Self::snapshot_index`] — a snapshot is only ever taken at an index
+    /// strictly newer than the one already covered.
+    fn maybe_snapshot(&mut self) -> bool {
+        let applied = self.sm.applied_index();
+        match self.node.log_bytes() {
+            Ok(bytes) => self.metrics.set_wal_bytes(bytes),
+            Err(e) => {
+                self.fail_all_pending(&format!("cannot size the durable log: {e}"));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
+        }
+
+        if self.snapshot_threshold_bytes == 0
+            || applied <= self.snapshot_index
+            || self.bytes_since_snapshot < self.snapshot_threshold_bytes
+        {
+            return true;
+        }
+
+        // The snapshot is of the applied state, so its index must be the
+        // applied index: a snapshot ahead of what this node applied would let
+        // compaction drop entries it never wrote to the state machine.
+        let term = match self.node.term_at(applied) {
+            Ok(term) => term,
+            Err(e) => {
+                self.fail_all_pending(&format!("cannot resolve the term at {applied}: {e}"));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
+        };
+        let data = match self.sm.snapshot() {
+            Ok(data) => data,
+            Err(e) => {
+                self.fail_all_pending(&format!("state machine snapshot failed: {e}"));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
+        };
+        let size_bytes = data.len() as u64;
+        let conf_state = SeamConfState {
+            voters: self.voters.clone(),
+            learners: Vec::new(),
+        };
+
+        // Q4: snapshot creation blocks apply. It is measured every time so the
+        // >1s budget alarm has data (propsol §8.2).
+        let started = Instant::now();
+        if let Err(e) = self.node.create_snapshot(applied, term, conf_state, data) {
+            self.fail_all_pending(&format!("snapshot creation failed: {e}"));
+            self.metrics.set_is_leader(false);
+            return false;
+        }
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.snapshot_index = applied;
+        self.bytes_since_snapshot = 0;
+        self.metrics.set_snapshot_last(elapsed_ms, size_bytes);
+        self.metrics.inc_snapshots_created();
         true
     }
 

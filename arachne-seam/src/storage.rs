@@ -253,6 +253,25 @@ pub trait Storage: Send + 'static {
             detail: "this storage implementation does not support snapshots".into(),
         })
     }
+
+    /// Adopt `snapshot` as this store's complete log: persist it, then discard
+    /// **every** locally retained entry.
+    ///
+    /// This is the follower side of snapshot transfer, and it is deliberately
+    /// stronger than `save_snapshot` + `compact`: an installed snapshot is
+    /// authoritative, and any entry this node holds from a diverged branch
+    /// must not survive it. raft only installs a snapshot at or above the
+    /// local commit index, so the discarded entries are uncommitted by
+    /// construction and the leader re-sends whatever is still needed.
+    ///
+    /// The default implementation fails loudly; storages that can persist
+    /// snapshots override it.
+    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError> {
+        let _ = snapshot;
+        Err(StorageError::Unrecoverable {
+            detail: "this storage implementation does not support snapshots".into(),
+        })
+    }
 }
 
 /// Observes per-segment fsync events from a WAL implementation.

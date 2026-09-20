@@ -152,7 +152,7 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 1. **测试竞态（`d788878`）**：`three_node_client.rs` 只等"存在一个 leader"，随后对 follower 的 handle 只 `put` 一次。重定向需要 leader hint，而新选出的 leader 未必已到达每个 follower；缺 hint 返回 `QuorumUnavailable`（handle 不重试）。本地 macOS 侥幸通过，2 核 CI runner 上失败。改为：先等该 follower 报告 leader hint，再对窗口期错误做**有界重试**（全部失败仍判失败，重定向契约仍被断言）。
 2. **`WalStorage::append` 缺覆盖语义（严重，本次修复）**：raft 在选举后会把**冲突后缀**重新交给存储（follower 必须覆盖上任短命 leader 的条目）。`append` 原本假设纯尾部追加、只用 `debug_assert` 守连续性 → debug 下 panic（`append continuity violation: expected 2, got 1`，actor 任务死亡）→ 测试在后段 `get_stale` 收到 `ShuttingDown`；**release 下 `debug_assert` 被编译掉，会写入重复 index，静默损坏日志**。现在 `append` 在追加前先截断到首个入参 index（复用 force-recovery 的物理截断，改名 `truncate_log_to`）；覆盖**已提交**条目属 raft 安全违规，故 fail-stop。新增 3 个单测（冲突后缀重写 + 重开后的持久性、从 index 1 覆盖、拒绝覆盖已提交）。
 
-### 1.8 M2 第一块（进行中）：FaultyStorage + fsync 台账 → INV1 两半在 L2 落地
+### 1.8 M2 第一块（已完成）：FaultyStorage + fsync 台账 → INV1 两半在 L2 落地
 
 M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路线推进。
 
@@ -175,9 +175,38 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - 之后重新入群，全节点状态快照一致（INV3/INV8）。
   - **顺带澄清一个语义细节（重要）**：`RaftNode::hard_state().commit` 是 raft 的**内存** commit，可能**领先于持久化 commit**（要到下一个 `step()` 才落盘）。因此 **INV2 的基准必须是"已持久化 commit"**（`DurabilityLedger::persisted_commit`），而不是内存值——我第一版扫描拿内存值当基准，被这个差异判成**假违规**（实测该 follower 的持久 HardState 只有 `(term1,commit0)`、`(term1,commit1)`，而内存 commit 已是 2）。**ack 路径不受影响**：runtime 只在 `step()` 落盘 commit 之后才 apply + ack。
   - **精确崩溃注入（本轮补齐，propsol v0.2.9 L）**：新增**默认关闭**的 crate feature `fault-injection`（`arachne/src/fault_injection.rs`），在 `RaftNode::step` 的 `AfterPersist`（entries+HardState 已落盘、尚未发出任何消息）与 `AfterDeliver`（消息已发、尚未 apply）两个边界提供 **thread-local 一次性**崩溃 hook；关闭时调用点被 `#[cfg]` 完全编译掉（零行为改变、零运行时开销）。`m2_durability.rs` 新增 `inv2_precise_ready_stage_crash_replays_the_durable_prefix`（feature 开启时运行；leader/follower × 两阶段共 4 例）：崩溃后从 WAL **纯回放**，断言恢复出的 commit ≥ 崩溃前**已持久化** commit、applied ≥ 该 commit、**leader 已 ack 的写入不丢**、重新入群后全节点状态一致。CI 增加 `cargo test -p arachne --features fault-injection --test m2_durability` 一步；`scripts/check-release-features.sh` 新增 **Gate C**（默认 release rlib **不含** hook 哨兵、feature 构建含之——用 `--message-format=json` 取产物，避免 mtime 误判）。
-- **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
+- **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；INV5 属 M3（会话去重）。**I3 与快照路径已在 §1.9 落地。**
 
 3. **客户端读截止时间短于 actor 的 ReadIndex 预算（`a26d21d`，本次 CI 再次暴露）**：`Handle` 原本把**所有**操作都限制在一个 `election_timeout` 内——对写是对的（runtime 的 propose 超时相同），对读太短：runtime 的 ReadIndex 路径每次等 `read_index_timeout_ms`（= 2×election）并可重试一次，actor 合法地可能用约 `2×read_index_timeout`（≈4×election）才给出结果。于是客户端在 actor 尚在解析读时就放弃，把一次慢的 ReadIndex 轮次变成客户端可见的 `Timeout`/503。现在读有独立截止：两次 ReadIndex 等待 + 一个 election 的调度余量。CI 上的表现正是 L3 杀 leader 测试偶发失败（换主后新 leader "读不到"杀前值）——实际是读超时而非数据丢失；修完后 CI 绿。
+
+### 1.9 M2 第二块：快照 / 压缩 / 追赶（propsol v0.2.10 M）
+
+设计权威见 propsol **rev M**（本块新增 5 行决议：落盘形态、最新快照判定、META 指针、压缩边界、**快照触发口径**与**follower 安装语义**、恢复时成员配置）。四个层次一次打通：
+
+- **存储层**（`arachne/src/storage/snapshot.rs` 新 + `meta.rs` + `wal.rs`）：
+  - 独立快照文件 `snapshot-<index:020>-<term:020>.snap`，布局 `[magic][format_version][index][term][voters][learners][data_len][data][crc32c]`，CRC 覆盖其前全部字节；原子写（tmp → fsync → rename → 目录 fsync）。
+  - `Meta` payload 尾部追加 `snapshot_index/snapshot_term`（16 字节，**版本仍为 1**；旧文件 decode 为 (0,0)）。
+  - 水位：`first_index = compacted_to + 1`，`term(snapshot.index)` 在条目被压缩后**仍可回答**（raft 追赶时就要问这个）。
+  - `save_snapshot` → 落盘 → 更新 META 指针 → 只保留最新两份（最新一份 CRC 坏时可回退上一份，`open` 会扫描目录取最新**合法**者）。
+  - `compact(to)` 只删**完全**位于 `to` 之前的段，且要求已有覆盖 `to` 的快照；否则 `Unrecoverable`（fail-start），**绝不删没有快照覆盖的条目**。
+- **seam**（`arachne-seam/src/storage.rs`）：新增 `save_snapshot` / `install_snapshot`（默认实现**响亮失败**，只有能落快照的存储覆盖它）。
+- **raft 适配 + 节点**（`consensus/raft_storage.rs`、`consensus/node.rs`）：`from_raft_snapshot` / `save_snapshot` / `install_snapshot` / `compact` / `term` / `log_bytes` 透传；`persist_ready` **先安装快照再 append 条目**（一个 `Ready` 里两者可能同时出现，条目从 `snapshot.index+1` 起），并把安装的快照经 `StepOutcome.snapshot` 交给上层；`StepOutcome.committed` 已按快照 index 过滤（安装点覆盖本周期已提交条目，直接 apply 会触发状态机的 `IndexViolation`）。`initial_state()` 现在返回**快照携带的 `ConfState`**。
+- **runtime**（`runtime/mod.rs`）：启动时先读持久快照并 `sm.restore`，再建节点（raft 的 applied 从 `first_index-1` 起算，正好等于快照 index，两者天然对齐）；`drive_cycle` 收到安装快照时先 restore 再 apply；新增 `maybe_snapshot` 触发"落快照 + 压缩"。指标新增 `wal_bytes`、`snapshot_last_duration_ms`、`snapshot_last_size_bytes`、`snapshots_created_total`、`snapshots_installed_total`。
+
+**本块发现并修掉的两个真问题（都不是新代码引入的，但被新代码逼出来）**：
+1. **`append` 用 `entries.last()` 当"日志尾"**：`entries` 被压缩清空后 `last_index()` 应为 `compacted_to`，而旧写法回落到 0 → 连续性与覆盖点判断双双错位（表现为 `append continuity violation: expected 1, got 9`）。改成一律走 `self.last_index()`，并且把原来的 `debug_assert!`（release 下**不存在**）升级为硬错误：带空洞的 append 会静默造出"有洞的持久日志"。新增"append 落在压缩水位及以下 → fail-start"的守卫。
+2. **物理字节数不能当触发输入**：v1 是段粒度压缩，含已压缩前缀的段要等下一次 rollover 才能回收字节，用物理 `wal_bytes` 判阈值会在跨过阈值的**每个条目**上重复触发快照。改为**逻辑增长**（自上次快照以来已 apply 的日志字节数达到 `snapshot_threshold` 即触发，快照后归零），`wal_bytes` 仍作为物理占用指标上报（rev M 新行）。
+
+**外加一个实测出来的恢复语义（重要）**：follower 安装快照时若只删 ≤ index 的条目、保留 > index 的本地条目，重启恢复会看到"陈旧条目 + leader 重发条目"之间的**空洞**而 fail-start（第一版就是这么挂的：`log index gap: expected 4, got 9`）。因此 `install_snapshot` 采用对齐 etcd `MemoryStorage.ApplySnapshot` 的**整体替换**：清空全部条目 + 把物理日志轮换为从 `snapshot.index+1` 起的空段（删除其余所有段）。安装时本地 > index 的条目必属另一分支且未提交（raft 断言 `snapshot.index ≥ committed`），丢弃安全，缺的由 leader 重发。
+
+**测试**：存储单测 +13（快照编解码 8、META 指针 1、WAL 水位/回退/剪枝/越界拒绝/段粒度删除 + 安装 3）；端到端 2 项（新 `arachne/tests/m2_snapshot.rs`，真实 `Runtime` actor + 3 节点内存传输）：
+- `lagging_follower_catches_up_through_a_snapshot`（**M2 验收 ①**）：杀掉一个 follower → leader 写入远超阈值（自动落 2 次快照并压缩）→ follower 带旧 WAL 重启 → 断言它**装上了快照**（`snapshots_installed_total > 0` + 盘上有快照文件）、追平最新值、且**只可能来自快照**的那个 key（写于 follower 宕机之前、已被 leader 压缩）仍在；最后线性一致读与全节点 applied index 一致。
+- `a_restart_rebuilds_the_state_machine_from_the_snapshot`：单节点写入跨阈值 → 重启后**启动即从快照恢复**（`applied_index >= newest snapshot index`，空状态机这里必然是 0）、压缩掉的早期 key 与日志尾部 key 都能读回。
+
+**如实声明（M2 仍未做）**：
+- 快照传输仍是**单条 `Ready` 承载**，未分片流式（§5.5.4 的 server-streaming 分片随传输层快照 RPC 落地）；安装期间本地读返回 `Busy` 也未实现（v1 安装是同步阻塞的）。
+- 字节级 `wal_trailing_keep` 窗口未接线（旋钮只在 `ProfileConfig`，未下沉 `WalConfig`），慢 follower 一律走快照路径（rev M 已记录：优化而非正确性）。
+- `snapshot_last_duration_ms` 已上报，但 `>1s` 的**告警发射**在 `arachne-node` 侧，尚未接线。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
