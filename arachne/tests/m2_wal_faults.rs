@@ -86,13 +86,23 @@ fn wal_opts(cluster: &str, node: &str, profile: &ProfileConfig) -> WalOptions {
 /// releases the data-dir lock). Returns the data dir and the WAL options that
 /// identify it.
 async fn acked_single_node(tag: &str) -> (PathBuf, WalOptions) {
+    acked_single_node_with(tag, false).await
+}
+
+/// The same, optionally through the asynchronous durability pipeline
+/// (propsol v0.2.13 P).
+async fn acked_single_node_with(tag: &str, offloaded: bool) -> (PathBuf, WalOptions) {
     let dir = temp_dir(tag);
     let cluster = "m2-walfault";
     let node = "n1";
     let profile = profile();
     let opts = wal_opts(cluster, node, &profile);
 
-    let wal = WalStorage::open(&dir, opts.clone()).expect("open wal");
+    let mut wal = WalStorage::open(&dir, opts.clone()).expect("open wal");
+    if offloaded {
+        wal.enable_offloaded_durability()
+            .expect("enable offloaded durability");
+    }
     let factory = InMemoryTransportFactory::new();
     let (tx, rx) = factory.create(NodeId::from(node));
     let metrics = Arc::new(Metrics::new());
@@ -403,6 +413,84 @@ async fn torn_tail_recovers_and_still_serves_the_acked_write() {
         seen.as_deref(),
         Some(b"value".as_ref()),
         "the acked write must survive a torn WAL tail"
+    );
+    task.abort();
+    let _ = task.await;
+    let _ = fs::remove_dir_all(&dir);
+}
+
+
+/// INV2 across the new durability window: an **acknowledged** write must survive
+/// a restart when the records were flushed off-thread (propsol v0.2.13 P).
+///
+/// The ack is the boundary that matters: the runtime replies only after the
+/// cycle that carries the entry completed, and a cycle completes only when its
+/// flush landed. So a crash after the ack cannot lose it — while a record whose
+/// flush is still in the air may simply not be there, which recovery must treat
+/// as a legal prefix rather than corruption.
+#[tokio::test]
+async fn acked_write_survives_a_restart_with_offloaded_durability() {
+    let (dir, opts) = acked_single_node_with("offloaded", true).await;
+
+    // The actor is gone (its `WalStorage` — and with it the flusher thread —
+    // was dropped). Reopening must find a consistent log with the acked entry.
+    let storage = WalStorage::open(&dir, opts.clone()).expect("reopen the offloaded WAL");
+    let last = storage.last_index().expect("last_index");
+    let commit = storage.initial_state().expect("initial_state").hard_state.commit;
+    assert!(
+        last >= 2,
+        "the acked write's entry must be durable (last_index {last})"
+    );
+    assert!(
+        commit <= last,
+        "INV2: durable commit ({commit}) must not exceed the durable log ({last})"
+    );
+    let entries = storage.entries(1, last + 1, None).expect("entries");
+    assert!(
+        entries.len() as u64 == last,
+        "the recovered log must be a contiguous prefix from index 1"
+    );
+    // (`offloaded_fsyncs` is an in-memory counter and this is a fresh handle;
+    // the storage unit tests assert the accounting, this test asserts the
+    // durable outcome.)
+    drop(storage);
+
+    // And the node serves the value again on that directory.
+    let profile = profile();
+    let wal = WalStorage::open(&dir, opts).expect("reopen for the runtime");
+    let factory = InMemoryTransportFactory::new();
+    let (tx, rx) = factory.create(NodeId::from("n1"));
+    let metrics = Arc::new(Metrics::new());
+    let config = RuntimeConfig {
+        self_raft_id: 1,
+        self_node_id: NodeId::from("n1"),
+        peers: HashMap::new(),
+        addresses: HashMap::new(),
+        raft: RaftNodeConfig::from_profile(&profile),
+        profile,
+        metrics: Arc::clone(&metrics),
+    };
+    let logger = slog::Logger::root(slog::Discard.fuse(), slog::o!());
+    let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger).expect("build runtime");
+    let task = tokio::spawn(runtime.run());
+    for _ in 0..400 {
+        if metrics.is_leader() {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    let mut seen = None;
+    for _ in 0..400 {
+        if let Ok(Some(value)) = handle.get_stale(b"acked").await {
+            seen = Some(value);
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some(b"value".as_slice()),
+        "the acked write must be served again after a restart"
     );
     task.abort();
     let _ = task.await;
