@@ -93,6 +93,37 @@ jobs:
       # - name: Lint (clippy, deny warnings)
       #   run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # L2 (deterministic simulator): real tonic over turmoil. Separate from the
+  # workspace job because `l2/` is its own cargo workspace; it is the only place
+  # the simulator runs, so its tests (the 3-node real-tonic cluster plus the
+  # transport latency gate) are a gate here.
+  l2:
+    name: L2 (turmoil)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain pinned by rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          [ -n "${channel}" ] || { echo "error: could not parse channel from rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "${channel}" --profile minimal
+          rustup default "${channel}"
+
+      - name: Install protoc 3.x (raft-proto codegen requirement)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v3.20.3/protoc-3.20.3-linux-x86_64.zip
+          unzip -o -q /tmp/protoc.zip -d "$HOME/protoc3"
+          echo "$HOME/protoc3/bin" >> "$GITHUB_PATH"
+          "$HOME/protoc3/bin/protoc" --version
+
+      - name: L2 tests (real tonic over turmoil, no ignored tests)
+        working-directory: l2
+        run: cargo test
+
   # Fuzz job: runs only on the nightly schedule or manual dispatch (not per-PR).
   # Uses `github.event_name` to gate: `schedule` and `workflow_dispatch` are
   # the only triggers that should run the fuzzer.

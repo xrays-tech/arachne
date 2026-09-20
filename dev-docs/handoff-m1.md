@@ -7,7 +7,7 @@
 ## 1. 现状总览
 
 - **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
-- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）**、**(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）** 与 **(C) stage 3a/3c**（3a transport I/O 接缝 `edd913d`；3c inc.1–10 见 §3(C)，L2 场景 18 项全绿）；**`(D)/M1-5` 已收尾（commit `adb2bd7`，含 `6c79886` 的持久化 commit 修复，见 §1.5）**；**stage 3b（real tonic over turmoil）仍为已记录 spike**。
+- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）**、**(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）** 与 **(C) stage 3a/3c**（3a transport I/O 接缝 `edd913d`；3c inc.1–10 见 §3(C)，L2 场景 18 项全绿）；**`(D)/M1-5` 已收尾（commit `adb2bd7`，含 `6c79886` 的持久化 commit 修复，见 §1.5）**；**(C) stage 3b（real tonic over turmoil）已解决**（harness 显式链路延迟，见 §1.6）。
 - **✅ 已恢复**：oracle provider 故障（模型 id 无法解析 + 空结果）已解决；(C) stage 1 确认门禁已补跑并 **GO**，stage 2 门禁亦 **GO**。
 
 ### 1.5 本轮收尾（**已提交**：`6c79886` 修复 + `adb2bd7` 收尾）
@@ -110,32 +110,25 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 **stage 3a（已完成，commit edd913d）：transport I/O 接缝**：`arachne-transport-tonic` 新增 `TransportIo` 接缝 + `TokioIoProvider`（真实 tokio）+ `TcpConnector`；`TonicTransportFactory`/`TonicTransport` 对 `Io = TokioIoProvider` 泛型，server 经 `io.bind`/`io.incoming`、client 经 `Endpoint::connect_with_connector`。既有 API 不变（默认类型参数保住 `arachne-node` 用法）；`hyper/hyper-util/tower(util)/http` 均经 tonic 已传递，无新包。**门禁 NO-GO→修 `TcpConnector` 丢 `TCP_NODELAY`（tonic 默认连接器会设、自定义连接器绕过）→GO**。
 **stage 3b（部分完成 → 记为 spike，commit 76df587）：真实 tonic over turmoil + SimNetwork**。已落地并可编译：`l2/` 的 `TurmoilIo`（`turmoil::net` listener/stream + `Accepted` newtype 实现 tonic `Connected` + `TokioIo` connector）、`SimNetwork`（partition/partition_oneway/repair/hold/release/crash/bounce/set_fail_rate/set_link_latency）、3 节点 in-sim 真实 tonic 集群；两个 `in_sim` 测试标 `#[ignore]`（原因见下）以保 `l2` suite 绿。
 - **已证明可用**：3 节点全部启动（WAL+bind+Runtime actor）；在 turmoil 承载的真实 tonic 上**成功选出 leader**；follower 学到 leader；消息双向健康（`MsgHeartbeat`/`MsgHeartbeatResponse` 双向、term 1）。
-- **卡点（未解；**2025 复诊见 §1.6**）**：客户端 `put` 永不提交。**旧记录的两处结论已被复诊推翻**：(a) 不是"actor 收不到 `Command::Propose`"——命令会被收到并被答复；(b) 不是 actor 逻辑死锁。真实机制见 §1.6。
+- **卡点（已解，见 §1.6）**：客户端 `put` 永不提交。**旧记录的两处结论均已被推翻**：(a) 不是"actor 收不到 `Command::Propose`"——命令会被收到并被答复；(b) 不是 actor 逻辑死锁。根因是 harness 未设显式链路延迟、用了 turmoil 的大抖动默认延迟，超过 election_timeout 导致 CheckQuorum 反复降级。
 - **附带修复**：`Runtime` 的 propose/ReadIndex 截止时间原用 `std::time::Instant`（真实墙钟）→ 在模拟器下是确定性泄漏，已改 `tokio::time::Instant`（commit 377f3ce，root 仍 277 绿）。
-- **现状**：3b 仍为已记录 spike（`l2/tests/in_sim.rs` 两个测试 `#[ignore]`，理由已按复诊结论更新）；L2 不变量/场景继续跑在**内存传输**（`arachne/tests/l2_scenarios.rs`，20 项）。
+- **现状**：3b **已解决**——`l2/tests/in_sim.rs` 两个测试已去 `#[ignore]` 并通过，新增 `l2/tests/transport_echo.rs` 传输门禁，CI 增 `l2` job；L2 不变量/场景另有 **20 项**跑在内存传输（`arachne/tests/l2_scenarios.rs`），两条轨道互补。
 
-### 1.6 stage 3b 复诊（`l2` · real tonic over turmoil）
+### 1.6 stage 3b 复诊 → **已解决**（`l2` · real tonic over turmoil）
 
-复诊方法：在 `Runtime::run`（select 分支计数 + 事件序列）、`TonicTransport::send`（dial/connect/reply 三段日志）、`l2` 的 accept 循环上加重放探针（**全部已回退**），跑 `cargo test --test in_sim -- --ignored`。
+**结论：不是产品缺陷，是 L2 harness 的配置问题。** harness 之前没有设置显式链路延迟，于是使用了 **turmoil 的默认链路延迟**——它大且抖动（单次 RPC 往返几十毫秒模拟时间、尾部过百毫秒），超过节点的 `election_timeout`，使 leader 被 CheckQuorum 反复降级 → 选举抖动（term 1→2→3…）→ 客户端 `put` 先 `Timeout` 后 `QuorumUnavailable`。**harness 现显式固定 1ms 链路延迟**，`l2` 全部测试通过且**不再 `#[ignore]`**（3 节点真实 tonic 集群、双跑确定性、传输 echo），并新增 CI `l2` job。
 
-**证据链**
-1. **actor 停在 `drive_cycle` 内，而这里只有一处 `await`**：日志为 `[actor n2] begin tick seq=239` 后**没有** `drive-ok seq=239`；同一时刻 actor n3 继续跑到 seq=250。`drive_cycle` 中唯一的 `await` 是 `deliver → transport.send`（`step()` 其余部分、`advance`、apply、reply 都是同步）。
-2. **悬挂方向明确**：`[send] n2->n3 dialing … connected` 之后**没有** `replied`；该方向此前成功 7 次（8 dialing / 7 replied）。`n2->n1`、`n3->n2`、`n1->n2` 均正常。
-3. **对端没死**：n3 的 actor 在 n2 停住后继续 tick；`l2` 的 accept 循环**未报错**（探针无输出），故不是"服务器停止 accept"。
-4. **不是"actor 收不到命令"**：占位日志显示 `begin cmd seq=318` 紧跟 `Propose rejected as non-leader: leader_id=2 raft_id=1`——命令被收到、被答复。
-5. **客户端可见后果**：`put` 先 `operation timed out`（propose 截止 = election_timeout），随后 `quorum unavailable`；`leader_id` 反复归 0、term 1→2→3→…（**check-quorum 降级 + 重新选举的抖动**），因为 leader 处理不到 follower 响应（`recent_active` 永不置位）。
+**定位过程（探针均已回退）**
+1. **事件序列探针**：actor 停在 `drive_cycle` 内，而这里唯一的 `await` 是 `deliver → transport.send`；同一时刻其他 actor 继续 tick。
+2. **传输探针**：`n2->n3 connected` 之后没有 `replied`（该方向此前成功 7 次）；对端 actor 仍 tick，accept 未报错。
+3. **命令探针**：`begin cmd` 紧跟 `Propose rejected as non-leader` —— 命令**被收到并被答复**（推翻旧记录的"actor 收不到 `Command::Propose`"）。
+4. **最小可复现对照** `l2/tests/transport_echo.rs`（纯传输、无 raft/WAL，带 `ECHO_*` 旋钮与延迟分布）：
+   - 默认链路延迟：`p50≈40–50ms`、`p90≈73–97ms`、`p99≈100ms`，100ms 界内偶发超时；
+   - **显式 1ms：`p50=p90=p99=2ms`（一个 RTT）、0 超时**；显式 10ms：`p50=p99=20ms`、0 超时；
+   - 关 keep-alive、预热、改发送间隔、单向/双向**都不改变结论** → 排除 keep-alive / 连接建立 / 排队 / 方向，确定为**默认网络模型的延迟量级**。
+5. 把显式 1ms 加进 `l2/src/harness.rs` 后：3 节点集群 `put_ok=true`，双跑确定性通过。
 
-**已尝试并排除的修法**（均在 `l2` 复跑，结果仍 FAIL）
-- 把 transport 的 `request_timeout`/`connect_timeout` 从工厂默认（5s/2s，墙钟形状）对齐到节点的**模拟** `rpc_timeout`（该对齐已在 `l2/src/harness.rs` 保留：模拟器下用模拟截止时间才是正确的）。
-- **失效通道逐出**：`send` 失败时从缓存删除该 peer 的 `Channel`（生产侧健壮性改动；未证明能修复 3b，**已回退**，列为建议）。
-- **完全绕过通道缓存**（每次 send 重新 dial）：仍 FAIL → 排除"缓存通道半开"作为唯一根因。
-
-**最小可复现对照（`l2/tests/transport_echo.rs`，`#[ignore]`）：纯传输 echo，无 raft、无 WAL**。两个 host 各跑一个真实 `TonicTransportFactory<TurmoilIo>`，互发 50 条，每条用模拟时钟限时；两端 inbound 都排空。
-- 结果（**确定性**，两次跑一致）：**全部 50 条请求都到达对端**（两端 `received=50`），但 **n1 有 1 条、n2 有 4 条在 100ms 模拟时限内没收到响应**（`sent_err`）。
-- 把时限放宽到 1500ms、条数降到 5：**0 失败**。
-- ⇒ **响应是被延迟、不是被丢弃**（存在约 100ms–1500ms 的偶发回复延迟）；缺陷在**传输层（tonic/hyper + `TurmoilIo`）**，与 raft/WAL 无关。
-
-**当前结论**：3b 不是死锁，而是**偶发的亚秒级到秒级 gRPC 回复延迟**。延迟一旦超过 `election_timeout`，leader 的 check-quorum 判定失败 → 主动降级 → 重新选举抖动（term 1→2→3…），客户端 `put` 先 `Timeout` 后 `QuorumUnavailable`；actor"停在 `step()` 内"正是它在等这个迟到的响应。**根因层已由纯传输对照锁定为传输（turmoil TCP 与 hyper/tonic 连接任务的调度/重传语义）**，**仍未修复**。下一步：(a) 定位延迟来源（hyper 连接任务在 turmoil 下的唤醒、HTTP/2 keep-alive、TCP 重传计时器）；(b) 若属模拟器语义差异，则在 `TurmoilIo`/sim 配置里对齐（显式 link latency、关闭/调大 keep-alive），并把该对照转为门禁。
+**留下的门禁**：`l2/tests/in_sim.rs`（2 项，已去 `#[ignore]`）+ `l2/tests/transport_echo.rs`（1 项：默认显式 1ms，`ECHO_LINK_LATENCY_US=0` 可复现默认延迟导致的停机）；CI 新增 `l2` job 跑 `cargo test`。**教训**：模拟器下必须显式设定网络模型参数——其默认值可能远超测试 profile 的超时。
 
 **stage 3c（增量 1 已完成，commit 6815bef + 46a8328；门禁 GO）：内存传输上的确定性 L2 场景**。新增 `arachne/tests/l2_scenarios.rs`：进程内 3 节点 harness（沿用 `m0_determinism` 的同步 `RaftNode` 模式：手工 `tick`+`block_on(step)`+`on_message`，harness 自控消息投递），用 harness 级 `Faults{isolated}` 丢弃隔离节点往返消息来注入分区/崩溃；选举 RNG 用 stage-2 的 `raft::set_election_rng_seed` 保证 leader 身份可复现。
 - 场景/不变量：**S02**（2+1 分区，并断言隔离节点确实未收到多数侧写、多数两侧都提交）+ **INV7**（全轨迹每 term ≤1 leader）；**S01**（隔离=崩溃旧 leader → 幸存者选新主 → 复活收敛）+ **INV9**（新主含已提交条目）+ **INV8**（重叠 index 日志一致）+ **INV3**（收敛后状态快照逐字节一致）；**INV4**（M1 验收④：分区下客户端 put/get 历史经 stage-1 ClientOracle **与** 自建检查器判定为线性一致）；**双跑确定性**（同种子 → leader 轨迹与日志逐字节一致）。
@@ -150,7 +143,7 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **增量 9（已完成，commit 2159fd9）：换主后同 seq 重试（at-most-once）**：客户端对 `(client 0, seq 1)` 的 `Put` 先在 leader0 上发起、随即隔离（已 propose 但**未提交**，断言旧 leader 已提交日志无该命令）记为失败；换主后**用同一 `(client, seq)` 在新 leader 重试**成功，再以 ReadIndex 读观察该值。断言 oracle+checker 通过且 `merge_retries().ops.len()==2`（两次尝试合并为一个逻辑 op）。另给 inc.8 的换主轨迹补 INV7 断言。`l2_scenarios` 16/16。
 - **增量 10（已完成，commit 6226ec2；门禁 GO，ora-9；P3 打磨 cbf1a85）：真实 crash + WAL 重启**：harness 现支持 `crash(i)`（丢弃节点=任务死亡，保留 WAL 目录）与 `bounce(i)`（从同一目录重开 `WalStorage`、重建 `RaftNode(applied=0)`、**重置内存状态机并清空已记录日志**＝volatile 丢失）。场景：崩溃一个 follower → 多数侧提交 v2 → 重启该 follower → 断言其状态机恢复出 v2，且全节点日志一致（INV8）、状态快照一致（INV3）、INV7 成立；打磨：重启后**仅驱动该节点（不投递）**断言其已由 WAL 重放出 v1（区分 replay 与后续 resync）。**M1 ④ 的最后一项实质内容已闭合。** `l2_scenarios` 17/17。
 - **M1 ④（L2）覆盖小结**：S01/S02/S16；INV3/4/7/8/9；双跑确定性；INV4 共 9 种形态（顺序、分区下、换主、并发、多键、分区下并发、ReadIndex 读、故障下 ReadIndex 读+恢复、换主后同 seq 重试 at-most-once）；oracle 负路径（幻值/跨键）；真实 crash+WAL 重启。
-- **剩余（非阻塞）**：follower 服务读的完整来回（转发→quorum→resp→本地服务；当前客户端契约是经 leader 读）；用 `complete_logged` 记录真实 log id 以激活 oracle ②（当前 harness 无 log id，② 为空转）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
+- **剩余（非阻塞）**：更大规模/随机种子历史与更多故障组合。~~follower 服务读的完整来回~~ 已由 `follower_read_index_round_trip_completes` 覆盖（运行时契约差异已记入 `client/mod.rs`）；~~oracle ② 空转~~ 已由 `oracle_check_two_uses_real_log_ids` 激活；~~3b（real-tonic-on-turmoil）~~ **已解决**（§1.6）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
@@ -163,7 +156,7 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 ① 杀 leader 后 ≤2×election_timeout 出新主 —— **已证**：L2 确定性 tick 计数（≤2×election_tick，实测 16/20）+ L3 进程 SIGKILL 换主。
 ② 期间写返回 `NotLeader`/`QuorumUnavailable` 不挂死 —— **已证**：L3 窗口内写只接受 409/503，挂死即判失败；客户端面 `8cbc765`；`Timeout` 现映射 503。
 ③ hint 失效经 seeds 轮询恢复 —— **契约已打通**：跨进程 `409`+hint 可达（`without_redirect`）；`Handle` 的 seeds 兜底已实现（`client_runtime`/`read_index` 覆盖）。
-④ 含切主窗口的 put/get 线性一致 —— **已在 L2（内存传输）证明**：stage 3c inc.4–10（分区/换主/并发/多键/ReadIndex 读/故障下 ReadIndex 读/换主后同 seq 重试 at-most-once 共 9 种形态）；**real-tonic-on-turmoil（stage 3b）仍为已记录 spike**。
+④ 含切主窗口的 put/get 线性一致 —— **已在 L2（内存传输）证明**：stage 3c inc.4–10（分区/换主/并发/多键/ReadIndex 读/故障下 ReadIndex 读/换主后同 seq 重试 at-most-once 共 9 种形态）；**real-tonic-on-turmoil（stage 3b）亦已打通**（3 节点真实 tonic 集群选主/提交/复制 + 双跑确定性 + 传输延迟门禁，见 §1.6）。
 ⑤ crate 文档首页语义表/错误矩阵 —— **已完成**（`151066a`，并在 (B) 校正 `get` 行为）。
 
 ## 4. 环境注意（踩过的坑）
@@ -199,6 +192,10 @@ cargo test -p arachne --test client_redirect -- --nocapture
 cargo test -p arachne --test force_recovery -- --nocapture
 # L4 真机 kill -9（每轮一次 acked 写入 + 崩溃后复验；需真实磁盘）：
 ARACHNE_L4_ITERATIONS=3 bash l4/kill_loop.sh
+# L2 独立工程（turmoil；真实 tonic 集群 + 传输延迟门禁，CI 有独立 job）：
+cd l2 && cargo test
+# 复现「默认链路延迟导致停机」的对照（预期 FAIL）：
+cd l2 && ECHO_LINK_LATENCY_US=0 cargo test --test transport_echo -- --nocapture
 ```
 **本地注意**：若 `CARGO_TARGET_DIR` 在仓库外（本机默认 `~/.cargo/global-target`），沙箱可能拒绝写入；测试时用仓库内目录覆盖，如 `CARGO_TARGET_DIR=.dsh-target cargo test --workspace`。
 

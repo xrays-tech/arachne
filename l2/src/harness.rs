@@ -206,6 +206,19 @@ pub fn run_three_node(seed: u64) -> Vec<NodeObservation> {
     }
     *addrs_cell.lock().expect("addrs cell") = Some(addrs);
 
+    // Pin an explicit, small per-link latency. Turmoil's **default** link
+    // latency is large and jittery — a single gRPC round-trip costs tens to
+    // ~100ms of simulated time (measured with `l2/tests/transport_echo.rs`) —
+    // which exceeds the node's election timeout and made the cluster flap
+    // (check-quorum step-down, terms 1->2->3...). With an explicit latency the
+    // same probe is crisp (p50 == p99 == 2ms at 1ms latency, zero timeouts),
+    // and 1ms is the realistic LAN figure for a single-process sim. This is a
+    // harness configuration fix, not a product change.
+    let link_latency = Duration::from_millis(1);
+    for (a, b) in [("n1", "n2"), ("n1", "n3"), ("n2", "n3")] {
+        sim.set_link_latency(a, b, link_latency);
+    }
+
     let dshared = Arc::clone(&shared);
     let dsink = Arc::clone(&sink);
     sim.client("driver", async move {

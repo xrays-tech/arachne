@@ -39,10 +39,14 @@ cargo run
 
 | 里程碑 | 交付 | 说明 |
 |---|---|---|
-| **M1** | 真实 tonic 接线 + SimNetwork 全原语 + ClientOracle v1 | 让 `turmoil` 承载 **真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配），把真实 `arachne` 节点（多实例）跑在模拟网络上；`SimNetwork` 补齐 `partition_oneway`/`hold`/`release`/`set_fail_rate`/链路延迟抖动（`test-plan` §6.1）；ClientOracle 做 G1/G2 判定（§6.4）。**此时才把 `arachne` 的 `transport-tonic` 显式启用**（D-ART-rev1：sim 的 tonic 仅在 L2 落地时显式开） |
+| **M1** ✅ | 真实 tonic 接线 + SimNetwork 全原语 + ClientOracle v1 | 让 `turmoil` 承载 **真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配），把真实 `arachne` 节点（多实例）跑在模拟网络上；`SimNetwork` 补齐 `partition_oneway`/`hold`/`release`/`set_fail_rate`/链路延迟抖动（`test-plan` §6.1）；ClientOracle 做 G1/G2 判定（§6.4）。**此时才把 `arachne` 的 `transport-tonic` 显式启用**（D-ART-rev1：sim 的 tonic 仅在 L2 落地时显式开） |
 | **M2** | FaultyStorage + INV1–INV6 | `FaultyStorage` 包装自有 `WalStorage`/`StateMachine` 缝，注入 fsync 失败/撕裂写/截断/位翻转/慢盘，并维护 **fsync 台账** 事后对账断言 I1–I4（§6.2）；INV1–INV6 逐条可执行断言（§7） |
 | **M2+** | 双跑复现门禁 + 线性化检查 | 每个场景同种子连跑两次，比对 ①故障调度序列 ②各节点 apply 序列哈希 ③预言机判定（§5）；自建 Wing–Gong 检查器 + stateright 交叉验证（T2，D-T2） |
 | **M3/M4** | 全场景矩阵 + 两阶段模糊器 | S01–S20 场景矩阵（§8）、safe/liveness 两阶段模型、`--reproduce` 重放（§9） |
+
+> **M1 已完成**：`l2/tests/in_sim.rs`（3 节点真实 tonic 集群选主/提交/复制 + 双跑确定性）与 `l2/tests/transport_echo.rs`（传输延迟门禁）全部通过、**无 `#[ignore]`**，并纳入 CI 的 `l2` job。
+>
+> **模拟网络必须显式设定链路延迟**：turmoil 的**默认**链路延迟大且抖动（实测单次 RPC 往返 `p50≈40–50ms`、`p99≈100ms`），足以超过被测 profile 的 `election_timeout`，使 leader 被 CheckQuorum 反复降级（阶段 3b 曾经的"悬挂"）。harness 现显式固定 1ms（`l2/src/harness.rs`）；用 `transport_echo` 的 `ECHO_LINK_LATENCY_US=0` 可复现默认行为，其余 `ECHO_*` 旋钮见该文件文档。
 
 **L2 不覆盖**（如实声明，`test-plan` §11 缺口）：真实磁盘 fsync 语义（那是 L4 的不可替代项，§2 L4 行）、真实网卡/内核栈行为（L3/L4 补位）。
 

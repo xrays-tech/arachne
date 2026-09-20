@@ -1,9 +1,17 @@
 //! M1 stage 3b — real tonic over turmoil.
 //!
-//! Two proofs: a 3-node cluster (real `RaftNode` + `WalStorage` + `Runtime`,
+//! Two gate tests: a 3-node cluster (real `RaftNode` + `WalStorage` + `Runtime`,
 //! real tonic gRPC carried by the `TurmoilIo` seam) elects a leader, commits one
 //! write, and replicates it to every node; and the whole trace is byte-identical
 //! across two same-seed runs.
+//!
+//! These were `#[ignore]`d while the stage 3b stall was unexplained. The cause
+//! was a **harness configuration** issue, not a product defect: turmoil's
+//! default per-link latency is large and jittery (tens to ~100ms of simulated
+//! time per RPC — measured by `l2/tests/transport_echo.rs`), which exceeded the
+//! node's election timeout and made the leader flap. The harness now pins an
+//! explicit 1ms link latency, and both tests pass. See the stage 3b entry in
+//! `dev-docs/handoff-m1.md`.
 
 use arachne_l2::harness::run_three_node;
 
@@ -11,15 +19,6 @@ use arachne_l2::harness::run_three_node;
 const SEED: u64 = 0x5EED_3B;
 
 #[test]
-#[ignore = "stage 3b spike (refined diagnosis): an outbound raft RPC \
-            (leader -> follower) connects but its response never arrives, so \
-            the single-task runtime actor stops between ticks (it is awaiting \
-            the send inside `step`). Leadership then churns — check-quorum \
-            step-downs with terms 1->2->3... — and a client `put` times out and \
-            then returns `quorum unavailable`. This is NOT an actor-logic \
-            deadlock: the command is received and answered. See the stage 3b \
-            entry in dev-docs/handoff-m1.md for the full evidence and the \
-            fixes that were tried and ruled out."]
 fn three_node_cluster_elects_commits_and_replicates() {
     let obs = run_three_node(SEED);
     assert_eq!(obs.len(), 3, "one observation per node: {obs:?}");
@@ -50,7 +49,6 @@ fn three_node_cluster_elects_commits_and_replicates() {
 }
 
 #[test]
-#[ignore = "stage 3b spike: see three_node_cluster_elects_commits_and_replicates"]
 fn double_run_same_seed_is_deterministic() {
     let a = run_three_node(SEED);
     let b = run_three_node(SEED);
