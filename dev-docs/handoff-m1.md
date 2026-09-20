@@ -88,7 +88,7 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **增量 4（已完成，commit dfc92be；门禁 GO，ora-9；P4 修正 5c4d6e4）：多键 INV4 + 分区下并发**：多键（"a"/"b"）写读交替 + 读一个从未写过的键断言为 `None`——使 oracle 首次跑在真正**多键**历史上（跨键混淆会被 harness 直断言 + checker 逐键模型 + oracle 正向幻值检查共同捕获；**注意**：absent-key 的 `None` 读走 oracle 的跳过路径，其"负路径"由 testsupport 单测 `phantom_read_is_a_violation_with_witness` 覆盖）；两客户端实时重叠区间在隔离一个 follower 的 2+1 分区下由多数侧服务、历史仍线性一致（断言被隔离者确实饥饿）。`l2_scenarios` 10/10。
 - **增量 5（已完成，commit 2f35da1；门禁 GO，ora-9；P4/保留加强 97f785a）：INV4 跨越换主**：某次 put/get 在换主前被调用、换主后在**新 leader** 上完成（其实时区间横跨 leadership change）；oracle+checker 仍判定线性一致，并断言轨迹出现非初始 leader；加强：对该换主轨迹断言 INV7，且**新 leader 必须保留换主前已提交的条目**（独立键 `"old"`）。`l2_scenarios` 11/11。
 - **增量 6（已完成，commit 32b8b7e；门禁 GO，ora-9；P4 打磨 f010304）：oracle 幻值负路径（注入）**：两条注入式违规测试断言 oracle 对幻值读**判定失败**——读一个从未写过的值、以及跨键读（值只写给另一个键）；打磨后两条测试**同时**断言自建检查器亦判 `Violation`。在 L2 层闭合幻值检查的负路径（此前仅 testsupport 单测覆盖）。`l2_scenarios` 13/13。
-- **增量 7（已完成，commit 272967a）：ReadIndex 路径的读**：客户端读改走 raft ReadIndex（leader `read_index` → 等 quorum 确认的读状态 → 等 `applied ≥ read_index` → 再读 SM），而非直接读 leader 状态机；所得 put/get 历史经 oracle+checker 判定线性一致，并以"每次读都产生读状态"作非空断言。闭合"读绕过 ReadIndex"缺口。`l2_scenarios` 14/14。
+- **增量 7（已完成，commit 272967a；门禁 GO，ora-9；P3/P4 打磨 f4f5b72）：ReadIndex 路径的读**：客户端读改走 raft ReadIndex（leader `read_index` → 等 quorum 确认的读状态 → 等 `applied ≥ read_index` → 再读 SM），而非直接读 leader 状态机；所得 put/get 历史经 oracle+checker 判定线性一致，并以"每次读都产生读状态"作非空断言；打磨后加"applied 屏障确已到达"断言。闭合"读绕过 ReadIndex"缺口——**M1 ④ 的核心主张（客户端历史在真实共识读机制上线性一致）至此已演示**。`l2_scenarios` 14/14。
 - **增量 8（未开始）候选**：真实 crash+WAL 重启（当前 crash 用隔离建模，volatile 丢失已在 M0 覆盖）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
