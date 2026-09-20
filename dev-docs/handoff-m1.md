@@ -163,7 +163,13 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - **I1**：消息的 `term` 不超过该节点已持久化的最高 term——**pre-vote 消息豁免**（`pre_vote: true`，pre-vote 故意探测未来 term 且不持久化，这是它存在的意义）。
   - 场景：① follower 崩溃 + 重启后 INV1 仍成立、已提交条目保留（INV2 的"已提交"半边）；② 全节点注入 `sync_entries` 失败 → 节点 **fail-stop**，全程**没有任何条目上过线**、也没有任何条目变为持久；③ 两个探测器各自的负向对照 + 一个无假警报对照。5 项测试。
 - **与既有覆盖的关系**：`m0_inv1_ordering.rs`（M0 验收③）已证 I2/I4 半边（2 节点、健康、send 时对账）；本块补齐 **I1** 半边，并把存储换成故障注入包装、加入崩溃重启。
-- **尚未覆盖（M2 剩余）**：撕裂写/位翻转/截断属**字节级**故障，需在自有 WAL 格式层**离线**注入（`FaultyStorage` 在逻辑层表达不了，现由 `fuzz/` + `l4/verify_wal.sh` 承担）→ 下一步做成 PR 级确定性电池（INV6）；`slow_fsync` 需文件层时序；INV2 的 ready 阶段逐点崩溃扫描；INV5 属 M3（会话去重）。
+- **字节级故障（本轮补齐，`arachne/tests/m2_wal_faults.rs`，3 项）**：在**真实单节点 runtime 已 ack 写入**的数据目录上做字节级注入，并绑定 INV2：
+  - `META` 变异（空/截断/坏 magic/坏 CRC/payload 逐字节位翻转）→ **必须 fail-start**，绝不静默重建并接管该目录；
+  - **活 WAL 变异扫描**：对每个截断偏移 + 有界位翻转做两象限分类（合法前缀 / fail-start），断言永不 panic、恢复前缀连续且不增长、且"仍在盘上的字节"不会被静默改坏；
+  - **撕裂尾**（最后 1 字节缺失）→ 合法截断，且**在该目录上重启 runtime 后仍能读回 acked 值**。
+  - **更正**：我先前的记录称 INV6 "只由 `fuzz/` + L4 承担"是**错的**——`arachne/tests/wal_mutation.rs`（M0 ②）早已有 PR 级确定性变异电池（合成 WAL：全偏移截断 + 位翻转 + len 破坏 + 非末段 fail-start + 已提交区不丢）。本文件补的是**活 WAL**、**META 变异**与**恢复后仍可服务**。
+  - **边界（如实声明）**：META 不记录"期望的最后 index"，且 N3 明确规定"有 META 无 segment = 合法空日志"（`meta_only_dir_reopens_as_empty_log`）。因此**移除已提交前缀字节的变异会得到更短的前缀（甚至空日志）**，恢复无法与"本来就是空"区分——INV6 的两象限允许这一结果。故强断言（acked 前缀必须在场）只施加于"不可能移除已提交字节"的变异（无变异基线、尾 1 字节撕裂）。
+- **仍未覆盖（M2 剩余）**：`slow_fsync`（需文件层时序）；**INV2 的 ready 阶段逐点崩溃扫描**（在 `persist_ready` 与 `deliver`/`apply` 之间精确注入崩溃需要生产代码注入点；现有覆盖是轮次级 crash+bounce）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
