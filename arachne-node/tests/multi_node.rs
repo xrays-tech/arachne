@@ -384,21 +384,37 @@ fn killing_the_leader_elects_a_new_one_and_writes_never_hang() {
     let new_leader = new_leader.expect("a new leader emerged");
     assert_ne!(new_leader, leader, "the killed node cannot be the new leader");
 
-    // The new leader still serves the pre-kill committed value: the write
-    // survived the failover on a quorum.
+    // The pre-kill committed value must still be served by the cluster. Poll
+    // every survivor with a linearizable GET: a non-leader answers 409, so a
+    // 200 + value proves the current leader has the entry. Polling all
+    // survivors (not just the one that accepted the post-kill write) keeps the
+    // assertion about the *cluster* rather than about a node that may have been
+    // superseded while the read was in flight.
+    let mut last_read = String::from("(no response)");
     let mut read_ok = false;
-    for _ in 0..100 {
-        if let Some((status, body)) = http_request(http_addrs[new_leader], "GET", "/kv/before") {
-            if status == 200 && body.trim() == "v" {
-                read_ok = true;
-                break;
+    for _ in 0..200 {
+        for &i in &survivors {
+            match http_request(http_addrs[i], "GET", "/kv/before") {
+                Some((200, body)) if body.trim() == "v" => {
+                    read_ok = true;
+                    break;
+                }
+                Some((status, body)) => {
+                    last_read = format!("node {} -> {status} {body:?}", i + 1);
+                }
+                None => {
+                    last_read = format!("node {} -> no response", i + 1);
+                }
             }
+        }
+        if read_ok {
+            break;
         }
         std::thread::sleep(core::time::Duration::from_millis(STEP_MS));
     }
     assert!(
         read_ok,
-        "the new leader must serve the pre-kill committed value; log tails:\n{}",
+        "the pre-kill committed value must survive the failover; last read: {last_read}; log tails:\n{}",
         log_tails(&root, &[true; NUM_NODES])
     );
 }
