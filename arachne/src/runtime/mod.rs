@@ -316,11 +316,25 @@ impl ApplyTask {
         false
     }
 
+    /// Publish progress, but only when the value actually changes: a `watch`
+    /// send is a wakeup for the actor, and waking it for an unchanged value
+    /// would be a busy loop.
     fn publish(&self) {
-        let _ = self.progress.send(ApplyProgress {
+        let next = ApplyProgress {
             applied_index: self.sm.applied_index(),
             applied_bytes_total: self.applied_bytes_total,
             failed: self.failed.clone(),
+        };
+        self.progress.send_if_modified(|current| {
+            if current.applied_index == next.applied_index
+                && current.applied_bytes_total == next.applied_bytes_total
+                && current.failed == next.failed
+            {
+                false
+            } else {
+                *current = next;
+                true
+            }
         });
     }
 }
@@ -646,6 +660,14 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         snapshot: Option<SeamSnapshot>,
         entries: Vec<(LogIndex, Vec<u8>)>,
     ) -> bool {
+        // Nothing committed and nothing installed: sending an empty batch
+        // would make the apply task publish progress the actor has already
+        // seen, waking it in a tight loop. (Harmless on a multi-thread runtime,
+        // fatal on a single-threaded one — the turmoiled L2 cluster stopped
+        // electing.)
+        if snapshot.is_none() && entries.is_empty() && self.deferred.is_none() {
+            return true;
+        }
         if let Some(snapshot) = &snapshot {
             // Storage already persisted it; the apply task restores it in order
             // with the entries that follow, and a restore failure is a
