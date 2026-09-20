@@ -175,6 +175,21 @@ pub struct StorageStats {
     pub wal_truncated_records: u64,
 }
 
+/// The outcome of a [`WalStorage::force_recovery`] rewrite (propsol §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceRecoveryReport {
+    /// The `cluster_id` found in META before the rewrite.
+    pub previous_cluster_id: String,
+    /// The `cluster_id` now recorded in META.
+    pub cluster_id: String,
+    /// The new term (previous term + 1).
+    pub term: Term,
+    /// The retained commit (== applied) index.
+    pub commit: LogIndex,
+    /// Log entries discarded from the uncommitted tail.
+    pub discarded_entries: u64,
+}
+
 // ---------------------------------------------------------------------------
 // WalStorage
 // ---------------------------------------------------------------------------
@@ -581,6 +596,192 @@ impl WalStorage {
             self.max_entry_in_segment = 0;
         }
         Ok(())
+    }
+
+    // ---- force-recovery (propsol §6.1) ----
+
+    /// Discard every log entry with index greater than `keep` (the
+    /// **uncommitted tail**), leaving the durable log at `1..=keep`.
+    ///
+    /// This is destructive and is only called by [`WalStorage::force_recovery`].
+    /// It is a no-op (returning `0`) when the log already ends at `keep`, so a
+    /// node with no uncommitted entries is untouched. The retained segment is
+    /// truncated in place and every later segment is removed; the in-memory
+    /// log/segment state is then updated to match.
+    fn discard_uncommitted_tail(&mut self, keep: LogIndex) -> Result<u64, StorageError> {
+        let last = self.entries.last().map(|e| e.index).unwrap_or(0);
+        if last <= keep {
+            return Ok(0);
+        }
+        let discarded = last - keep;
+        let data_dir = self.data_dir.clone();
+        let segment_bytes = self.segment_bytes;
+        let segment_indices = list_segment_indices(&data_dir).map_err(StorageError::Io)?;
+
+        // Locate the byte offset just past the record for entry `keep`, and the
+        // segment that holds it. (Entries are contiguous and 1-based, so entry
+        // `keep` exists whenever `keep >= 1`.)
+        let mut holding: Option<(u64, u64)> = None; // (segment first index, offset)
+        'segments: for &idx in &segment_indices {
+            let path = segment_path(&data_dir, idx);
+            let raw = fs::read(&path).map_err(StorageError::Io)?;
+            let file_len = raw.len() as u64;
+            let mut offset: u64 = 0;
+            while offset < file_len {
+                if file_len - offset < 8 {
+                    break; // torn tail; `open` already handled it
+                }
+                let len = u32::from_le_bytes([
+                    raw[offset as usize],
+                    raw[offset as usize + 1],
+                    raw[offset as usize + 2],
+                    raw[offset as usize + 3],
+                ]) as u64;
+                let record_end = offset + 8 + len;
+                if record_end > file_len {
+                    break;
+                }
+                let record_bytes = &raw[offset as usize..record_end as usize];
+                if let Ok((RecordType::Entry, payload)) = decode_record(record_bytes)
+                    && let Ok((index, _, _, _)) = decode_entry(&payload)
+                    && index == keep
+                {
+                    holding = Some((idx, record_end));
+                    break 'segments;
+                }
+                offset = record_end;
+            }
+        }
+
+        match holding {
+            Some((first, offset)) => {
+                let seg = open_segment_at(&data_dir, first, segment_bytes)?;
+                seg.truncate_at(offset).map_err(StorageError::Io)?;
+                seg.sync().map_err(StorageError::Io)?;
+                for &idx in &segment_indices {
+                    if idx > first {
+                        fs::remove_file(segment_path(&data_dir, idx)).map_err(StorageError::Io)?;
+                    }
+                }
+                fsync_dir(&data_dir).map_err(StorageError::Io)?;
+                self.segment = seg;
+                self.segment_first_index = first;
+                self.max_entry_in_segment = keep;
+            }
+            None => {
+                // Nothing is retained (`keep == 0`): drop every segment and
+                // start a fresh, empty one at index 1.
+                for &idx in &segment_indices {
+                    fs::remove_file(segment_path(&data_dir, idx)).map_err(StorageError::Io)?;
+                }
+                fsync_dir(&data_dir).map_err(StorageError::Io)?;
+                self.segment = open_segment_at(&data_dir, 1, segment_bytes)?;
+                self.segment_first_index = 1;
+                self.max_entry_in_segment = 0;
+                fsync_dir(&data_dir).map_err(StorageError::Io)?;
+            }
+        }
+
+        self.entries.truncate(keep as usize);
+        self.pending_entry_fsync = false;
+        Ok(discarded)
+    }
+
+    /// Force-recovery rewrite of a data dir (propsol §6.1). **Destructive.**
+    ///
+    /// The operator-gated procedure (the CLI requires `--i-know-data-loss`)
+    /// that resets a node to a single-voter cluster at its committed point:
+    ///
+    /// 1. reads META (the data dir must exist and its `node_id` must match),
+    /// 2. opens the WAL with the **old** `cluster_id`, which acquires the
+    ///    data-dir lock and refuses if another process holds it,
+    /// 3. **discards the uncommitted tail** (entries above `commit`), so
+    ///    resurrected-but-never-committed entries cannot be promoted by the
+    ///    reset single-node leader,
+    /// 4. writes a new HardState: `term + 1`, `vote = self` (raft id 1 — this
+    ///    node is the only voter of the reset cluster), `commit` kept,
+    /// 5. rewrites META with `new_cluster_id` (or keeps the old one).
+    ///
+    /// # Membership (M1 boundary)
+    ///
+    /// Membership is **bootstrap-only** until M3 persists a `ConfState`
+    /// (`raft_storage.rs` notes it is static). This method therefore does not
+    /// (and cannot) persist `ConfState = [self]`; the caller must start the
+    /// recovered node with `initial_cluster = [self]` — a single-voter cluster.
+    /// The node's `force-recovery` command enforces that by emitting such a
+    /// config. Persisting the reset membership is M3 work.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Unrecoverable`] if META is missing/mismatched, the lock
+    /// is held, or the rewrite fails; [`StorageError::Io`] for I/O failures.
+    pub fn force_recovery(
+        dir: &Path,
+        node_id: &str,
+        new_cluster_id: Option<String>,
+        config: WalConfig,
+        created_at_millis: u64,
+    ) -> Result<ForceRecoveryReport, StorageError> {
+        let meta = read_meta(dir).map_err(|e| StorageError::Unrecoverable {
+            detail: format!("force-recovery: cannot read META: {e}"),
+        })?;
+        if meta.node_id != node_id {
+            return Err(StorageError::Unrecoverable {
+                detail: format!(
+                    "force-recovery: data dir node_id {:?} does not match {:?}",
+                    meta.node_id, node_id
+                ),
+            });
+        }
+        let previous_cluster_id = meta.cluster_id.clone();
+        let target_cluster_id = new_cluster_id.unwrap_or_else(|| previous_cluster_id.clone());
+        if target_cluster_id.is_empty() {
+            return Err(StorageError::Unrecoverable {
+                detail: "force-recovery: cluster_id must be non-empty".into(),
+            });
+        }
+
+        // Open with the OLD cluster_id: META validation passes, and this
+        // acquires the data-dir lock (refusing when another process holds it).
+        let mut wal = Self::open(
+            dir,
+            WalOptions {
+                cluster_id: previous_cluster_id.clone(),
+                node_id: node_id.to_string(),
+                config,
+                created_at_millis,
+                fsync_observer: None,
+            },
+        )?;
+
+        let commit = wal.hard_state.commit;
+        let previous_term = wal.hard_state.term;
+        let discarded = wal.discard_uncommitted_tail(commit)?;
+        // New hard state: bump the term and vote for self. `vote = 1` because
+        // this node is voter 1 of the reset single-voter cluster.
+        wal.set_hard_state(&HardState {
+            term: previous_term + 1,
+            vote: Some(1),
+            commit,
+        })?;
+
+        // Release the data-dir lock before rewriting META.
+        drop(wal);
+
+        let mut new_meta = meta;
+        new_meta.cluster_id = target_cluster_id.clone();
+        write_meta(dir, &new_meta).map_err(|e| StorageError::Unrecoverable {
+            detail: format!("force-recovery: cannot write META: {e}"),
+        })?;
+        fsync_dir(dir).map_err(StorageError::Io)?;
+
+        Ok(ForceRecoveryReport {
+            previous_cluster_id,
+            cluster_id: target_cluster_id,
+            term: previous_term + 1,
+            commit,
+            discarded_entries: discarded,
+        })
     }
 }
 
@@ -1617,6 +1818,190 @@ mod tests {
             Err(StorageError::Unrecoverable { .. }) => {}
             Err(e) => panic!("expected Unrecoverable for non-last segment corruption, got: {e}"),
             Ok(_) => panic!("expected fail-start, got Ok"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- force-recovery (propsol §6.1) ----
+
+    /// Force-recovery discards the uncommitted tail, bumps the term, votes for
+    /// self, keeps `commit`, and rewrites META with the new cluster id.
+    #[test]
+    fn force_recovery_discards_uncommitted_tail_and_rotates_cluster_id() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut wal = WalStorage::open(&dir, opts.clone()).unwrap();
+            wal.append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+            ])
+            .unwrap();
+            // Only 1..=2 are committed; entry 3 is an uncommitted tail.
+            wal.set_hard_state(&HardState {
+                term: 0,
+                vote: None,
+                commit: 2,
+            })
+            .unwrap();
+            wal.sync_entries().unwrap();
+        }
+
+        let report = WalStorage::force_recovery(
+            &dir,
+            "node-1",
+            Some("recovered-cluster".into()),
+            WalConfig::default(),
+            1_700_000_000_000,
+        )
+        .expect("force-recovery must succeed");
+
+        assert_eq!(report.previous_cluster_id, "test-cluster");
+        assert_eq!(report.cluster_id, "recovered-cluster");
+        assert_eq!(report.term, 1, "term must be bumped by one");
+        assert_eq!(report.commit, 2, "commit must be kept (== applied)");
+        assert_eq!(report.discarded_entries, 1, "entry 3 must be discarded");
+
+        // Reopening with the NEW cluster id sees the truncated log and the new
+        // hard state.
+        let mut new_opts = opts.clone();
+        new_opts.cluster_id = "recovered-cluster".into();
+        let wal = WalStorage::open(&dir, new_opts).expect("reopen with new cluster id");
+        assert_eq!(wal.last_index().unwrap(), 2, "uncommitted tail must be gone");
+        let hs = wal.initial_state().unwrap().hard_state;
+        assert_eq!(hs.term, 1);
+        assert_eq!(hs.vote, Some(1), "force-recovery votes for self");
+        assert_eq!(hs.commit, 2);
+
+        // The old cluster id no longer matches META.
+        match WalStorage::open(&dir, opts) {
+            Err(StorageError::Unrecoverable { .. }) => {}
+            Err(e) => panic!("expected a META mismatch with the old cluster id, got error: {e}"),
+            Ok(_) => panic!("expected a META mismatch with the old cluster id, got Ok"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With `new_cluster_id = None` the cluster id is preserved.
+    #[test]
+    fn force_recovery_keeps_the_cluster_id_when_not_rotating() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut wal = WalStorage::open(&dir, opts.clone()).unwrap();
+            wal.append(&[make_entry(1, 1, b"a")]).unwrap();
+            wal.set_hard_state(&HardState {
+                term: 3,
+                vote: Some(2),
+                commit: 1,
+            })
+            .unwrap();
+            wal.sync_entries().unwrap();
+        }
+
+        let report = WalStorage::force_recovery(
+            &dir,
+            "node-1",
+            None,
+            WalConfig::default(),
+            1_700_000_000_000,
+        )
+        .expect("force-recovery must succeed");
+        assert_eq!(report.cluster_id, "test-cluster");
+        assert_eq!(report.discarded_entries, 0, "a fully committed log is untouched");
+        assert_eq!(report.term, 4);
+
+        let wal = WalStorage::open(&dir, opts).expect("reopen");
+        assert_eq!(wal.last_index().unwrap(), 1);
+        let hs = wal.initial_state().unwrap().hard_state;
+        assert_eq!(hs.term, 4);
+        assert_eq!(hs.vote, Some(1), "the vote is reset to self");
+        assert_eq!(hs.commit, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With nothing committed, the whole log is discarded and a fresh segment
+    /// is started.
+    #[test]
+    fn force_recovery_with_zero_commit_discards_every_entry() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut wal = WalStorage::open(&dir, opts.clone()).unwrap();
+            wal.append(&[make_entry(1, 5, b"x"), make_entry(2, 5, b"y")])
+                .unwrap();
+            // HardState is written at open with commit 0; append does not
+            // advance commit, so both entries are uncommitted.
+            wal.sync_entries().unwrap();
+        }
+
+        let report = WalStorage::force_recovery(
+            &dir,
+            "node-1",
+            None,
+            WalConfig::default(),
+            1_700_000_000_000,
+        )
+        .expect("force-recovery must succeed");
+        assert_eq!(report.commit, 0);
+        assert_eq!(report.discarded_entries, 2);
+
+        let wal = WalStorage::open(&dir, opts).expect("reopen");
+        assert_eq!(wal.last_index().unwrap(), 0, "the log must be empty");
+        let hs = wal.initial_state().unwrap().hard_state;
+        assert_eq!(hs.commit, 0);
+        // The log is still appendable after the rewrite.
+        drop(wal);
+        let mut wal = WalStorage::open(&dir, test_opts()).expect("reopen for append");
+        wal.append(&[make_entry(1, 6, b"z")]).unwrap();
+        wal.sync_entries().unwrap();
+        assert_eq!(wal.last_index().unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A held data-dir lock refuses force-recovery (the old process is running).
+    #[test]
+    fn force_recovery_refuses_a_locked_data_dir() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let _held = WalStorage::open(&dir, opts).unwrap();
+
+        match WalStorage::force_recovery(
+            &dir,
+            "node-1",
+            None,
+            WalConfig::default(),
+            1_700_000_000_000,
+        ) {
+            Err(StorageError::Unrecoverable { detail }) => {
+                assert!(detail.contains("locked"), "unexpected detail: {detail}");
+            }
+            Err(e) => panic!("expected a lock refusal, got error: {e}"),
+            Ok(_) => panic!("expected a lock refusal, got Ok"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `node_id` that does not match META is refused.
+    #[test]
+    fn force_recovery_refuses_a_node_id_mismatch() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        drop(WalStorage::open(&dir, opts).unwrap());
+
+        match WalStorage::force_recovery(
+            &dir,
+            "someone-else",
+            None,
+            WalConfig::default(),
+            1_700_000_000_000,
+        ) {
+            Err(StorageError::Unrecoverable { detail }) => {
+                assert!(detail.contains("does not match"), "unexpected detail: {detail}");
+            }
+            Err(e) => panic!("expected a node_id mismatch, got error: {e}"),
+            Ok(_) => panic!("expected a node_id mismatch, got Ok"),
         }
         let _ = fs::remove_dir_all(&dir);
     }

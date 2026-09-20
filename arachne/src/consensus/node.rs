@@ -338,6 +338,29 @@ where
         // entries plus any messages generated during the advance).
         let light = self.raw.advance(ready);
 
+        // Persist a **commit-index advance**. raft-rs surfaces a commit advance
+        // on the `LightReady` (`LightReady::commit_index`), *not* on
+        // `Ready::hs` — `Ready::hs` carries term/vote changes, and the
+        // `LightReady` path also advances raft's internal `prev_hs.commit`. So
+        // if this is not persisted here, the commit is never written again and
+        // the durable HardState's `commit` stays stale forever. That stale
+        // value is what `initial_state()` reports on restart and what
+        // force-recovery (propsol §6.1, recovery point = committed/applied
+        // index) would use as the truncation point — so a stale commit makes
+        // force-recovery discard committed data. Persist it here, before any
+        // committed entry is applied or acknowledged (I1: `set_hard_state`
+        // always fsyncs), mirroring raft-rs's own example
+        // (`examples/single_mem_node`).
+        if let Some(commit) = light.commit_index() {
+            let hs = self.raw.raft.hard_state();
+            let mut seam_hs = RaftStorage::<S>::to_seam_hard_state(&hs);
+            seam_hs.commit = commit;
+            self.raw
+                .mut_store()
+                .set_hard_state(&seam_hs)
+                .map_err(NodeError::Raft)?;
+        }
+
         for msg in &persisted {
             self.deliver(msg).await;
         }

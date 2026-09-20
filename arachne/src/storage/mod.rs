@@ -55,5 +55,5 @@ pub use crate::storage::crc32c::crc32c;
 
 // Re-export the WAL-backed storage implementation.
 pub use crate::storage::wal::{
-    FsyncPolicy, StorageStats, WalConfig, WalOptions, WalStorage,
+    ForceRecoveryReport, FsyncPolicy, StorageStats, WalConfig, WalOptions, WalStorage,
 };
