@@ -297,6 +297,11 @@ where
         // I1/I2: persist entries, hard state, and snapshot durably BEFORE any
         // message is sent.
         self.persist_ready(&ready)?;
+        // INV2 crash injection (propsol v0.2.9 L; test-only, compiled out by
+        // default): the boundary where entries + HardState are durable but no
+        // message has been sent yet.
+        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::check(crate::fault_injection::Stage::AfterPersist);
 
         // Send the immediate (pre-persist) messages: the leader's fast-path
         // replication messages, which do not depend on local durability.
@@ -379,6 +384,11 @@ where
                 .iter()
                 .map(|e| (e.get_index(), e.get_data().to_vec())),
         );
+        // INV2 crash injection: messages have been sent, committed entries have
+        // not been applied yet (the caller applies after `step` returns).
+        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::check(crate::fault_injection::Stage::AfterDeliver);
+
         Ok(StepOutcome {
             committed,
             read_states,

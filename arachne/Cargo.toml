@@ -11,6 +11,11 @@ rust-version.workspace = true
 # Build with `--no-default-features` for a "lean" core with no transport at all.
 default = ["transport-tonic"]
 transport-tonic = ["dep:arachne-transport-tonic"]
+# Test-only crash injection at `RaftNode::step`'s ready-stage boundaries
+# (propsol v0.2.9 L / INV2). NOT a default feature and excluded from
+# release/publish builds (enforced by `scripts/check-release-features.sh`); when
+# off, the hook module and its call sites are compiled out entirely.
+fault-injection = []
 
 [dependencies]
 # The seam traits and shared value types live in the leaf `arachne-seam` crate.

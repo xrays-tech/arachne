@@ -54,6 +54,10 @@
 
 pub mod client;
 pub mod consensus;
+/// Test-only crash injection (propsol v0.2.9 L). Compiled only with the
+/// `fault-injection` feature; see the module docs.
+#[cfg(feature = "fault-injection")]
+pub mod fault_injection;
 pub mod metrics;
 pub mod profile;
 pub mod runtime;

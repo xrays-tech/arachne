@@ -1,11 +1,11 @@
-# Arachne 设计文档（v0.2.8 RFC）
+# Arachne 设计文档（v0.2.9 RFC）
 
 > 上游文档：`propsol.md`（v0.1）。本文件在其基础上做需求/设计精化，**不包含实现代码**。
 > 设计基线不变：复用成熟共识内核（`tikv/raft-rs`，备选 `openraft`）、CP 语义、不自研共识、失去多数派不自动接管、不基于 ACK 超时自动剔除节点。
 
 ---
 
-## 变更日志（v0.1 → v0.2.8）
+## 变更日志（v0.1 → v0.2.9）
 
 ### A. 三项待决策项已决议（见 §11）
 
@@ -127,6 +127,21 @@ M1-1 实现配置管线（`ProfileConfig::validate`）时发现：§7 的**约�
 | 预设数值 | 不变 | 不变 | 预设是冻结决策；本次只修**注解**使其与预设一致 |
 
 实现侧已按修正后的约束强制（`el ≥ 5·hb`、`rpc < el`）；本 E-rev 使**文档 / 实现 / 预设**三者自洽。
+
+### L. v0.2.9：INV2 的测试专用崩溃注入点（E-rev，test-only hook）
+
+M2 落地 INV2（"任意 ready 阶段注入崩溃，重启后 `HardState.commit` 及之前的条目全部在场且 apply 结果一致"，§7）时确认：**轮次级** harness 崩溃点（`crash`/`bounce`）只能表达"某一轮结束后崩溃"，无法在 `RaftNode::step` 的 **persist 与 deliver 之间**注入崩溃——而那正是"条目已落盘、尚未传播"这一关键窗口。字节级变异电池（`wal_mutation` / `m2_wal_faults`）与 `FaultyStorage` 分别覆盖磁盘损坏与 fsync 失败，均**不能**表达"进程在此刻死亡"。故需一个测试专用注入点。
+
+| 决策点 | 选择 | 否决的备选 | 理由 |
+|---|---|---|---|
+| 注入位置 | `RaftNode::step` 内两个阶段边界：`AfterPersist`（entries + HardState 持久化之后、任何消息发出之前）与 `AfterDeliver`（消息发出之后、apply 之前） | ①仅 harness 轮级崩溃；②在 `Storage` 接缝注入 | ①无法表达 persist/deliver 之间；②接缝是逻辑层，只能表达存储错误而非进程死亡 |
+| 开关 | crate **feature `fault-injection`，默认关闭**；关闭时调用点被 `#[cfg]` 完全编译掉（零行为改变、零运行时开销） | 运行时 flag / trait 对象 | 运行时开关会在生产热路径留下分支与状态 |
+| 状态 | **thread-local、一次性**（armed 后触发一次即清除） | 全局可变状态 | 测试并行运行时互不干扰 |
+| "崩溃"语义 | 触发点以固定 payload **panic**，由 harness `catch_unwind` 捕获后丢弃该节点（保留 WAL 目录） | 让 `step` 返回"崩溃"错误（须给 `NodeError` 加变体，改公共 API） | 不改动公共错误类型；"死亡即丢弃内存态"正是要建模的语义 |
+| 发布产物隔离 | 同 D-ART-testobs：**不是默认 feature**；`scripts/check-release-features.sh` 断言发布构建不含该 feature（哨兵字符串不出现） | 仅靠"记得别开" | 与既有 `test-observability` 门禁同一纪律 |
+| 不建模什么 | 撕裂写（字节级电池负责）、fsync 失败（`FaultyStorage` 负责）、真实掉电时序（L4） | —— | 明确边界，避免把三类故障混为一谈 |
+
+落点：§7 INV2 的"crash 边界扫描"；调用点在 `arachne/src/consensus/node.rs`，feature 模块 `arachne/src/fault_injection.rs`，测试在 `arachne/tests/m2_durability.rs`。
 
 ---
 
@@ -680,8 +695,8 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 | Q6 | `wal_trailing_keep` 是否与 `snapshot_threshold` 解耦 | 绑定同值简化运维，出现慢 follower 快照风暴证据再解耦 | §5.5.4、§7 | M2 追赶测试 |
 | Q7 | 提案队列按字节还是按条数计 | 按字节（64MB），对大值更稳 | §4.1、§7 | M1 压测 |
 
-**截至 v0.2.8 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
+**截至 v0.2.9 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J/L 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
 
 ---
 
-*v0.2.8 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.9 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
