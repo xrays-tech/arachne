@@ -999,3 +999,89 @@ fn oracle_flags_cross_key_phantom_read() {
         "the checker must also reject the cross-key phantom"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Increment 7: reads that go through the ReadIndex path into the oracle/checker
+// ---------------------------------------------------------------------------
+
+/// Perform a linearizable read via the raft ReadIndex mechanism: ask the leader
+/// for a read index, wait for the quorum-confirmed read state, wait for applied
+/// to reach it, then read the state machine. Returns the key's value.
+fn read_via_read_index(
+    c: &mut Cluster,
+    leader: RaftId,
+    key: &[u8],
+    ctx: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let i = (leader - 1) as usize;
+    c.nodes[i].as_mut().expect("leader present").read_index(ctx.clone());
+
+    let mut read_index = None;
+    for _ in 0..300 {
+        c.round();
+        if let Some((_, _, ri)) = c.read_states.iter().find(|(n, x, _)| *n == leader && *x == ctx) {
+            read_index = Some(*ri);
+            break;
+        }
+    }
+    let read_index = read_index.expect("leader must emit a read state for the ReadIndex request");
+
+    for _ in 0..300 {
+        if c.nodes[i].as_ref().expect("leader present").applied_index() >= read_index {
+            break;
+        }
+        c.round();
+    }
+    c.sms[i].get(key).expect("sm get")
+}
+
+/// INV4 where the client's reads are served through the ReadIndex path rather
+/// than by reading the leader's state machine directly.
+#[test]
+fn inv4_reads_via_read_index_are_linearizable() {
+    let _seed = ElectionSeed::enter(0x1_600);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+    let mut version = 0u64;
+    let mut read_states_seen = 0u32;
+
+    for r in 0..4u64 {
+        version += 1;
+        let value = ValueId(version);
+        let put_call = CallId(r * 2 + 1);
+        let get_call = CallId(r * 2 + 2);
+
+        h.invoke(put_call, ClientId(0), SeqNo(r * 2 + 1), Op::Put { key: b"k".to_vec(), value }, ts);
+        ts += 1;
+        commit_put(&mut c, leader, b"k", value, r * 2 + 1);
+        h.complete(put_call, ts, OpResult::Ok(None));
+        ts += 1;
+
+        let ctx = vec![0xA0, r as u8];
+        h.invoke(get_call, ClientId(0), SeqNo(r * 2 + 2), Op::Get { key: b"k".to_vec() }, ts);
+        ts += 1;
+        let before = c.read_states.len();
+        let read = read_via_read_index(&mut c, leader, b"k", ctx);
+        if c.read_states.len() > before {
+            read_states_seen += 1;
+        }
+        h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+        ts += 1;
+    }
+
+    // Non-vacuity: every read actually went through the ReadIndex path.
+    assert_eq!(read_states_seen, 4, "each read must produce a read state");
+
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (ReadIndex reads): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (ReadIndex reads): {outcome:?}"
+    );
+    c.cleanup();
+}
+
