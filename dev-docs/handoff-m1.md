@@ -130,7 +130,12 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **失效通道逐出**：`send` 失败时从缓存删除该 peer 的 `Channel`（生产侧健壮性改动；未证明能修复 3b，**已回退**，列为建议）。
 - **完全绕过通道缓存**（每次 send 重新 dial）：仍 FAIL → 排除"缓存通道半开"作为唯一根因。
 
-**当前结论**：3b 的失败是 **leader→follower 的某次 gRPC 请求/响应在半开或已失效的 HTTP/2 连接上永不返回**，把单任务 actor 卡在 `step()` 内；actor 卡住 → leader 收不到 follower 响应 → check-quorum 降级 → 选举抖动 → 客户端看到 Timeout/QuorumUnavailable。**根因所在层未定位**（turmoil TCP 半开语义 vs hyper/tonic 连接复用 vs 服务端连接任务），**未修复**。下一步：(a) 加"服务端 handler 计数 + 连接生命周期"探针，确认请求是否到达服务端；(b) 做最小 **tonic 双向 unary echo under turmoil** 对照（无 raft/WAL），把变量收敛到传输层；(c) 若对照复现，查 hyper 连接任务在 turmoil 下的唤醒路径。
+**最小可复现对照（`l2/tests/transport_echo.rs`，`#[ignore]`）：纯传输 echo，无 raft、无 WAL**。两个 host 各跑一个真实 `TonicTransportFactory<TurmoilIo>`，互发 50 条，每条用模拟时钟限时；两端 inbound 都排空。
+- 结果（**确定性**，两次跑一致）：**全部 50 条请求都到达对端**（两端 `received=50`），但 **n1 有 1 条、n2 有 4 条在 100ms 模拟时限内没收到响应**（`sent_err`）。
+- 把时限放宽到 1500ms、条数降到 5：**0 失败**。
+- ⇒ **响应是被延迟、不是被丢弃**（存在约 100ms–1500ms 的偶发回复延迟）；缺陷在**传输层（tonic/hyper + `TurmoilIo`）**，与 raft/WAL 无关。
+
+**当前结论**：3b 不是死锁，而是**偶发的亚秒级到秒级 gRPC 回复延迟**。延迟一旦超过 `election_timeout`，leader 的 check-quorum 判定失败 → 主动降级 → 重新选举抖动（term 1→2→3…），客户端 `put` 先 `Timeout` 后 `QuorumUnavailable`；actor"停在 `step()` 内"正是它在等这个迟到的响应。**根因层已由纯传输对照锁定为传输（turmoil TCP 与 hyper/tonic 连接任务的调度/重传语义）**，**仍未修复**。下一步：(a) 定位延迟来源（hyper 连接任务在 turmoil 下的唤醒、HTTP/2 keep-alive、TCP 重传计时器）；(b) 若属模拟器语义差异，则在 `TurmoilIo`/sim 配置里对齐（显式 link latency、关闭/调大 keep-alive），并把该对照转为门禁。
 
 **stage 3c（增量 1 已完成，commit 6815bef + 46a8328；门禁 GO）：内存传输上的确定性 L2 场景**。新增 `arachne/tests/l2_scenarios.rs`：进程内 3 节点 harness（沿用 `m0_determinism` 的同步 `RaftNode` 模式：手工 `tick`+`block_on(step)`+`on_message`，harness 自控消息投递），用 harness 级 `Faults{isolated}` 丢弃隔离节点往返消息来注入分区/崩溃；选举 RNG 用 stage-2 的 `raft::set_election_rng_seed` 保证 leader 身份可复现。
 - 场景/不变量：**S02**（2+1 分区，并断言隔离节点确实未收到多数侧写、多数两侧都提交）+ **INV7**（全轨迹每 term ≤1 leader）；**S01**（隔离=崩溃旧 leader → 幸存者选新主 → 复活收敛）+ **INV9**（新主含已提交条目）+ **INV8**（重叠 index 日志一致）+ **INV3**（收敛后状态快照逐字节一致）；**INV4**（M1 验收④：分区下客户端 put/get 历史经 stage-1 ClientOracle **与** 自建检查器判定为线性一致）；**双跑确定性**（同种子 → leader 轨迹与日志逐字节一致）。
