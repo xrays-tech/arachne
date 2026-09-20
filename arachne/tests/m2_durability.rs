@@ -399,6 +399,40 @@ impl Cluster {
         }
     }
 
+    /// Arm the `fault-injection` hook for `stage` on this thread, then
+    /// tick+step node `i` exactly once, catching the injected crash.
+    ///
+    /// Returns `true` if the node stopped at the armed stage. The node is left
+    /// in whatever in-memory state it had (the caller drops it, modelling a
+    /// crash); nothing is applied, because the crash precedes the caller's
+    /// apply step.
+    #[cfg(feature = "fault-injection")]
+    fn drive_one_armed(&mut self, i: RaftId, stage: arachne::fault_injection::Stage) -> bool {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let idx = (i - 1) as usize;
+        arachne::fault_injection::arm(stage);
+        let node = self.nodes[idx].as_mut().expect("node present");
+        node.tick();
+        match catch_unwind(AssertUnwindSafe(|| block_on(node.step()))) {
+            Err(_) => true,
+            Ok(Ok(outcome)) => {
+                for (ix, data) in outcome.committed {
+                    self.sms[idx].apply(ix, &data).expect("apply");
+                    self.committed[idx].push((ix, data));
+                }
+                self.nodes[idx].as_mut().expect("node present").advance_apply();
+                arachne::fault_injection::disarm();
+                false
+            }
+            Ok(Err(e)) => {
+                self.dead[idx] = true;
+                self.step_errors[idx] = Some(e.to_string());
+                arachne::fault_injection::disarm();
+                false
+            }
+        }
+    }
+
     fn leader(&self) -> Option<RaftId> {
         (1..=self.n).find(|&i| {
             self.nodes[(i - 1) as usize]
@@ -684,6 +718,108 @@ fn inv2_crash_sweep_replays_the_committed_prefix() {
             c.round();
         }
         c.assert_converged();
+
+        c.cleanup();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INV2: precise ready-stage crash injection (feature `fault-injection`)
+// ---------------------------------------------------------------------------
+
+/// IN2 with a **precise** crash point (propsol v0.2.9 L): arm the runtime hook for
+/// a `RaftNode::step` stage boundary and crash the target exactly there —
+/// `AfterPersist` (entries + HardState durable, nothing sent yet) or
+/// `AfterDeliver` (messages sent, not yet applied). Swept over the leader and a
+/// follower.
+///
+/// After the crash the node is restarted on its WAL and driven with **no
+/// delivery** (pure replay). INV2 requires that everything up to the durably
+/// persisted `HardState.commit` is present, so:
+/// * the commit recovered from disk is >= the commit persisted before the crash;
+/// * the replayed state machine has applied at least that commit;
+/// * a crash at the *leader* — which had acked the write — never loses the acked
+///   value;
+/// * after rejoining, every node converges on one state.
+///
+/// Gated on `--features fault-injection` (not a default feature).
+#[cfg(feature = "fault-injection")]
+#[test]
+fn inv2_precise_ready_stage_crash_replays_the_durable_prefix() {
+    use arachne::fault_injection::Stage;
+
+    let cases: &[(&str, Stage)] = &[
+        ("leader", Stage::AfterPersist),
+        ("leader", Stage::AfterDeliver),
+        ("follower", Stage::AfterPersist),
+        ("follower", Stage::AfterDeliver),
+    ];
+
+    for (role, stage) in cases {
+        let mut c = Cluster::new(3);
+        let leader = elect(&mut c);
+        let target = if *role == "leader" {
+            leader
+        } else {
+            (1..=3).find(|&i| i != leader).expect("a follower exists")
+        };
+        let tag = format!("role={role}, stage={stage:?}");
+
+        // Ack one write so a durably committed prefix exists.
+        commit_put(&mut c, leader, 1);
+
+        // Crash the target at the armed stage boundary inside `step`.
+        let crashed = c.drive_one_armed(target, *stage);
+        assert!(
+            crashed,
+            "the fault-injection hook must stop the node at {stage:?} [{tag}]"
+        );
+        let persisted_at_crash = c.ledgers[(target - 1) as usize].persisted_commit();
+
+        // Drop the node (crash), then restart it on its WAL.
+        c.crash(target);
+        c.bounce(target);
+
+        let recovered_commit = c.durable_commit(target);
+        assert!(
+            recovered_commit >= persisted_at_crash,
+            "INV2 violated: the persisted commit was not recovered ({persisted_at_crash} -> {recovered_commit}) [{tag}]"
+        );
+
+        // Pure WAL replay (no delivery).
+        c.drive_local(target, 400);
+
+        // INV2: apply keeps up with the recovered commit.
+        let applied = c.nodes[(target - 1) as usize]
+            .as_ref()
+            .expect("node present")
+            .applied_index();
+        assert!(
+            applied >= recovered_commit,
+            "INV2 violated: applied ({applied}) < recovered commit ({recovered_commit}) [{tag}]"
+        );
+
+        // A crash at the leader — which had acked the write — must never lose it.
+        if *role == "leader" {
+            assert_eq!(
+                c.sm(target).get(b"k").expect("sm get"),
+                Some(v_bytes(1)),
+                "INV2 violated: the leader lost its acked write across the crash [{tag}]"
+            );
+        }
+
+        // Rejoin and converge (INV3).
+        for _ in 0..800 {
+            c.round();
+        }
+        c.assert_converged();
+        for i in 1..=3 {
+            assert_eq!(
+                c.sm(i).get(b"k").expect("sm get"),
+                Some(v_bytes(1)),
+                "every node must hold the acked value after convergence [{tag}]"
+            );
+        }
 
         c.cleanup();
     }
