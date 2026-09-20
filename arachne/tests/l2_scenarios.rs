@@ -25,6 +25,7 @@ use arachne_testsupport::{
     block_on, check_linearizable, CallId, CheckOutcome, ClientId, History, InMemoryRx,
     InMemoryTransportFactory, InMemoryTx, KvState, Op, OpResult, SeqNo, ValueId,
 };
+use raft::{clear_election_rng_seed, set_election_rng_seed};
 use slog::{o, Drain, Logger};
 
 type TestNode = RaftNode<WalStorage, InMemoryTx, InMemoryRx>;
@@ -174,13 +175,12 @@ impl Cluster {
         }
 
         // Record (term, leader) for INV7.
-        for (i, slot) in self.nodes.iter().enumerate() {
+        for slot in self.nodes.iter() {
             if let Some(node) = slot {
                 let obs = (node.hard_state().term, node.leader_id());
                 if obs.1 != 0 {
                     self.leader_obs.push(obs);
                 }
-                let _ = i;
             }
         }
     }
@@ -237,14 +237,14 @@ struct ElectionSeed;
 
 impl ElectionSeed {
     fn enter(seed: u64) -> Self {
-        raft::set_election_rng_seed(seed);
+        set_election_rng_seed(seed);
         Self
     }
 }
 
 impl Drop for ElectionSeed {
     fn drop(&mut self) {
-        raft::clear_election_rng_seed();
+        clear_election_rng_seed();
     }
 }
 
@@ -282,6 +282,7 @@ fn run_s02(seed: u64) -> Outcome {
     // Isolate a follower: the leader + the other follower keep a majority.
     let victim = (1..=3).find(|&i| i != leader).expect("a follower exists");
     c.faults.isolate(victim);
+    let victim_len_before = c.committed[(victim - 1) as usize].len();
 
     assert!(
         c.propose(leader, b"k1", b"v1", 2),
@@ -290,6 +291,20 @@ fn run_s02(seed: u64) -> Outcome {
     for _ in 0..400 {
         c.round();
     }
+
+    // The partition must be OBSERVED: the isolated follower did not receive the
+    // majority-side write, while both majority nodes did.
+    assert_eq!(
+        c.committed[(victim - 1) as usize].len(),
+        victim_len_before,
+        "isolated follower must not receive the majority-side write"
+    );
+    assert!(
+        (1..=3)
+            .filter(|&i| i != victim)
+            .all(|i| c.committed[(i - 1) as usize].len() > victim_len_before),
+        "both majority nodes must commit the second write"
+    );
 
     assert_single_leader_per_term(&c.leader_obs);
     // Non-vacuity: every node committed the first write; the majority also
@@ -447,6 +462,7 @@ fn inv4_client_history_is_linearizable_under_partition() {
     // client writes keep committing (a non-trivial linearization under fault).
     let victim = (1..=3).find(|&i| i != leader).expect("a follower exists");
     c.faults.isolate(victim);
+    let victim_len_before = c.committed[(victim - 1) as usize].len();
 
     let mut h = History::new();
     let mut ts = 0u64;
@@ -494,6 +510,14 @@ fn inv4_client_history_is_linearizable_under_partition() {
         h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
         ts += 1;
     }
+
+    // The partition is OBSERVED: the isolated follower never saw any
+    // partition-era write, while the majority committed them all.
+    assert_eq!(
+        c.committed[(victim - 1) as usize].len(),
+        victim_len_before,
+        "isolated follower must not observe the partition-era writes"
+    );
 
     // Oracle: all always-on checks (phantom / one-log-id / RYW / monotonic /
     // well-formed).
