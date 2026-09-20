@@ -108,6 +108,8 @@ struct Cluster {
     sms: Vec<KvStateMachine>,
     /// Per-node committed log `(index, data)` in apply order.
     committed: Vec<Vec<(RaftId, Vec<u8>)>>,
+    /// Read states emitted across the run: `(node, request_ctx, read_index)`.
+    read_states: Vec<(RaftId, Vec<u8>, arachne::LogIndex)>,
     faults: Faults,
     /// `(term, leader)` observations across the whole run, for INV7.
     leader_obs: Vec<(u64, RaftId)>,
@@ -139,6 +141,7 @@ impl Cluster {
             nodes,
             sms,
             committed,
+            read_states: Vec::new(),
             faults: Faults::default(),
             leader_obs: Vec::new(),
         }
@@ -150,8 +153,11 @@ impl Cluster {
         for i in 0..self.nodes.len() {
             if let Some(node) = self.nodes[i].as_mut() {
                 node.tick();
-                let outcome = block_on(node.step()).expect("step").committed;
-                for (idx, data) in outcome {
+                let outcome = block_on(node.step()).expect("step");
+                for (ctx, index) in &outcome.read_states {
+                    self.read_states.push(((i + 1) as RaftId, ctx.clone(), *index));
+                }
+                for (idx, data) in outcome.committed {
                     self.sms[i].apply(idx, &data).expect("apply");
                     self.committed[i].push((idx, data));
                 }
@@ -191,6 +197,21 @@ impl Cluster {
                 }
             }
         }
+    }
+
+    /// Tick+step only node `i` with NO message delivery, returning the read
+    /// states it emits locally. Isolates "does this node serve ReadIndex itself?".
+    fn step_local(&mut self, i: usize) -> Vec<(Vec<u8>, arachne::LogIndex)> {
+        let node = self.nodes[i].as_mut().expect("node present");
+        node.tick();
+        let out = block_on(node.step()).expect("step");
+        let reads = out.read_states;
+        for (idx, data) in out.committed {
+            self.sms[i].apply(idx, &data).expect("apply");
+            self.committed[i].push((idx, data));
+        }
+        node.advance_apply();
+        reads
     }
 
     fn leader_of(&self, id: RaftId) -> bool {
@@ -665,3 +686,98 @@ fn inv4_failover_mid_history_is_linearizable() {
 
     c.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// Increment 3: concurrent (overlapping) ops + transport-level ReadIndex
+// ---------------------------------------------------------------------------
+
+/// INV4 with two clients whose operations overlap in real time — this exercises
+/// the checker's concurrency machinery (prior histories were sequential).
+#[test]
+fn inv4_two_clients_overlapping_ops_linearizable() {
+    let _seed = ElectionSeed::enter(0x1_4C0);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+    let mut version = 0u64;
+
+    for r in 0..4u64 {
+        version += 1;
+        let value = ValueId(version);
+        let put_call = CallId(r * 4 + 1);
+        let get_call = CallId(r * 4 + 2);
+
+        // Invoke BOTH before completing either ⇒ real-time overlap.
+        h.invoke(put_call, ClientId(0), SeqNo(r), Op::Put { key: b"k".to_vec(), value }, ts);
+        ts += 1;
+        h.invoke(get_call, ClientId(1), SeqNo(r), Op::Get { key: b"k".to_vec() }, ts);
+        ts += 1;
+
+        // The put commits; the concurrent get then observes it.
+        commit_put(&mut c, leader, b"k", value, r * 4 + 1);
+        let read = c.sms[(leader - 1) as usize].get(b"k").expect("sm get");
+        h.complete(put_call, ts, OpResult::Ok(None));
+        ts += 1;
+        h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+        ts += 1;
+    }
+
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (2 clients): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (2 clients): {outcome:?}"
+    );
+    c.cleanup();
+}
+
+/// ReadIndex is served only on the leader: the leader emits a read state for its
+/// request, while a follower (which forwards the request) emits none locally.
+#[test]
+fn read_index_is_served_only_on_the_leader() {
+    let _seed = ElectionSeed::enter(0x1_4D0);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+    // Ensure the leader has committed in its term (ReadIndex is ignored until
+    // then).
+    commit_put(&mut c, leader, b"k", ValueId(1), 1);
+
+    let leader_ctx = vec![1u8; 8];
+    c.nodes[(leader - 1) as usize]
+        .as_mut()
+        .expect("leader present")
+        .read_index(leader_ctx.clone());
+    for _ in 0..200 {
+        c.round();
+    }
+    assert!(
+        c.read_states
+            .iter()
+            .any(|(n, ctx, _)| *n == leader && *ctx == leader_ctx),
+        "the leader must emit a read state for its ReadIndex request"
+    );
+
+    let follower = (1..=3).find(|&i| i != leader).expect("a follower exists");
+    let follower_ctx = vec![2u8; 8];
+    c.nodes[(follower - 1) as usize]
+        .as_mut()
+        .expect("follower present")
+        .read_index(follower_ctx.clone());
+    // Without delivery the follower cannot complete a quorum round, so it must
+    // not serve the read itself — only the leader's round yields a read state.
+    let mut served_locally = false;
+    for _ in 0..20 {
+        for (ctx, _) in c.step_local((follower - 1) as usize) {
+            if ctx == follower_ctx {
+                served_locally = true;
+            }
+        }
+    }
+    assert!(!served_locally, "a follower must not serve ReadIndex itself");
+
+    c.cleanup();
+}
+
