@@ -2,7 +2,7 @@
 
 > 面向**新会话**。先读本文，再读 `dev-docs/propsol-v0.2.8`（设计权威）与 `dev-docs/test-plan-v0.1.3`（测试方案）。会话态进度见 `.slim/deepwork/arachne-m1.md`（git-local，但 OpenCode 可读）。
 >
-> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**292 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
+> 仓库：`/Users/alex/Projects/workspace/Arachne`，git 已 init，工作树干净，**293 tests 0 failed**、0 告警、`scripts/check-deps.sh` 与 `scripts/check-entropy.sh` 全绿。
 
 ## 1. 现状总览
 
@@ -12,10 +12,10 @@
 
 ### 提交线（新 → 旧）
 ```
-e1b7f31 M1-4 (C) stage 3c inc.8: 故障下的 ReadIndex 读                       ← HEAD
+2159fd9 M1-4 (C) stage 3c inc.9: 换主后同 seq 重试（at-most-once）              ← HEAD
+fba2aca docs: (C) stage 3c inc.8 门禁 GO
+e1b7f31 M1-4 (C) stage 3c inc.8: 故障下的 ReadIndex 读
 53f4644 docs: (C) stage 3c inc.7 门禁 GO；M1 ④ 核心已演示
-f4f5b72 M1-4 (C) stage 3c inc.7: 门禁 P3/P4 打磨
-272967a M1-4 (C) stage 3c inc.7: ReadIndex 路径的读
 6815bef M1-4 (C) stage 3c inc.1: 内存传输确定性 L2 场景（S01/S02+INV3/4/7/8/9）
 76df587 M1-4 (C) stage 3b spike: 真实 tonic over turmoil（部分；commit 路径卡住）
 377f3ce fix(runtime): actor 截止时间改用模拟 tokio::time::Instant（确定性）
@@ -90,7 +90,8 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **增量 6（已完成，commit 32b8b7e；门禁 GO，ora-9；P4 打磨 f010304）：oracle 幻值负路径（注入）**：两条注入式违规测试断言 oracle 对幻值读**判定失败**——读一个从未写过的值、以及跨键读（值只写给另一个键）；打磨后两条测试**同时**断言自建检查器亦判 `Violation`。在 L2 层闭合幻值检查的负路径（此前仅 testsupport 单测覆盖）。`l2_scenarios` 13/13。
 - **增量 7（已完成，commit 272967a；门禁 GO，ora-9；P3/P4 打磨 f4f5b72）：ReadIndex 路径的读**：客户端读改走 raft ReadIndex（leader `read_index` → 等 quorum 确认的读状态 → 等 `applied ≥ read_index` → 再读 SM），而非直接读 leader 状态机；所得 put/get 历史经 oracle+checker 判定线性一致，并以"每次读都产生读状态"作非空断言；打磨后加"applied 屏障确已到达"断言。闭合"读绕过 ReadIndex"缺口——**M1 ④ 的核心主张（客户端历史在真实共识读机制上线性一致）至此已演示**。`l2_scenarios` 14/14。
 - **增量 8（已完成，commit e1b7f31）：故障下的 ReadIndex 读**：一个读在 leader0 上发起后 leader0 被隔离——断言其**不能完成**（无该 ctx 的读状态，绝不返回陈旧值），客户端记录为失败（`OpResult::Err(Timeout)`，非线性化点）；换主后由新 leader 服务一次新的 ReadIndex 读。整段历史（含失败读）仍线性一致。`l2_scenarios` 15/15。
-- **增量 9（未开始）候选**：真实 crash+WAL 重启（当前 crash 用隔离建模，volatile 丢失已在 M0 覆盖）；follower 服务读的完整来回（转发→quorum→resp→本地服务）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
+- **增量 9（已完成，commit 2159fd9）：换主后同 seq 重试（at-most-once）**：客户端对 `(client 0, seq 1)` 的 `Put` 先在 leader0 上发起、随即隔离（已 propose 但**未提交**，断言旧 leader 已提交日志无该命令）记为失败；换主后**用同一 `(client, seq)` 在新 leader 重试**成功，再以 ReadIndex 读观察该值。断言 oracle+checker 通过且 `merge_retries().ops.len()==2`（两次尝试合并为一个逻辑 op）。另给 inc.8 的换主轨迹补 INV7 断言。`l2_scenarios` 16/16。
+- **增量 10（未开始）候选**：真实 crash+WAL 重启（当前 crash 用隔离建模，volatile 丢失已在 M0 覆盖）；follower 服务读的完整来回（转发→quorum→resp→本地服务）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
 - (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
