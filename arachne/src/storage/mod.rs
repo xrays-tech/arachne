@@ -8,6 +8,7 @@
 //!   encode/decode functions.
 //! * [`segment`] — segment file naming, append, and read.
 //! * [`meta`] — the cluster/node identity META file with atomic write.
+//! * [`snapshot`] — the on-disk snapshot file format (propsol §5.5.4).
 //! * [`crc32c`] — the CRC32C (Castagnoli) checksum used for record and META
 //!   integrity.
 //! * [`wal`] — the WAL-backed [`WalStorage`]: crash-safe durable log with
@@ -23,6 +24,7 @@ mod crc32c;
 mod format;
 mod meta;
 mod segment;
+pub mod snapshot;
 mod wal;
 
 // Re-export the seam's storage types so `arachne::storage::Storage` etc.

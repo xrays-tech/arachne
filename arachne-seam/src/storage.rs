@@ -233,6 +233,26 @@ pub trait Storage: Send + 'static {
     /// P2 may return [`StorageError::Unrecoverable`] or be a no-op until real
     /// compaction lands (M2).
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError>;
+
+    /// Persist `snapshot` durably and make it this store's latest snapshot.
+    ///
+    /// **Invariant I3:** once this returns, the snapshot's position and
+    /// membership are durable. Only then may the snapshot be advertised to
+    /// peers, and only then may the log at or below `snapshot.meta.index` be
+    /// released with [`compact`](Storage::compact).
+    ///
+    /// Moving the snapshot backwards is never allowed: an implementation that
+    /// already holds a snapshot at or beyond `snapshot.meta.index` must leave
+    /// its state unchanged and report success.
+    ///
+    /// The default implementation fails loudly rather than silently dropping
+    /// the snapshot: only storages that can persist snapshots override it.
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError> {
+        let _ = snapshot;
+        Err(StorageError::Unrecoverable {
+            detail: "this storage implementation does not support snapshots".into(),
+        })
+    }
 }
 
 /// Observes per-segment fsync events from a WAL implementation.

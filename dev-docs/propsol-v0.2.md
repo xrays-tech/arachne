@@ -1,11 +1,11 @@
-# Arachne 设计文档（v0.2.9 RFC）
+# Arachne 设计文档（v0.2.10 RFC）
 
 > 上游文档：`propsol.md`（v0.1）。本文件在其基础上做需求/设计精化，**不包含实现代码**。
 > 设计基线不变：复用成熟共识内核（`tikv/raft-rs`，备选 `openraft`）、CP 语义、不自研共识、失去多数派不自动接管、不基于 ACK 超时自动剔除节点。
 
 ---
 
-## 变更日志（v0.1 → v0.2.9）
+## 变更日志（v0.1 → v0.2.10）
 
 ### A. 三项待决策项已决议（见 §11）
 
@@ -142,6 +142,22 @@ M2 落地 INV2（"任意 ready 阶段注入崩溃，重启后 `HardState.commit`
 | 不建模什么 | 撕裂写（字节级电池负责）、fsync 失败（`FaultyStorage` 负责）、真实掉电时序（L4） | —— | 明确边界，避免把三类故障混为一谈 |
 
 落点：§7 INV2 的"crash 边界扫描"；调用点在 `arachne/src/consensus/node.rs`，feature 模块 `arachne/src/fault_injection.rs`，测试在 `arachne/tests/m2_durability.rs`。
+
+### M. v0.2.10：快照落盘契约、META 快照指针与压缩边界（E-rev）
+
+M2 落地 §5.5.4 的快照与压缩时，需把三处此前只有文字规定、没有落盘契约的地方钉死。
+
+| 决策点 | 选择 | 否决的备选 | 理由 |
+|---|---|---|---|
+| 快照落盘形态 | **独立文件 `snapshot-<index>-<term>.snap`**：`[u32 magic][u32 format_version][u64 index][u64 term][u32 voters_len][voters u64…][u32 learners_len][learners u64…][u64 data_len][data][u32 crc32c]`，CRC 覆盖其前全部字节（含 header 与成员表）；原子写（tmp → fsync → rename → 目录 fsync） | ①塞进 WAL 的 `Meta(0x03)` 记录；②放进 META 文件 | ①记录上限 64 MiB，快照会超；大记录进段内也拖慢回放。②META 是身份文件，与段无关 |
+| "最新快照"判定 | **扫描目录，取 index 最大且 CRC 合法者**；非法则回退更早快照；无更早快照且 WAL 不能从更早完整回放 → fail-start | 仅以 META 指针为唯一判据 | 直接对应 §5.5.3 第 3 步"加载最新合法快照 / 回退上一份"；扫描天然给出"上一份" |
+| META 快照指针 | **payload 尾部追加 `snapshot_index: u64, snapshot_term: u64`（无快照 = 0,0）**，仍保持 `format_version = 1` | ①升 `FORMAT_VERSION` 到 2；②不加指针 | §5.6 允许"major 内只扩 payload"；`decode_meta` 只读到 `created_at` 为止、**不校验尾部长度**，故旧文件可读、新文件对旧读者只是多出被忽略的尾部——零版本代价。指针给运维/排障一个"当前生效快照"的单点事实，扫描是兜底 |
+| 压缩边界 | `compact(to)` 只删除**完全**位于 `to` 之前的段；`first_index = to + 1`；`entries`/`term` 对 `< first_index` 返回 `Compacted` | 允许段内前缀截断 | v1 的段粒度压缩已满足 §5.5.4 保留策略；段内截断复杂度高而收益低 |
+| **快照保留份数** | 磁盘上保留**最新两份**快照文件，其余在每次 `save_snapshot` 后删除（目录 fsync） | 只留最新一份 | 最新文件 CRC 损坏时需要回退到上一份（§5.5.3 第 3 步）；仅一份则只能 fail-start |
+| trailing 保留 | 压缩时保留 `to` 之前的段直到其字节量 ≤ `wal_trailing_keep`（与 `snapshot_threshold` 同值，Q6） | 压缩后立即全删 | 慢 follower 需要 trailing 追赶；超出则走快照传输 |
+| **（v0.2.10 落地范围）** | 本版 `compact(to)` 实现为**段粒度全删**（`to` 之前完全覆盖的段）；**字节级 trailing 窗口尚未接线**——`wal_trailing_keep` 只在 `ProfileConfig`，未进 `WalConfig`，慢 follower 一律走快照传输 | 本版即接字节保留 | 保留窗口是空间/带宽的优化而非正确性条件：删段后落后 follower 由 `Compacted` 路径拉快照，语义不变。接线需把 `wal_trailing_keep` 下沉到 `WalConfig`，随 M2 追赶测试一并做 |
+
+落点：§5.5.3 第 3/5 步、§5.5.4；实现 `arachne/src/storage/snapshot.rs`（新）、`meta.rs`、`wal.rs`。
 
 ---
 
@@ -440,6 +456,9 @@ Lease Read 留 v2，显式记录其前提：配置化的时钟偏移上限 + 安
 - **创建**（v1 全内存状态机）：持 apply 锁、阻塞 apply，序列化 → tmp → fsync → rename → 目录 fsync → 更新 meta → 方可压缩 WAL。阻塞时长与数据量线性；**v0.2.1 决议 Q4：接受阻塞方案，`snapshot_last_duration > 1s` 触发告警（§8.2）；数据量逼近内存上限时 v1.1 重审双缓冲/持久结构**。
 - **安装**（follower）：流式分片 → tmp 聚合 → CRC → fsync → rename → apply 锁内原子替换内存状态机 → 更新 applied index/term/ConfState → 回执。安装期间本地读短暂返回 `Busy`。
 - **保留策略**：快照成功后删除 `first_index` 之前的 WAL 段，保留 trailing 供慢 follower 追赶；**v0.2.1 决议 Q6：`wal_trailing_keep` 与 `snapshot_threshold` 绑定同值（Lan 64 MB / Wan 16 MB，可显式覆盖解耦）**；落后超出 trailing → 快照传输（`Compacted` 路径）。
+- **（v0.2.10 落地范围）** 快照文件本身保留最新两份（防最新一份 CRC 损坏导致 fail-start）；WAL 侧实现段粒度全删，**字节级 trailing 窗口留待接线**（见 §M 表末行）。
+- **顺序**：`save_snapshot` 先落快照文件（fsync + 目录 fsync），再更新 META 指针（原子写），最后删旧快照文件；调用方只有在 `save_snapshot` 返回后才可 `compact`。**压缩绝不删除未被快照覆盖的条目**——`compact(to)` 在快照缺失或 `snapshot.index < to` 时返回 `Unrecoverable`（fail-start）而非降级删除。
+- **恢复时的水位**：载入快照即令 `first_index = snapshot.index + 1`（快照对其及更早的条目是权威视图），WAL 中仍物理存在的更早段在下一次 `compact` 时回收。
 - **与 lagging follower 的交互**：压缩不等待任何 follower；追赶不上的 follower 一律走快照路径，leader 始终保留最新一份快照。
 
 ### 5.6 传输与安全
@@ -695,8 +714,8 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 | Q6 | `wal_trailing_keep` 是否与 `snapshot_threshold` 解耦 | 绑定同值简化运维，出现慢 follower 快照风暴证据再解耦 | §5.5.4、§7 | M2 追赶测试 |
 | Q7 | 提案队列按字节还是按条数计 | 按字节（64MB），对大值更稳 | §4.1、§7 | M1 压测 |
 
-**截至 v0.2.9 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J/L 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
+**截至 v0.2.10 无未决设计问题。** §12 假设与 §13 风险为需在实现与运维期持续监视的事项，不属于开放设计决策；推翻任何锁定决议须按 §11 的决策记录格式约定追加 rev 条目（上游 D/E/F/G/H/I/J/L/M 系列，test-plan 的 D-T/D-L/D-ART/D-ART-rev1/S 系列）。
 
 ---
 
-*v0.2.9 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.10 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*

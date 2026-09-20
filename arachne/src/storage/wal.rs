@@ -50,6 +50,7 @@
 //! `last_index + 1` at the time of creation).
 
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,9 +64,19 @@ use crate::storage::format::{
     RecordType, MAX_RECORD_BYTES,
 };
 use crate::storage::meta::{read_meta, write_meta, fsync_dir, Meta, FORMAT_VERSION};
+use crate::storage::snapshot::{
+    decode_snapshot, encode_snapshot, parse_snapshot_file_name, snapshot_file_name,
+};
 use crate::storage::segment::{
     parse_segment_name, segment_path, Segment, DEFAULT_SEGMENT_BYTES,
 };
+
+/// How many snapshot files to retain on disk.
+///
+/// The newest is the live snapshot; the runner-up exists so that `open` can
+/// fall back to it when the newest file fails its CRC check. Older files are
+/// superseded by the compaction watermark and only waste space.
+const SNAPSHOT_RETENTION: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -209,8 +220,18 @@ pub struct WalStorage {
     /// The highest Entry index physically present in the active segment.
     /// 0 if the segment holds no Entry yet.
     max_entry_in_segment: LogIndex,
-    /// The in-memory log entries (contiguous, 1-based indices).
+    /// The in-memory log entries: contiguous, starting at
+    /// `compacted_to + 1` (or later, then trimmed at open).
     entries: Vec<LogEntry>,
+    /// The index the log has been compacted through (0 = nothing compacted).
+    /// `first_index() == compacted_to + 1`.
+    compacted_to: LogIndex,
+    /// The persisted snapshot, if any (loaded at open, written by
+    /// [`WalStorage::save_snapshot`]).
+    snapshot: Option<Snapshot>,
+    /// The META record as loaded, kept so `save_snapshot` can update the
+    /// snapshot pointer without re-reading the file.
+    meta: Meta,
     /// The current hard state.
     hard_state: HardState,
     /// Whether there are unfsynced entries since the last real entry fsync.
@@ -276,21 +297,59 @@ impl WalStorage {
 
         // Step 2: read and validate META.
         let mut stats = StorageStats::default();
-        let _meta = Self::recover_meta(dir, &opts, &mut stats)?;
+        let meta = Self::recover_meta(dir, &opts, &mut stats)?;
 
-        // Step 3: (P2: no snapshot loading; M2 adds it.)
-
-        // Step 4: replay WAL segments.
-        let (entries, hard_state, truncated_records, dir_fsyncs_from_recovery) =
-            Self::recover_wal(dir)?;
+        // Step 3: load the newest valid snapshot META names (propsol §5.5.3 step
+        // 3). A corrupt newest snapshot falls back to an earlier one; if META
+        // names a snapshot but none can be loaded, the WAL must still contain
+        // the whole log from index 1, else recovery cannot be complete.
+        let mut snapshot = Self::load_snapshot(dir, meta.snapshot_index)?;
+        let mut compacted_to = snapshot.as_ref().map(|s| s.meta.index).unwrap_or(0);
+        let (mut entries, hard_state, truncated_records, dir_fsyncs_from_recovery) =
+            Self::recover_wal(dir, compacted_to)?;
         stats.wal_truncated_records = truncated_records;
         stats.dir_fsyncs += dir_fsyncs_from_recovery;
 
-        // Step 5: verify index continuity.
+        if meta.snapshot_index != 0 && snapshot.is_none() {
+            let first = entries.first().map(|e| e.index).unwrap_or(1);
+            if first != 1 {
+                return Err(StorageError::Unrecoverable {
+                    detail: format!(
+                        "META names a snapshot at index {} but no valid snapshot file \
+                         could be loaded and the WAL starts at index {first}",
+                        meta.snapshot_index
+                    ),
+                });
+            }
+            // No snapshot after all: recover as a plain (non-compacted) log.
+            compacted_to = 0;
+        }
+
+        // Step 5: verify index continuity within the retained set and that the
+        // retained entries meet the snapshot with no gap.
         Self::verify_continuity(&entries)?;
+        if let Some(first) = entries.first().map(|e| e.index)
+            && first > compacted_to + 1
+        {
+            return Err(StorageError::Unrecoverable {
+                detail: format!(
+                    "gap between the snapshot (index {compacted_to}) and the first \
+                     retained entry (index {first})"
+                ),
+            });
+        }
+        // Entries at or below the snapshot are covered by it; drop them from the
+        // in-memory cache (propsol §5.5.3 step 5: rebuild from `S.index + 1`).
+        entries.retain(|e| e.index > compacted_to);
+        if snapshot.is_none() {
+            snapshot = None;
+        }
 
         // Step 6: assert commit <= last_entry_index (unconditional).
-        let last_entry_index = entries.last().map(|e| e.index).unwrap_or(0);
+        let last_entry_index = entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(compacted_to);
         if hard_state.commit > last_entry_index {
             return Err(StorageError::Unrecoverable {
                 detail: format!(
@@ -330,6 +389,9 @@ impl WalStorage {
             segment_first_index: active_first_index,
             max_entry_in_segment,
             entries,
+            compacted_to,
+            snapshot,
+            meta,
             hard_state,
             pending_entry_fsync: false,
             fsync_policy: opts.config.fsync_policy,
@@ -404,6 +466,8 @@ impl WalStorage {
                 node_id: opts.node_id.clone(),
                 format_version: FORMAT_VERSION,
                 created_at: opts.created_at_millis,
+                snapshot_index: 0,
+                snapshot_term: 0,
             };
             write_meta(dir, &meta).map_err(|e| StorageError::Unrecoverable {
                 detail: format!("failed to write META: {e}"),
@@ -415,6 +479,7 @@ impl WalStorage {
 
     fn recover_wal(
         dir: &Path,
+        compacted_to: LogIndex,
     ) -> Result<(Vec<LogEntry>, HardState, u64, u64), StorageError> {
         let segment_indices = list_segment_indices(dir).map_err(StorageError::Io)?;
         let last_segment_idx = segment_indices.len().saturating_sub(1);
@@ -462,10 +527,13 @@ impl WalStorage {
                         });
                     }
                     // Tear in the last segment: apply the commit-window check.
-                    // M2: at M2, estimated_index must derive from the first
-                    // retained index (after snapshot/compaction), not from
-                    // entries.len() + 1.
-                    let estimated_index = entries.len() as LogIndex + 1;
+                    // The estimated index of the torn record: one past the
+                    // last entry actually replayed (or one past the snapshot
+                    // when nothing was replayed yet).
+                    let estimated_index = entries
+                        .last()
+                        .map(|e| e.index + 1)
+                        .unwrap_or(compacted_to + 1);
                     if estimated_index <= hard_state.commit + 1 {
                         return Err(StorageError::Unrecoverable {
                             detail: format!(
@@ -543,11 +611,18 @@ impl WalStorage {
         Ok((entries, hard_state, truncated_records, dir_fsyncs))
     }
 
-    // M2: at M2, verify_continuity must derive `expected` from the first
-    // retained index (after snapshot/compaction), not from position + 1.
+    /// Verify the retained entries are contiguous, starting from the first one.
+    ///
+    /// After compaction the first retained index is no longer 1 (and trailing
+    /// retention may even keep entries at or below the snapshot), so contiguity
+    /// is checked relative to `entries[0]`; the caller additionally verifies
+    /// that the retained set meets the snapshot without a gap.
     fn verify_continuity(entries: &[LogEntry]) -> Result<(), StorageError> {
+        let Some(first) = entries.first().map(|e| e.index) else {
+            return Ok(());
+        };
         for (i, entry) in entries.iter().enumerate() {
-            let expected = (i + 1) as LogIndex;
+            let expected = first + i as LogIndex;
             if entry.index != expected {
                 return Err(StorageError::Unrecoverable {
                     detail: format!(
@@ -558,6 +633,41 @@ impl WalStorage {
             }
         }
         Ok(())
+    }
+
+    /// Load the newest valid snapshot META names, falling back to an earlier one
+    /// when the newest is corrupt (propsol §5.5.3 step 3).
+    ///
+    /// A META pointer of 0 means "no snapshot": snapshot files are ignored, which
+    /// is what makes a crash between renaming the snapshot file and updating META
+    /// safe (the WAL is still complete, because compaction happens after the META
+    /// update).
+    fn load_snapshot(dir: &Path, expected_index: LogIndex) -> Result<Option<Snapshot>, StorageError> {
+        if expected_index == 0 {
+            return Ok(None);
+        }
+        let mut candidates: Vec<(LogIndex, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(dir).map_err(StorageError::Io)? {
+            let entry = entry.map_err(StorageError::Io)?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some((index, _term)) = parse_snapshot_file_name(&name)
+                && index <= expected_index
+            {
+                candidates.push((index, entry.path()));
+            }
+        }
+        // Newest first, so the fallback walks backwards through history.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        for (index, path) in candidates {
+            let bytes = fs::read(&path).map_err(StorageError::Io)?;
+            if let Ok(snapshot) = decode_snapshot(&bytes)
+                && snapshot.meta.index == index
+            {
+                return Ok(Some(snapshot));
+            }
+            // A corrupt or mislabelled file: fall back to the next candidate.
+        }
+        Ok(None)
     }
 
     // ---- Rollover helper ----
@@ -785,6 +895,33 @@ impl WalStorage {
             discarded_entries: discarded,
         })
     }
+    /// Delete all but the newest [`SNAPSHOT_RETENTION`] snapshot files.
+    ///
+    /// One older snapshot is kept so that open can fall back when the newest
+    /// file is found corrupt. A fallback is only usable if the WAL still
+    /// covers the gap; otherwise recovery fails loudly rather than silently
+    /// losing entries.
+    fn prune_snapshots(&self) -> Result<(), StorageError> {
+        let mut candidates: Vec<(LogIndex, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(&self.data_dir).map_err(StorageError::Io)? {
+            let entry = entry.map_err(StorageError::Io)?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some((index, _term)) = parse_snapshot_file_name(&name) {
+                candidates.push((index, entry.path()));
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut removed = false;
+        for (_index, path) in candidates.into_iter().skip(SNAPSHOT_RETENTION) {
+            fs::remove_file(&path).map_err(StorageError::Io)?;
+            removed = true;
+        }
+        if removed {
+            fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -808,9 +945,9 @@ impl Storage for WalStorage {
         if low >= high {
             return Ok(Vec::new());
         }
-        // M2: at M2, `first` must derive from the first retained index.
-        let first = self.entries.first().map(|e| e.index).unwrap_or(1);
-        let last = self.entries.last().map(|e| e.index).unwrap_or(0);
+        // Entries at or below the compaction watermark live in the snapshot.
+        let first = self.compacted_to + 1;
+        let last = self.last_index()?;
         if low < first {
             return Err(StorageError::Compacted);
         }
@@ -837,26 +974,38 @@ impl Storage for WalStorage {
     }
 
     fn term(&self, index: LogIndex) -> Result<Term, StorageError> {
-        let first = self.entries.first().map(|e| e.index).unwrap_or(1);
-        let last = self.entries.last().map(|e| e.index).unwrap_or(0);
-        if index < first || index > last {
+        let first = self.compacted_to + 1;
+        if index < first {
+            // raft asks for the term at the snapshot index when it has one;
+            // anything older is genuinely compacted.
+            if let Some(snapshot) = &self.snapshot
+                && index == snapshot.meta.index
+            {
+                return Ok(snapshot.meta.term);
+            }
+            return Err(StorageError::Compacted);
+        }
+        let last = self.last_index()?;
+        if index > last {
             return Err(StorageError::Compacted);
         }
         Ok(self.entries[(index - first) as usize].term)
     }
 
     fn first_index(&self) -> Result<LogIndex, StorageError> {
-        // M2: at M2, this must derive from the first retained index.
-        Ok(self.entries.first().map(|e| e.index).unwrap_or(1))
+        Ok(self.compacted_to + 1)
     }
 
     fn last_index(&self) -> Result<LogIndex, StorageError> {
-        Ok(self.entries.last().map(|e| e.index).unwrap_or(0))
+        Ok(self
+            .entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(self.compacted_to))
     }
 
     fn snapshot(&self) -> Result<Option<Snapshot>, StorageError> {
-        // P2: no snapshots.
-        Ok(None)
+        Ok(self.snapshot.clone())
     }
 
     fn append(&mut self, entries: &[LogEntry]) -> Result<(), StorageError> {
@@ -979,11 +1128,104 @@ impl Storage for WalStorage {
         Ok(())
     }
 
-    fn compact(&mut self, _compact_to: LogIndex) -> Result<(), StorageError> {
-        // P2: compaction is not yet implemented.
-        Err(StorageError::Unrecoverable {
-            detail: "compaction is not implemented in P2 (lands in M2)".into(),
-        })
+    /// Persist `snapshot` and point META at it.
+    ///
+    /// File protocol: write `*.snap.tmp` → fsync → rename to `*.snap` → fsync
+    /// the data dir; then rewrite META (its own atomic protocol) with the new
+    /// snapshot pointer. The directory scan at open is the authority, so a
+    /// crash between the two steps leaves a usable, if unadvertised, snapshot.
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError> {
+        if let Some(existing) = &self.snapshot
+            && existing.meta.index >= snapshot.meta.index
+        {
+            // Idempotent, and never move the snapshot backwards.
+            return Ok(());
+        }
+
+        let name = snapshot_file_name(snapshot.meta.index, snapshot.meta.term);
+        let final_path = self.data_dir.join(&name);
+        let tmp_path = self.data_dir.join(format!("{name}.tmp"));
+        let blob = encode_snapshot(snapshot);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(StorageError::Io)?;
+        file.write_all(&blob).map_err(StorageError::Io)?;
+        // I3: the snapshot bytes must be durable before the rename makes the
+        // file visible, and before META ever points at it.
+        file.sync_all().map_err(StorageError::Io)?;
+        drop(file);
+        fs::rename(&tmp_path, &final_path).map_err(StorageError::Io)?;
+        fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
+
+        let mut meta = self.meta.clone();
+        meta.snapshot_index = snapshot.meta.index;
+        meta.snapshot_term = snapshot.meta.term;
+        write_meta(&self.data_dir, &meta).map_err(|e| StorageError::Unrecoverable {
+            detail: format!("failed to persist the snapshot pointer in META: {e}"),
+        })?;
+        self.meta = meta;
+        self.snapshot = Some(snapshot.clone());
+
+        self.prune_snapshots()?;
+        Ok(())
+    }
+
+    fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError> {
+        if compact_to <= self.compacted_to {
+            return Ok(()); // already compacted at least this far
+        }
+        let last = self.last_index()?;
+        if compact_to > last {
+            return Err(StorageError::Unrecoverable {
+                detail: format!("compact_to ({compact_to}) > last_index ({last})"),
+            });
+        }
+        // Never drop entries nothing covers: a snapshot at or beyond the
+        // watermark must already be durable (propsol §5.5.4: snapshot first,
+        // then compact).
+        match &self.snapshot {
+            Some(snapshot) if snapshot.meta.index >= compact_to => {}
+            Some(snapshot) => {
+                return Err(StorageError::Unrecoverable {
+                    detail: format!(
+                        "compact_to ({compact_to}) is beyond the snapshot index ({})",
+                        snapshot.meta.index
+                    ),
+                });
+            }
+            None => {
+                return Err(StorageError::Unrecoverable {
+                    detail: "compact called with no durable snapshot".into(),
+                });
+            }
+        }
+
+        // Delete every segment **wholly** below the watermark. A segment is
+        // wholly below iff its successor starts at or before `compact_to + 1`;
+        // the loop only ever considers segments that have a successor, so the
+        // active segment is never removed.
+        let keep_from = compact_to + 1;
+        let indices = list_segment_indices(&self.data_dir).map_err(StorageError::Io)?;
+        let mut removed = 0u32;
+        for window in indices.windows(2) {
+            let (this, next) = (window[0], window[1]);
+            if next <= keep_from && this != self.segment_first_index {
+                fs::remove_file(segment_path(&self.data_dir, this)).map_err(StorageError::Io)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
+        }
+
+        // The snapshot covers everything at or below the watermark.
+        self.entries.retain(|e| e.index > compact_to);
+        self.compacted_to = compact_to;
+        Ok(())
     }
 }
 
@@ -1061,6 +1303,7 @@ fn seam_entry_type_to_u8(ety: arachne_seam::storage::EntryType) -> u8 {
 mod tests {
     use super::*;
     use crate::storage::segment_name;
+    use arachne_seam::storage::SnapshotMeta;
     use std::fs;
 
     /// Create a unique temp directory for a test.
@@ -1606,6 +1849,311 @@ mod tests {
         let opts = test_opts();
         let storage = WalStorage::open(&dir, opts).unwrap();
         assert_eq!(storage.snapshot().unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- snapshots and compaction (propsol v0.2.10 §M) ----
+
+    fn make_snapshot(index: LogIndex, term: Term, data: &[u8]) -> Snapshot {
+        Snapshot {
+            meta: SnapshotMeta {
+                index,
+                term,
+                conf_state: ConfState {
+                    voters: vec![1, 2, 3],
+                    learners: vec![],
+                },
+            },
+            data: data.to_vec(),
+        }
+    }
+
+    /// Snapshot files present in `dir`, sorted by index.
+    fn snapshot_files(dir: &Path) -> Vec<LogIndex> {
+        let mut found: Vec<LogIndex> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| parse_snapshot_file_name(&e.file_name().to_string_lossy()))
+            .map(|(index, _term)| index)
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn save_snapshot_survives_reopen_and_raises_the_watermark() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+            storage
+                .append(&[
+                    make_entry(1, 1, b"a"),
+                    make_entry(2, 1, b"b"),
+                    make_entry(3, 1, b"c"),
+                    make_entry(4, 1, b"d"),
+                    make_entry(5, 1, b"e"),
+                ])
+                .unwrap();
+            storage.sync_entries().unwrap();
+            storage
+                .save_snapshot(&make_snapshot(3, 1, b"state@3"))
+                .unwrap();
+
+            assert_eq!(snapshot_files(&dir), vec![3]);
+            assert_eq!(storage.snapshot().unwrap().unwrap().data, b"state@3");
+        }
+
+        // Reopen: the snapshot is loaded and is authoritative for everything
+        // at or below its index, so the log's window starts above it.
+        let storage = WalStorage::open(&dir, opts).unwrap();
+        let snapshot = storage.snapshot().unwrap().expect("snapshot survives reopen");
+        assert_eq!(snapshot.meta.index, 3);
+        assert_eq!(snapshot.data, b"state@3");
+        assert_eq!(storage.first_index().unwrap(), 4);
+        assert_eq!(storage.last_index().unwrap(), 5);
+        assert_eq!(storage.term(3).unwrap(), 1);
+        assert!(matches!(storage.term(2), Err(StorageError::Compacted)));
+        assert!(matches!(
+            storage.entries(1, 4, None),
+            Err(StorageError::Compacted)
+        ));
+        let replayed = storage.entries(4, 6, None).unwrap();
+        assert_eq!(
+            replayed.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_drops_entries_and_answers_term_at_the_snapshot_index() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+                make_entry(4, 1, b"d"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+        storage
+            .save_snapshot(&make_snapshot(3, 1, b"state@3"))
+            .unwrap();
+        storage.compact(3).unwrap();
+
+        assert_eq!(storage.first_index().unwrap(), 4);
+        assert_eq!(storage.last_index().unwrap(), 4);
+        // raft must be able to ask for the term at the snapshot index.
+        assert_eq!(storage.term(3).unwrap(), 1);
+        assert!(matches!(
+            storage.term(2),
+            Err(StorageError::Compacted)
+        ));
+        assert!(matches!(
+            storage.entries(3, 5, None),
+            Err(StorageError::Compacted)
+        ));
+        let kept = storage.entries(4, 5, None).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].index, 4);
+
+        // Idempotent: compacting to or below the watermark is a no-op.
+        storage.compact(3).unwrap();
+        storage.compact(1).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_after_restart_uses_the_reloaded_snapshot() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+            storage
+                .append(&[
+                    make_entry(1, 1, b"a"),
+                    make_entry(2, 1, b"b"),
+                    make_entry(3, 1, b"c"),
+                ])
+                .unwrap();
+            storage.sync_entries().unwrap();
+            storage
+                .save_snapshot(&make_snapshot(2, 1, b"state@2"))
+                .unwrap();
+        }
+        let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+        storage.compact(2).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 3);
+        assert_eq!(storage.term(2).unwrap(), 1);
+        drop(storage);
+
+        // The watermark is durable: a second reopen sees the compacted view.
+        let storage = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 3);
+        assert_eq!(storage.last_index().unwrap(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_requires_a_covering_snapshot() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        storage
+            .append(&[make_entry(1, 1, b"a"), make_entry(2, 1, b"b")])
+            .unwrap();
+        storage.sync_entries().unwrap();
+
+        // No snapshot at all.
+        assert!(matches!(
+            storage.compact(1),
+            Err(StorageError::Unrecoverable { .. })
+        ));
+        // A snapshot that does not cover the watermark.
+        storage
+            .save_snapshot(&make_snapshot(1, 1, b"state@1"))
+            .unwrap();
+        assert!(matches!(
+            storage.compact(2),
+            Err(StorageError::Unrecoverable { .. })
+        ));
+        // Beyond the end of the log.
+        assert!(matches!(
+            storage.compact(9),
+            Err(StorageError::Unrecoverable { .. })
+        ));
+        assert_eq!(storage.first_index().unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_snapshot_never_moves_backwards() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+        storage
+            .save_snapshot(&make_snapshot(2, 1, b"state@2"))
+            .unwrap();
+        storage
+            .save_snapshot(&make_snapshot(1, 1, b"state@1"))
+            .unwrap();
+
+        let snapshot = storage.snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.meta.index, 2);
+        assert_eq!(snapshot.data, b"state@2");
+        assert_eq!(snapshot_files(&dir), vec![2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_deletes_only_segments_wholly_below_the_watermark() {
+        let dir = temp_dir();
+        // A tiny segment budget forces one segment per entry.
+        let opts = test_opts_with_segment_bytes(1);
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        for index in 1..=6 {
+            storage.append(&[make_entry(index, 1, b"x")]).unwrap();
+            storage.sync_entries().unwrap();
+        }
+        let before = list_segment_indices(&dir).unwrap();
+        assert!(before.len() > 2, "expected several segments, got {before:?}");
+
+        storage
+            .save_snapshot(&make_snapshot(4, 1, b"state@4"))
+            .unwrap();
+        storage.compact(4).unwrap();
+
+        // Only segments that begin at or before 4 are covered by the snapshot;
+        // later segments must survive.
+        let after = list_segment_indices(&dir).unwrap();
+        assert_eq!(after, vec![5, 6]);
+        assert!(before.len() > after.len());
+        assert_eq!(storage.last_index().unwrap(), 6);
+        let kept = storage.entries(5, 7, None).unwrap();
+        assert_eq!(kept.len(), 2);
+
+        // And the trimmed segments are not resurrected by a reopen.
+        drop(storage);
+        let storage = WalStorage::open(&dir, test_opts_with_segment_bytes(1)).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 5);
+        assert_eq!(storage.last_index().unwrap(), 6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_snapshot_prunes_all_but_the_newest_two() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+                make_entry(4, 1, b"d"),
+                make_entry(5, 1, b"e"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+        for index in [2, 3, 4, 5] {
+            storage
+                .save_snapshot(&make_snapshot(index, 1, b"state"))
+                .unwrap();
+        }
+        // Newest two survive; superseded files are gone.
+        assert_eq!(snapshot_files(&dir), vec![4, 5]);
+        assert_eq!(storage.snapshot().unwrap().unwrap().meta.index, 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_newest_snapshot_falls_back_to_the_previous_one() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+            storage
+                .append(&[
+                    make_entry(1, 1, b"a"),
+                    make_entry(2, 1, b"b"),
+                    make_entry(3, 1, b"c"),
+                ])
+                .unwrap();
+            storage.sync_entries().unwrap();
+            storage
+                .save_snapshot(&make_snapshot(1, 1, b"state@1"))
+                .unwrap();
+            storage
+                .save_snapshot(&make_snapshot(3, 1, b"state@3"))
+                .unwrap();
+        }
+        let newest = dir.join(snapshot_file_name(3, 1));
+        let mut bytes = fs::read(&newest).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF; // corrupt the trailing CRC
+        fs::write(&newest, &bytes).unwrap();
+
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        let snapshot = storage.snapshot().unwrap().expect("falls back");
+        assert_eq!(snapshot.meta.index, 1);
+        assert_eq!(snapshot.data, b"state@1");
+        // META still points at the corrupt file, so the watermark must come
+        // from the snapshot actually loaded.
+        storage.compact(1).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

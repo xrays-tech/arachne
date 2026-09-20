@@ -9,7 +9,14 @@
 //! [u16 cluster_id_len LE][cluster_id bytes]
 //! [u16 node_id_len LE][node_id bytes]
 //! [u64 created_at_millis LE]
+//! [u64 snapshot_index LE][u64 snapshot_term LE]   <- optional payload extension
 //! ```
+//!
+//! The trailing snapshot pointer (propsol v0.2.10 M) is an *extension* within
+//! the same `format_version`: a file written before it was added simply ends
+//! after `created_at_millis` and decodes with a zero pointer, and a reader that
+//! predates it ignores the extra bytes (the decoder here never requires the
+//! payload to end at a particular offset).
 //!
 //! * `magic` — the constant [`META_MAGIC`], used to detect a valid META file.
 //! * `format_version` — the WAL format major version ([`FORMAT_VERSION`]).
@@ -33,6 +40,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use arachne_seam::types::{LogIndex, Term};
+
 use crate::storage::crc32c::crc32c;
 
 /// The current WAL format major version.
@@ -52,6 +61,13 @@ pub struct Meta {
     pub format_version: u32,
     /// The creation timestamp in milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// The index of the snapshot this directory's log has been compacted to
+    /// (0 = no snapshot). Written after the snapshot file is durable, so it is
+    /// the single-point record of the currently effective snapshot; recovery
+    /// still validates it against the snapshot file itself.
+    pub snapshot_index: LogIndex,
+    /// The term of that snapshot (0 = no snapshot).
+    pub snapshot_term: Term,
 }
 
 /// Errors from META file operations.
@@ -110,13 +126,16 @@ fn encode_meta(meta: &Meta) -> Vec<u8> {
     let node_bytes = meta.node_id.as_bytes();
 
     // Payload: [u16 cluster_len][cluster][u16 node_len][node][u64 created_at]
-    let payload_len = 2 + cluster_bytes.len() + 2 + node_bytes.len() + 8;
+    //          [u64 snapshot_index][u64 snapshot_term]  (extension, v0.2.10 M)
+    let payload_len = 2 + cluster_bytes.len() + 2 + node_bytes.len() + 8 + 16;
     let mut payload = Vec::with_capacity(payload_len);
     payload.extend_from_slice(&(cluster_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(cluster_bytes);
     payload.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(node_bytes);
     payload.extend_from_slice(&meta.created_at.to_le_bytes());
+    payload.extend_from_slice(&meta.snapshot_index.to_le_bytes());
+    payload.extend_from_slice(&meta.snapshot_term.to_le_bytes());
 
     let crc = crc32c(&payload);
 
@@ -175,11 +194,25 @@ fn decode_meta(buf: &[u8]) -> Result<Meta, MetaError> {
     let created_at_offset = node_offset + 2 + node_len;
     let created_at = le64_at(payload, created_at_offset)?;
 
+    // Optional trailing snapshot pointer: a META written before v0.2.10 ends
+    // right after `created_at`, which decodes as "no snapshot".
+    let pointer_offset = created_at_offset + 8;
+    let (snapshot_index, snapshot_term) = if payload.len() >= pointer_offset + 16 {
+        (
+            le64_at(payload, pointer_offset)?,
+            le64_at(payload, pointer_offset + 8)?,
+        )
+    } else {
+        (0, 0)
+    };
+
     Ok(Meta {
         cluster_id,
         node_id,
         format_version,
         created_at,
+        snapshot_index,
+        snapshot_term,
     })
 }
 
@@ -282,6 +315,8 @@ mod tests {
             node_id: "node-1".into(),
             format_version: FORMAT_VERSION,
             created_at: 1_700_000_000_000,
+            snapshot_index: 0,
+            snapshot_term: 0,
         }
     }
 
@@ -313,10 +348,44 @@ mod tests {
             node_id: String::new(),
             format_version: 1,
             created_at: 0,
+            snapshot_index: 0,
+            snapshot_term: 0,
         };
         let blob = encode_meta(&meta);
         let decoded = decode_meta(&blob).unwrap();
         assert_eq!(decoded, meta);
+    }
+
+    /// The snapshot pointer is an optional payload extension (v0.2.10 M): a
+    /// non-zero pointer round-trips, and a META written before the extension
+    /// (payload ending at `created_at`) decodes as "no snapshot".
+    #[test]
+    fn snapshot_pointer_roundtrips_and_old_files_decode_as_none() {
+        let mut meta = test_meta();
+        meta.snapshot_index = 42;
+        meta.snapshot_term = 7;
+        let blob = encode_meta(&meta);
+        assert_eq!(decode_meta(&blob).unwrap(), meta);
+
+        // Truncate the payload back to the pre-extension layout and fix the CRC.
+        let stale = Meta {
+            snapshot_index: 0,
+            snapshot_term: 0,
+            ..meta.clone()
+        };
+        let mut body = encode_meta(&stale);
+        // Drop the 16-byte pointer from the payload (the last 16 payload bytes,
+        // which sit just before the 4-byte CRC).
+        // Drop the trailing 16-byte pointer and re-stamp the header CRC (META's
+        // CRC lives at offset 8, over the payload at 12.. — not trailing).
+        let n = body.len();
+        body.truncate(n - 16);
+        let crc = crc32c(&body[12..]);
+        body[8..12].copy_from_slice(&crc.to_le_bytes());
+        let decoded = decode_meta(&body).expect("a pre-extension META must decode");
+        assert_eq!(decoded.snapshot_index, 0);
+        assert_eq!(decoded.snapshot_term, 0);
+        assert_eq!(decoded.cluster_id, meta.cluster_id);
     }
 
     #[test]
@@ -338,6 +407,8 @@ mod tests {
             node_id: "node-2".into(),
             format_version: FORMAT_VERSION,
             created_at: 2_000_000_000_000,
+            snapshot_index: 0,
+            snapshot_term: 0,
         };
         write_meta(&dir, &meta2).unwrap();
         let read_back = read_meta(&dir).unwrap();
