@@ -26,6 +26,11 @@
 //! The runtime is **generic over the transport** (`T`/`Tr`) so the same actor
 //! drives the in-memory transport in tests and the tonic transport in
 //! production; it names no concrete transport type.
+//!
+//! The actor performs blocking durable-storage I/O (`fsync`), so production
+//! runs it on a **dedicated OS thread** ([`Runtime::spawn_dedicated`]) rather
+//! than on a shared async worker thread; `run` stays available for embedders
+//! and tests that want to place it themselves.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1080,5 +1085,73 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// The highest applied log index (as reported by the apply task).
     pub fn applied_index(&self) -> LogIndex {
         self.applied_index
+    }
+}
+
+/// A [`Runtime`] running on its own OS thread.
+pub struct RuntimeThread {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RuntimeThread {
+    /// Wait for the actor to stop (it stops when its inbound stream and command
+    /// channel close, or on a fail-stop).
+    pub fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RuntimeThread {
+    fn drop(&mut self) {
+        // Detached on drop: dropping the join handle leaves the thread running,
+        // which is what an embedder that keeps its `Handle`s wants. Joining here
+        // would block the (usually async) caller.
+        self.handle.take();
+    }
+}
+
+impl<T, Tr> Runtime<T, Tr>
+where
+    T: Transport + Send + 'static,
+    Tr: TransportRx + Send + 'static,
+{
+    /// Run this actor on a **dedicated OS thread** with its own current-thread
+    /// runtime.
+    ///
+    /// The consensus loop performs blocking durable-storage I/O: every
+    /// `sync_entries` and every `set_hard_state` is a real `fsync` of a segment
+    /// (and META updates flush the directory too). A full-durability flush of a
+    /// device costs milliseconds, and running the loop as a task on a shared
+    /// tokio runtime parks those flushes on worker threads that the transport
+    /// and client tasks also need — so a write storm starves unrelated work
+    /// (measured: ~10ms per flush, with everything client-facing queueing behind
+    /// it).
+    ///
+    /// Blocking I/O belongs on its own thread: this keeps the async runtime for
+    /// what it is good at (network and client work) while the actor keeps its
+    /// synchronous storage seam. It does **not** remove the actor's own
+    /// serialization on durability — a read still waits for the flush the actor
+    /// is currently inside — so this bounds *worker* starvation, not the
+    /// per-flush latency (see the handoff: group commit is the separate change
+    /// for that).
+    pub fn spawn_dedicated(self) -> Result<RuntimeThread, std::io::Error> {
+        let name = format!("arachne-consensus-{}", self.self_node);
+        let handle = std::thread::Builder::new().name(name).spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                // Without a runtime the actor cannot run at all; it stops, and
+                // the node's `shutdown` join observes the thread ending.
+                Err(_) => return,
+            };
+            runtime.block_on(self.run());
+        })?;
+        Ok(RuntimeThread {
+            handle: Some(handle),
+        })
     }
 }

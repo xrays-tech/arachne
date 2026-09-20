@@ -66,7 +66,7 @@ pub mod storage;
 
 pub use client::ArachneError;
 pub use metrics::Metrics;
-pub use runtime::{Command, Runtime, RuntimeConfig};
+pub use runtime::{Command, Runtime, RuntimeConfig, RuntimeThread};
 
 pub use arachne_seam::seam;
 pub use arachne_seam::types;

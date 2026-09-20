@@ -82,7 +82,7 @@ pub struct Arachne {
     /// The tonic transport factory; [`Arachne::shutdown`] stops its server and
     /// closes the inbound channels before the runtime actor is aborted.
     factory: TonicTransportFactory,
-    task: tokio::task::JoinHandle<()>,
+    task: arachne::RuntimeThread,
     handle: Handle,
     metrics: Arc<Metrics>,
 }
@@ -164,7 +164,11 @@ impl Arachne {
             }
         };
 
-        let task = tokio::spawn(runtime.run());
+        // The actor does blocking `fsync`s, so it gets its own OS thread
+        // instead of a shared tokio worker (see `Runtime::spawn_dedicated`).
+        let task = runtime
+            .spawn_dedicated()
+            .map_err(|e| NodeError::Runtime(format!("cannot spawn the runtime thread: {e}")))?;
         Ok(Self {
             factory,
             task,
@@ -188,9 +192,11 @@ impl Arachne {
     /// `recv` resolves to `None`), then abort the runtime actor (dropping the
     /// WAL and releasing the dir lock).
     pub async fn shutdown(self) {
+        // Closing the factory closes the inbound stream, which ends the actor's
+        // loop; join its thread off the async workers so the WAL (and its data
+        // dir lock) is released before this returns.
         self.factory.shutdown().await;
-        self.task.abort();
-        let _ = self.task.await;
+        let _ = tokio::task::spawn_blocking(move || self.task.join()).await;
     }
 }
 
