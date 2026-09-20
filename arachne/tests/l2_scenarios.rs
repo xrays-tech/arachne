@@ -972,6 +972,10 @@ fn oracle_flags_injected_phantom_read() {
         "it must be tagged as a phantom violation: {}",
         report.render()
     );
+    assert!(
+        matches!(check_linearizable(&h, &KvState::new()), CheckOutcome::Violation { .. }),
+        "the checker must also reject the injected phantom"
+    );
 }
 
 /// A read of key `b` returning a value that was only ever written to key `a`
@@ -990,5 +994,8 @@ fn oracle_flags_cross_key_phantom_read() {
         "a cross-key read must be a phantom: {}",
         report.render()
     );
+    assert!(
+        matches!(check_linearizable(&h, &KvState::new()), CheckOutcome::Violation { .. }),
+        "the checker must also reject the cross-key phantom"
+    );
 }
-
