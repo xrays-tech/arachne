@@ -28,10 +28,6 @@ use tokio::time::Instant;
 use slog::Logger;
 use tokio::sync::{mpsc, oneshot};
 
-/// Approximate per-entry durable overhead (record header, type byte, and the
-/// index/term fields) used to size the snapshot trigger.
-const ENTRY_FRAMING_BYTES: u64 = 24;
-
 use crate::client::{ArachneError, Handle};
 use crate::consensus::{NodeError, RaftNode, RaftNodeConfig};
 use crate::metrics::Metrics;
@@ -40,6 +36,17 @@ use crate::state_machine::KvStateMachine;
 use crate::storage::WalStorage;
 use crate::{LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx};
 use arachne_seam::storage::{ConfState as SeamConfState, Storage as _};
+
+/// Approximate per-entry durable overhead (record header, type byte, and the
+/// index/term fields) used to size the snapshot trigger.
+const ENTRY_FRAMING_BYTES: u64 = 24;
+
+/// How often the physical WAL size is sampled for the `wal_bytes` metric.
+/// Sizing the log is a `read_dir` + `stat` walk, so it must not run on every
+/// drive cycle: under a write storm that would be thousands of syscalls a
+/// second, exactly when latency matters most. The snapshot *trigger* does not
+/// depend on this sample — it uses the logical growth counter.
+const WAL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A request from a client [`Handle`] to the node runtime.
 pub enum Command {
@@ -159,6 +166,9 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     /// Log growth that triggers a local snapshot and compaction
     /// (`snapshot_threshold`, propsol §7). 0 disables the trigger.
     snapshot_threshold_bytes: u64,
+    /// When the physical WAL size was last sampled (see
+    /// [`WAL_SAMPLE_INTERVAL`]).
+    last_wal_sample: Instant,
     /// Bytes of applied log written since the last snapshot — the trigger's
     /// input. This is the *logical* growth of the log, not the physical size
     /// of the segment files: v1 compacts whole segments, so a segment holding
@@ -253,6 +263,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             propose_timeout: Duration::from_millis(config.profile.election_timeout_ms.max(1)),
             voters,
             snapshot_threshold_bytes: config.profile.snapshot_threshold_bytes,
+            last_wal_sample: Instant::now(),
             bytes_since_snapshot: 0,
             snapshot_index,
         };
@@ -315,6 +326,9 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 return false;
             }
             self.snapshot_index = self.snapshot_index.max(snapshot.meta.index);
+            // The installed snapshot already covers everything applied so far,
+            // so the local trigger starts counting from here.
+            self.bytes_since_snapshot = 0;
             self.metrics.inc_snapshots_installed();
         }
 
@@ -363,12 +377,16 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// strictly newer than the one already covered.
     fn maybe_snapshot(&mut self) -> bool {
         let applied = self.sm.applied_index();
-        match self.node.log_bytes() {
-            Ok(bytes) => self.metrics.set_wal_bytes(bytes),
-            Err(e) => {
-                self.fail_all_pending(&format!("cannot size the durable log: {e}"));
-                self.metrics.set_is_leader(false);
-                return false;
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_wal_sample) >= WAL_SAMPLE_INTERVAL {
+            self.last_wal_sample = now;
+            match self.node.log_bytes() {
+                Ok(bytes) => self.metrics.set_wal_bytes(bytes),
+                Err(e) => {
+                    self.fail_all_pending(&format!("cannot size the durable log: {e}"));
+                    self.metrics.set_is_leader(false);
+                    return false;
+                }
             }
         }
 
