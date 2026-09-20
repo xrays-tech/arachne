@@ -166,6 +166,10 @@ impl TransportRx for InMemoryRx {
             waker: None,
         }
     }
+
+    fn try_recv(&mut self) -> Option<(NodeId, TransportMessage)> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 /// Non-blocking receive, for deterministic single-threaded harness loops that

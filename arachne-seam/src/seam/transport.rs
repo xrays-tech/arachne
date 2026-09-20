@@ -81,6 +81,21 @@ pub trait TransportRx: Send + 'static {
     /// Resolves to `Some((sender, message))` for each delivered message, or
     /// `None` when the transport is closed and drained.
     fn recv(&mut self) -> impl Future<Output = Option<(NodeId, TransportMessage)>> + Send;
+
+    /// Receive the next **already-queued** message without suspending.
+    ///
+    /// `None` means "nothing is queued right now" (or the transport is closed
+    /// and drained); it never blocks. The runtime uses this to fold everything
+    /// that has already arrived into one durability cycle, because each cycle
+    /// costs a real `fsync` and a burst of writes is therefore bounded by the
+    /// *number of cycles* rather than by the number of messages (propsol
+    /// v0.2.12 O).
+    ///
+    /// The default reports "nothing queued", which is always safe: a message it
+    /// declines to hand over is still delivered by [`recv`](TransportRx::recv).
+    fn try_recv(&mut self) -> Option<(NodeId, TransportMessage)> {
+        None
+    }
 }
 
 /// Mints the transport halves for a single node.

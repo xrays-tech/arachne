@@ -164,6 +164,15 @@ const READ_QUEUE_DEPTH: usize = MAX_PENDING_READS;
 /// write work, so a read flood cannot starve apply.
 const READ_BURST: usize = 64;
 
+/// How many already-queued events the actor folds into one durability cycle.
+///
+/// Every cycle costs two real `fsync`s — the entries, then the commit
+/// `HardState` — so under a write storm what the storm costs is the *number of
+/// cycles*, not the number of messages. Draining what has already arrived lets
+/// raft build a bigger `Ready` and lets several commit advances share one
+/// flush (propsol v0.2.12 O).
+const CYCLE_BURST: usize = 64;
+
 /// Committed entries for the apply task, in log order.
 ///
 /// An installed snapshot and the entries that follow it travel in **one**
@@ -549,8 +558,15 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             match outcome {
                 Outcome::Tick => self.node.tick(),
                 Outcome::Inbound(Some((from, msg))) => {
-                    if let Some(id) = self.node_to_raft.get(from.as_str()).copied() {
-                        let _ = self.node.on_message(id, msg);
+                    self.route_inbound(from, msg);
+                    // Fold the rest of the burst in: one cycle then carries a
+                    // bigger `Ready` and one flush can cover more work.
+                    for _ in 1..CYCLE_BURST {
+                        let next = self.node.rx().try_recv();
+                        match next {
+                            Some((from, msg)) => self.route_inbound(from, msg),
+                            None => break,
+                        }
                     }
                 }
                 Outcome::Inbound(None) => break,
@@ -570,7 +586,18 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     self.metrics.set_is_leader(false);
                     break;
                 }
-                Outcome::Command(Some(cmd)) => self.handle_command(cmd),
+                Outcome::Command(Some(cmd)) => {
+                    self.handle_command(cmd);
+                    // Same for proposals: they accumulate in raft's log and go
+                    // out in one `Ready`, so several writes share one flush
+                    // pair instead of paying their own (propsol v0.2.12 O).
+                    for _ in 1..CYCLE_BURST {
+                        match self.commands.try_recv() {
+                            Ok(cmd) => self.handle_command(cmd),
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Outcome::Command(None) => break,
             }
             if !self.drive_cycle().await {
@@ -1047,6 +1074,13 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             if let Some(ack) = r.ack.take() {
                 let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
             }
+        }
+    }
+
+    /// Tag an inbound peer message with its raft id and hand it to raft.
+    fn route_inbound(&mut self, from: NodeId, msg: TransportMessage) {
+        if let Some(id) = self.node_to_raft.get(from.as_str()).copied() {
+            let _ = self.node.on_message(id, msg);
         }
     }
 

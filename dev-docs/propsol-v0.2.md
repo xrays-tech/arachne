@@ -181,6 +181,18 @@ M2 验收 ⑤ 要把 apply 从 actor loop 里挪出去（§347 / §701 R6）。�
 
 ---
 
+### O. v0.2.12：不批 fsync，改批「持久化周期」（E-rev）
+
+M2 ⑤ 落地后实测到：`FsyncPolicy::Always` 下一次全量落盘（macOS `sync_all` 是整设备刷新）本机约 10ms，写洪峰中**写/弱读/线性读的 p99 齐平在 ~100ms**——瓶颈是写路径的落盘序列化。于是"给条目路径做 group commit（实现 `BatchMs`）"看似是下一步，但**在本架构里不成立**，本轮改为批「周期」，并把结论钉在这里。
+
+| 决策点 | 选择 | 否决的备选 | 理由 |
+|---|---|---|---|
+| 条目路径批 fsync | **不做**。维持 I2/I4 的"`sync_entries` 返回即持久"，`BatchMs` 仍是**未实现**的占位（不再含糊其辞） | ①延后 `ms` 再刷；②合并同周期两次 flush | ①单写者 WAL（`sync_entries(&mut self)`，actor 独占）**没有可合并的并发等待者**，"等 ms 攒一批"只会把 ack 提前到落盘之前，直接违反 I1/I2/I4，`m2_durability.rs` 的台账对账会（正确地）判失败。②一个周期内的两次 flush 是**结构性**的：entries 必须在 `advance` 前持久（否则 I2/I4），而 commit 索引要 `advance` 之后才知道 → `set_hard_state` 必须再刷一次。两者之间必然有一次写入，无法合并。 |
+| 降低落盘成本的杠杆 | **批「持久化周期」**：actor 每轮先把**已排队**的命令与入站消息成批处理（上限 `CYCLE_BURST=64`），再走一次 `drive_cycle` | 提高 raft 的 `max_msg_size`/`max_inflight_msgs` | 洪峰里每次写几乎独占一个周期（各写者等 ack，每轮只有 1–4 个条目）→ 每写 2 次 flush。批周期让 raft 组更大的 `Ready`、多个 commit 前进共享一次 flush，且**不触碰任何持久化语义**。调 raft 参数只影响单条消息大小，不改变"每条消息一个 step"的节奏。 |
+| seam 支持 | `TransportRx::try_recv()`：**默认 `None`**（= "现在没排队/无法非阻塞"，安全，因为被拒绝交接的消息仍由 `recv` 送达），tonic 与内存传输都已实现 | 只给内存传输加 | 生产（tonic）才是 fsync 瓶颈所在，只优化测试传输没有意义。 |
+| 实测收益（同机、`read_latency`） | 洪峰写 p99 **106–157ms → 38–53ms**；线性读 **100–144ms → 38–52ms**；弱读 **85–99ms → 0.17ms**；测试耗时 6.1s → 4.1s | —— | 弱读的巨幅改善来自 actor 不再"每条消息一次 flush 对"地卡住，act→apply 的跳转能被及时服务。 |
+| 仍未做 | 阻塞 fsync 仍在 actor 线程上同步等待（actor 已按 rev N 移出 async worker）；要消除"读等当前 flush"，需要**异步持久化流水线**（写缓冲 + 专用 flusher + 消息/advance 延后到 flush 完成），那是独立 rev 与独立故障注入验证 | —— | 它把 I2/I4 的时序从"同一控制流顺序"改成显式状态机，风险与工作量都不是本增量级别。 |
+
 ## 1. 目标与非目标
 
 **目标**
@@ -739,4 +751,4 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 
 ---
 
-*v0.2.11 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）、逻辑增长触发快照、follower 安装快照的整体替换语义**；**v0.2.11 apply 独立任务、反压口径与 actor 专用线程（E-rev）：actor↔apply 两通道 + `watch` 进度、Q7 的 `proposal_queue_bytes` 真正接线为「已提交未 apply」的字节背压（触顶回 `Busy`）、快照请求同序入队、进度确认后才 `advance_apply`、延迟预算用空载/洪峰比值口径**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.12 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）、逻辑增长触发快照、follower 安装快照的整体替换语义**；**v0.2.11 apply 独立任务、反压口径与 actor 专用线程（E-rev）：actor↔apply 两通道 + `watch` 进度、Q7 的 `proposal_queue_bytes` 真正接线为「已提交未 apply」的字节背压（触顶回 `Busy`）、快照请求同序入队、进度确认后才 `advance_apply`、延迟预算用空载/洪峰比值口径**；**v0.2.12 不批 fsync 而批持久化周期（E-rev）：明确 `BatchMs` 为何不可实现（单写者无并发等待者 + 周期内两次 flush 结构性）、改为命令/入站成批处理后每次 `drive_cycle`（`CYCLE_BURST`）、seam 增 `TransportRx::try_recv`，实测洪峰写 p99 106–157ms→38–53ms、弱读 85–99ms→0.17ms**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*

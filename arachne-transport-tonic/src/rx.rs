@@ -39,4 +39,8 @@ impl TransportRx for TonicRx {
     async fn recv(&mut self) -> Option<(NodeId, TransportMessage)> {
         self.receiver.recv().await
     }
+
+    fn try_recv(&mut self) -> Option<(NodeId, TransportMessage)> {
+        self.receiver.try_recv().ok()
+    }
 }
