@@ -152,6 +152,19 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 1. **测试竞态（`d788878`）**：`three_node_client.rs` 只等"存在一个 leader"，随后对 follower 的 handle 只 `put` 一次。重定向需要 leader hint，而新选出的 leader 未必已到达每个 follower；缺 hint 返回 `QuorumUnavailable`（handle 不重试）。本地 macOS 侥幸通过，2 核 CI runner 上失败。改为：先等该 follower 报告 leader hint，再对窗口期错误做**有界重试**（全部失败仍判失败，重定向契约仍被断言）。
 2. **`WalStorage::append` 缺覆盖语义（严重，本次修复）**：raft 在选举后会把**冲突后缀**重新交给存储（follower 必须覆盖上任短命 leader 的条目）。`append` 原本假设纯尾部追加、只用 `debug_assert` 守连续性 → debug 下 panic（`append continuity violation: expected 2, got 1`，actor 任务死亡）→ 测试在后段 `get_stale` 收到 `ShuttingDown`；**release 下 `debug_assert` 被编译掉，会写入重复 index，静默损坏日志**。现在 `append` 在追加前先截断到首个入参 index（复用 force-recovery 的物理截断，改名 `truncate_log_to`）；覆盖**已提交**条目属 raft 安全违规，故 fail-stop。新增 3 个单测（冲突后缀重写 + 重开后的持久性、从 index 1 覆盖、拒绝覆盖已提交）。
 
+### 1.8 M2 第一块（进行中）：FaultyStorage + fsync 台账 → INV1 两半在 L2 落地
+
+M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路线推进。
+
+- **`DurabilityLedger`（新，`arachne-testsupport/src/durability.rs`）**：每节点一份"已持久化"台账 = **条目 fsync**（内嵌 `FsyncLedger`，经 WAL 的 `FsyncObserver`）+ **HardState 持久化记录**（term/vote/commit）。seam 没有 HardState-fsync 回调，但 `FaultyStorage` 位于 raft 与 WAL 之间、能看到每次 `set_hard_state`，而 `WalStorage::set_hard_state` 返回即已 fsync（I1）——因此"记录到的 HardState 就是持久的"。提供 `entries_cover` / `max_persisted_term` / `persisted_commit`。**注意**：HardState fsync 也会让同 segment 内**已写入但未 fsync** 的条目字节变持久（fsync 刷整文件），所以 `entries_cover` 而非"事件非空"才是正确的判据。
+- **`FaultyStorage` 扩展**：新增注入 `fail_append_at`、`fail_sync_entries_every`（原有 `fail_sync_entries_at` / `fail_set_hard_state_at`），并新增 `with_ledger(...)`——**成功**写入的 HardState 才记入台账（失败的 fsync 不记）。单测 +3。
+- **新 L2 场景 `arachne/tests/m2_durability.rs`**：3 节点、真实 `WalStorage` 外包 `FaultyStorage`、每节点一份 `DurabilityLedger`；**每条出站 raft 消息在 `Transport::send` 时**与台账对账，闭合 INV1 两半：
+  - **I2/I4**：消息携带的每个条目都已被台账覆盖；
+  - **I1**：消息的 `term` 不超过该节点已持久化的最高 term——**pre-vote 消息豁免**（`pre_vote: true`，pre-vote 故意探测未来 term 且不持久化，这是它存在的意义）。
+  - 场景：① follower 崩溃 + 重启后 INV1 仍成立、已提交条目保留（INV2 的"已提交"半边）；② 全节点注入 `sync_entries` 失败 → 节点 **fail-stop**，全程**没有任何条目上过线**、也没有任何条目变为持久；③ 两个探测器各自的负向对照 + 一个无假警报对照。5 项测试。
+- **与既有覆盖的关系**：`m0_inv1_ordering.rs`（M0 验收③）已证 I2/I4 半边（2 节点、健康、send 时对账）；本块补齐 **I1** 半边，并把存储换成故障注入包装、加入崩溃重启。
+- **尚未覆盖（M2 剩余）**：撕裂写/位翻转/截断属**字节级**故障，需在自有 WAL 格式层**离线**注入（`FaultyStorage` 在逻辑层表达不了，现由 `fuzz/` + `l4/verify_wal.sh` 承担）→ 下一步做成 PR 级确定性电池（INV6）；`slow_fsync` 需文件层时序；INV2 的 ready 阶段逐点崩溃扫描；INV5 属 M3（会话去重）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

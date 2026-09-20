@@ -26,12 +26,19 @@
 //! * [`linearizability`] — a self-built **complete** linearizability checker
 //!   (a Wing–Gong–equivalent search) over the reduced history, cross-validated
 //!   against stateright in tests (test-plan §4 T2 / D-T2).
+//! * [`DurabilityLedger`] — per-node durability ledger (entry fsyncs plus
+//!   persisted HardStates) for reconciling outbound raft messages against INV1.
+//! * [`FaultyStorage`] — a deterministic fault-injecting [`Storage`] wrapper.
+//! * [`FsyncLedger`] — records segment fsyncs (the WAL's `FsyncObserver`).
+//!
+//! [`Storage`]: arachne_seam::Storage
 //!
 //! All of these are dependency-free (std/core only) and build offline. The
 //! only external crate is `stateright`, which is a **dev-dependency** used solely
 //! in `#[cfg(test)]` to cross-validate the linearizability checker.
 
 mod clock;
+mod durability;
 mod faulty_storage;
 mod fsync_ledger;
 mod linearizability;
@@ -42,6 +49,7 @@ mod store_suite;
 mod transport;
 
 pub use clock::ManualClock;
+pub use durability::{DurabilityLedger, PersistedHardState};
 pub use faulty_storage::{FaultSchedule, FaultyStorage, OpKind, OpRecord};
 pub use fsync_ledger::{FsyncEvent, FsyncLedger};
 pub use linearizability::{check_linearizable, check_reduced, CheckOutcome, KvState};

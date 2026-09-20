@@ -40,7 +40,7 @@ cargo run
 | 里程碑 | 交付 | 说明 |
 |---|---|---|
 | **M1** ✅ | 真实 tonic 接线 + SimNetwork 全原语 + ClientOracle v1 | 让 `turmoil` 承载 **真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配），把真实 `arachne` 节点（多实例）跑在模拟网络上；`SimNetwork` 补齐 `partition_oneway`/`hold`/`release`/`set_fail_rate`/链路延迟抖动（`test-plan` §6.1）；ClientOracle 做 G1/G2 判定（§6.4）。**此时才把 `arachne` 的 `transport-tonic` 显式启用**（D-ART-rev1：sim 的 tonic 仅在 L2 落地时显式开） |
-| **M2** | FaultyStorage + INV1–INV6 | `FaultyStorage` 包装自有 `WalStorage`/`StateMachine` 缝，注入 fsync 失败/撕裂写/截断/位翻转/慢盘，并维护 **fsync 台账** 事后对账断言 I1–I4（§6.2）；INV1–INV6 逐条可执行断言（§7） |
+| **M2** 🚧 | FaultyStorage + INV1–INV6 | `FaultyStorage` 包装自有 `WalStorage`/`StateMachine` 缝，注入 fsync 失败/撕裂写/截断/位翻转/慢盘，并维护 **fsync 台账** 事后对账断言 I1–I4（§6.2）；INV1–INV6 逐条可执行断言（§7）。**进行中**：`DurabilityLedger`（条目 fsync + HardState 持久化）与 `FaultyStorage` 扩展已落地，INV1 的 **I1+I2/I4 两半**已在 `arachne/tests/m2_durability.rs` 的 3 节点 L2 场景中闭合（含崩溃重启与注入 fsync 失败）；**剩余**：字节级故障（撕裂写/位翻转/截断）的离线注入、`slow_fsync`、INV2 的 ready 阶段逐点崩溃扫描、INV6 的确定性变异电池 |
 | **M2+** | 双跑复现门禁 + 线性化检查 | 每个场景同种子连跑两次，比对 ①故障调度序列 ②各节点 apply 序列哈希 ③预言机判定（§5）；自建 Wing–Gong 检查器 + stateright 交叉验证（T2，D-T2） |
 | **M3/M4** | 全场景矩阵 + 两阶段模糊器 | S01–S20 场景矩阵（§8）、safe/liveness 两阶段模型、`--reproduce` 重放（§9） |
 
