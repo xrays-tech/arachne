@@ -112,6 +112,8 @@ struct Cluster {
     committed: Vec<Vec<(RaftId, Vec<u8>)>>,
     /// Read states emitted across the run: `(node, request_ctx, read_index)`.
     read_states: Vec<(RaftId, Vec<u8>, arachne::LogIndex)>,
+    /// Snapshot installs, per node: the index of each installed snapshot.
+    installed: Vec<Vec<arachne::LogIndex>>,
     faults: Faults,
     /// `(term, leader)` observations across the whole run, for INV7.
     leader_obs: Vec<(u64, RaftId)>,
@@ -124,6 +126,7 @@ impl Cluster {
         let mut nodes = Vec::new();
         let mut sms = Vec::new();
         let mut committed = Vec::new();
+        let mut installed = Vec::new();
 
         for i in 1..=n {
             let dir = temp_dir(&format!("n{i}"));
@@ -135,6 +138,7 @@ impl Cluster {
             nodes.push(Some(node));
             sms.push(KvStateMachine::new());
             committed.push(Vec::new());
+            installed.push(Vec::new());
         }
 
         Self {
@@ -145,6 +149,7 @@ impl Cluster {
             sms,
             committed,
             read_states: Vec::new(),
+            installed,
             faults: Faults::default(),
             leader_obs: Vec::new(),
         }
@@ -159,6 +164,13 @@ impl Cluster {
                 let outcome = block_on(node.step()).expect("step");
                 for (ctx, index) in &outcome.read_states {
                     self.read_states.push(((i + 1) as RaftId, ctx.clone(), *index));
+                }
+                if let Some(snapshot) = outcome.snapshot {
+                    // The runtime half of an install: the storage already
+                    // replaced the log, so the state machine must be rebuilt
+                    // from the snapshot *before* any later entry is applied.
+                    self.sms[i].restore(&snapshot.data).expect("restore");
+                    self.installed[i].push(snapshot.meta.index);
                 }
                 for (idx, data) in outcome.committed {
                     self.sms[i].apply(idx, &data).expect("apply");
@@ -209,6 +221,10 @@ impl Cluster {
         node.tick();
         let out = block_on(node.step()).expect("step");
         let reads = out.read_states;
+        if let Some(snapshot) = out.snapshot {
+            self.sms[i].restore(&snapshot.data).expect("restore");
+            self.installed[i].push(snapshot.meta.index);
+        }
         for (idx, data) in out.committed {
             self.sms[i].apply(idx, &data).expect("apply");
             self.committed[i].push((idx, data));
@@ -221,13 +237,17 @@ impl Cluster {
     /// isolate pure WAL replay from leader resync.
     fn step_local_apply(&mut self, i: RaftId) {
         let idx = (i - 1) as usize;
-        let committed = {
+        let (snapshot, committed) = {
             let node = self.nodes[idx].as_mut().expect("node present");
             node.tick();
             let out = block_on(node.step()).expect("step");
             node.advance_apply();
-            out.committed
+            (out.snapshot, out.committed)
         };
+        if let Some(snapshot) = snapshot {
+            self.sms[idx].restore(&snapshot.data).expect("restore");
+            self.installed[idx].push(snapshot.meta.index);
+        }
         for (ix, data) in committed {
             self.sms[idx].apply(ix, &data).expect("apply");
             self.committed[idx].push((ix, data));
@@ -274,12 +294,52 @@ impl Cluster {
             .is_ok()
     }
 
+    /// Take a local snapshot of node `i`'s applied state and compact the log
+    /// it covers — the runtime's `maybe_snapshot` path, invoked directly
+    /// because this harness drives `RaftNode` without the actor.
+    ///
+    /// Returns the snapshot index. The snapshot is taken at the **applied**
+    /// index, which is what makes compaction safe (propsol §5.5.4).
+    fn snapshot_and_compact(&mut self, i: RaftId) -> arachne::LogIndex {
+        let idx = (i - 1) as usize;
+        let applied = self.sms[idx].applied_index();
+        assert!(applied > 0, "node {i} has nothing to snapshot");
+        let data = self.sms[idx].snapshot().expect("state machine snapshot");
+        let node = self.nodes[idx].as_mut().expect("node present");
+        let term = node.term_at(applied).expect("term at the applied index");
+        node.create_snapshot(
+            applied,
+            term,
+            arachne::ConfState {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            data,
+        )
+        .expect("create snapshot and compact");
+        applied
+    }
+
     fn cleanup(&mut self) {
         self.nodes.iter_mut().for_each(|n| *n = None);
         for dir in &self.dirs {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+}
+
+/// Snapshot indexes present in a node's data directory.
+fn snapshot_files(dir: &std::path::Path) -> Vec<arachne::LogIndex> {
+    let mut found: Vec<arachne::LogIndex> = std::fs::read_dir(dir)
+        .expect("read data dir")
+        .flatten()
+        .filter_map(|e| {
+            arachne::storage::snapshot::parse_snapshot_file_name(&e.file_name().to_string_lossy())
+        })
+        .map(|(index, _term)| index)
+        .collect();
+    found.sort_unstable();
+    found
 }
 
 /// INV7: each term has at most one leader across the whole observed run.
@@ -405,6 +465,186 @@ fn s02_partition_preserves_single_leader_per_term() {
 fn double_run_same_seed_is_deterministic() {
     let a = run_s02(0x5020_0001);
     let b = run_s02(0x5020_0001);
+    assert_eq!(a.leader_trace, b.leader_trace, "same seed ⇒ same leader trace");
+    assert_eq!(a.committed, b.committed, "same seed ⇒ same committed logs");
+}
+
+// ---------------------------------------------------------------------------
+// S03: the leader snapshots and compacts, and a lagging node catches up
+// through the snapshot
+// ---------------------------------------------------------------------------
+
+/// S03 (M2 acceptance ①): elect a leader, commit a few writes, **kill** a
+/// follower, commit more writes while the leader compacts its log, then
+/// restart the follower and let it catch up.
+///
+/// The node is killed rather than partitioned on purpose: a partitioned node
+/// campaigns and raises the term, which can change leaders and let the new
+/// leader serve the follower from its *un-compacted* log, making the test pass
+/// without ever exercising snapshot transfer. A restarted node has a fresh
+/// election timer and a stale term, so it cannot disrupt the leader.
+fn run_snapshot_catchup(seed: u64) -> Outcome {
+    let _seed = ElectionSeed::enter(seed);
+    let mut c = Cluster::new(3);
+    let all: [RaftId; 3] = [1, 2, 3];
+
+    // 1. Elect, then commit writes that will end up *inside* the snapshot.
+    let leader = elect(&mut c);
+    let leader_idx = (leader - 1) as usize;
+    for i in 0..5u64 {
+        assert!(
+            c.propose(leader, format!("early{i}").as_bytes(), b"early", 1 + i),
+            "propose must be accepted"
+        );
+        for _ in 0..40 {
+            c.round();
+        }
+    }
+    let early_applied = c.sms[leader_idx].applied_index();
+    assert!(early_applied >= 5, "the early writes must be applied");
+
+    // 2. A follower goes away, and the majority keeps writing.
+    let victim = (1..=3).find(|&i| i != leader).expect("a follower exists");
+    let victim_idx = (victim - 1) as usize;
+    c.crash(victim);
+    let victim_applied_before = c.sms[victim_idx].applied_index();
+    for i in 0..10u64 {
+        assert!(
+            c.propose(leader, format!("late{i}").as_bytes(), b"late", 100 + i),
+            "the majority must still commit: {}",
+            i
+        );
+        for _ in 0..40 {
+            c.round();
+        }
+    }
+    assert_eq!(
+        c.sms[victim_idx].applied_index(),
+        victim_applied_before,
+        "the dead node cannot have applied the majority-era writes"
+    );
+
+    // 3. The leader snapshots its applied state and releases the log it covers.
+    let snap_index = c.snapshot_and_compact(leader);
+    assert!(
+        snap_index > victim_applied_before,
+        "the snapshot must cover what the lagging node is missing ({snap_index} <= {victim_applied_before})"
+    );
+    assert_eq!(
+        snapshot_files(&c.dirs[leader_idx]),
+        vec![snap_index],
+        "the leader's snapshot must be durable"
+    );
+    // The compacted entries are really gone from the log, not merely shadowed:
+    // raft asks the storage for the term at the watermark while catching up.
+    assert!(
+        c.nodes[leader_idx]
+            .as_mut()
+            .expect("leader present")
+            .term_at(snap_index)
+            .is_ok(),
+        "the term at the snapshot index must stay answerable after compaction"
+    );
+    // ...and an entry *below* the watermark is genuinely gone: this is what
+    // forces a snapshot instead of an append when the follower returns.
+    if snap_index > 1 {
+        assert!(
+            c.nodes[leader_idx]
+                .as_mut()
+                .expect("leader present")
+                .term_at(snap_index - 1)
+                .is_err(),
+            "the compacted entry below the watermark must no longer be readable"
+        );
+    }
+
+    // 4. Writes *after* the snapshot: the follower must replay these on top of
+    //    the state it restored, so both halves of the catch-up are exercised.
+    for i in 0..2u64 {
+        assert!(
+            c.propose(leader, format!("post{i}").as_bytes(), b"post", 200 + i),
+            "the leader keeps accepting writes after compacting"
+        );
+        for _ in 0..40 {
+            c.round();
+        }
+    }
+    let tail_index = c.sms[leader_idx].applied_index();
+    assert!(
+        tail_index > snap_index,
+        "the post-snapshot writes must be applied ({tail_index} <= {snap_index})"
+    );
+
+    // 5. The follower restarts from its short WAL and must be brought up by the
+    //    leader's snapshot: its `next_idx` is below the leader's first index.
+    c.bounce(victim);
+    for _ in 0..600 {
+        c.round();
+    }
+
+    // 6. It converged...
+    assert_eq!(
+        c.sms[victim_idx].applied_index(),
+        c.sms[leader_idx].applied_index(),
+        "the restarted node must reach the leader's applied index"
+    );
+    assert_state_agreement(&c, &all);
+    assert_log_matching(&c.committed);
+    assert_single_leader_per_term(&c.leader_obs);
+
+    // ...and it did so through a snapshot, not by replaying the whole log.
+    assert!(
+        c.installed[victim_idx]
+            .iter()
+            .any(|&index| index >= snap_index),
+        "the lagging node must have installed the leader's snapshot \
+         (installed {:?}, snapshot index {snap_index})",
+        c.installed[victim_idx]
+    );
+    assert_eq!(
+        snapshot_files(&c.dirs[victim_idx]),
+        vec![snap_index],
+        "the installed snapshot must be durable on the follower"
+    );
+    // Non-vacuity: the snapshot really carried the gap. The follower's applied
+    // *entry* log skips the indices the snapshot covered.
+    let victim_entries: BTreeSet<arachne::LogIndex> = c.committed[victim_idx]
+        .iter()
+        .map(|(index, _)| *index)
+        .collect();
+    assert!(
+        !victim_entries.contains(&(victim_applied_before + 1)),
+        "the follower must not have replayed the entries the snapshot covered: {victim_entries:?}"
+    );
+    assert!(
+        victim_entries.contains(&(snap_index + 1)),
+        "the follower must apply the entries that follow the snapshot"
+    );
+
+    let out = Outcome {
+        leader_trace: c.leader_obs.clone(),
+        committed: c.committed.clone(),
+    };
+    c.cleanup();
+    out
+}
+
+#[test]
+fn s03_lagging_node_catches_up_through_a_snapshot() {
+    let out = run_snapshot_catchup(0x5030_0001);
+    assert!(!out.leader_trace.is_empty(), "a leader must appear in the trace");
+    // Every node ends up with applied work, and the snapshot-covered prefix is
+    // missing from the lagging node's entry log (see the scenario's asserts).
+    assert!(
+        out.committed.iter().all(|log| !log.is_empty()),
+        "every node must have applied work"
+    );
+}
+
+#[test]
+fn double_run_snapshot_scenario_is_deterministic() {
+    let a = run_snapshot_catchup(0x5030_0001);
+    let b = run_snapshot_catchup(0x5030_0001);
     assert_eq!(a.leader_trace, b.leader_trace, "same seed ⇒ same leader trace");
     assert_eq!(a.committed, b.committed, "same seed ⇒ same committed logs");
 }

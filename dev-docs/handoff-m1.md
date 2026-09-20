@@ -203,6 +203,11 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 - `lagging_follower_catches_up_through_a_snapshot`（**M2 验收 ①**）：杀掉一个 follower → leader 写入远超阈值（自动落 2 次快照并压缩）→ follower 带旧 WAL 重启 → 断言它**装上了快照**（`snapshots_installed_total > 0` + 盘上有快照文件）、追平最新值、且**只可能来自快照**的那个 key（写于 follower 宕机之前、已被 leader 压缩）仍在；最后线性一致读与全节点 applied index 一致。
 - `a_restart_rebuilds_the_state_machine_from_the_snapshot`：单节点写入跨阈值 → 重启后**启动即从快照恢复**（`applied_index >= newest snapshot index`，空状态机这里必然是 0）、压缩掉的早期 key 与日志尾部 key 都能读回。
 - `killing_the_leader_does_not_interrupt_a_follower_catching_up`（**M2 验收 ②**）：lagging follower 重启与旧 leader 被杀的**同时**发生，两个存活节点各自都已压缩过日志 → follower 只能从**新 leader** 拿快照；断言新 leader 产生、写入恢复、follower 装上快照并追平两个时代的 key。
+- **确定性 L2 场景 S03**（`arachne/tests/l2_scenarios.rs`，同步内存传输、逐轮驱动、可字节比对）：`s03_lagging_node_catches_up_through_a_snapshot` + `double_run_snapshot_scenario_is_deterministic`。与上面两个真实 async 测试互补——它们证"能跑通"，S03 证"**确定性地**跑通"。要点：
+  - 用**杀掉再重启**（`crash`/`bounce`）而非分区来制造落后：被分区节点会不断竞选抬高 term，可能换主，而新主日志没压缩过、直接用日志就能把 follower 补上——测试会"绕过"快照路径假绿。重启节点任期陈旧、选举计时器重置，无法干扰现任 leader。
+  - leader 调 `snapshot_and_compact`（runtime `maybe_snapshot` 的直接形态）后断言：快照文件落盘、**水位以下的条目确实读不到了**（`term_at(snap_index-1)` 为 Err）、`term_at(snap_index)` 仍可答；随后再写两条，follower 重启后必须"快照恢复 + 尾部回放"两半都走。
+  - 断言 follower 的**条目日志跳过了快照覆盖的区间**（`!contains(victim_applied_before+1)`）却包含 `snap_index+1`，且最终 `applied_index`、状态机快照、重叠 index 内容与全组一致（INV3/INV8/INV7）。
+  - 为此给确定性 harness 补上了 runtime 的**安装半边**：`round()`/`step_local()`/`step_local_apply()` 现在遇 `StepOutcome.snapshot` 会先 `sm.restore` 再 apply（此前只 apply `committed`，装了快照的状态机会因 `applied` 不连续而 `IndexViolation`）。
 - `arachne/tests/quorum_loss.rs`（**M2 验收 ④**）：3 节点杀掉 leader + 一个 follower → 唯一存活节点**永远无法组成多数派**；断言 `put` 与线性一致 `get` 都在有界时间内返回 **`QuorumUnavailable`**（既不成功也不挂死），`get_stale` 仍从本地状态机正常返回值（N1 弱读），并且两个 peer 恢复后集群重新选主、继续写入、断电前的写入仍在。
 
 **该 ④ 测试暴露并修掉一个客户端错误映射缺陷（`client/handle.rs`）**：重定向链里若某个 peer 已经消失（其命令通道关闭），原实现把该 peer 的 **`ShuttingDown`**（"本节点正在关闭"）原样抛给调用方——语义完全错位，且与 §2.1 承诺的 `QuorumUnavailable` 不符。现在：目标不是自己且报 `ShuttingDown` → 视为"该 peer 不可达"，继续尝试下一个候选；所有 peer 都不可达 → `QuorumUnavailable`。目标是**自己**时的 `ShuttingDown` 仍原样上抛（那才是真的本节点在关闭）。`put`/`get` 两条重定向路径同改。
