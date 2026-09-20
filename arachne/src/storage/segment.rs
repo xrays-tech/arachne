@@ -187,6 +187,15 @@ impl Segment {
     }
 
     /// The path to the segment file.
+    /// Duplicate this segment's descriptor so another thread can `fsync` it.
+    ///
+    /// `fsync` flushes the *inode*, so a duplicate descriptor covers every byte
+    /// written through the original — which is what lets the durability
+    /// pipeline run its flush off the actor thread (propsol v0.2.13 P).
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

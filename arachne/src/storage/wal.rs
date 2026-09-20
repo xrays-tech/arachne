@@ -201,6 +201,28 @@ pub struct ForceRecoveryReport {
     pub discarded_entries: u64,
 }
 
+/// A duplicate descriptor of one WAL segment, for flushing off the actor
+/// thread (propsol v0.2.13 P).
+pub struct FlushHandle {
+    file: File,
+    segment_first_index: LogIndex,
+}
+
+impl FlushHandle {
+    /// Flush every byte written to this segment through the original descriptor
+    /// before this call.
+    pub fn flush(&self) -> Result<(), StorageError> {
+        self.file.sync_all().map_err(StorageError::Io)
+    }
+
+    /// The first log index of the segment this handle flushes. A pipeline that
+    /// observes a different active segment on completion knows a rollover
+    /// happened and that the outgoing segment was already flushed by it.
+    pub fn segment_first_index(&self) -> LogIndex {
+        self.segment_first_index
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WalStorage
 // ---------------------------------------------------------------------------
@@ -895,6 +917,26 @@ impl WalStorage {
             discarded_entries: discarded,
         })
     }
+    /// Duplicate the active segment's descriptor for an **off-thread flush**.
+    ///
+    /// The durability pipeline (propsol v0.2.13 P) writes records on the actor
+    /// and runs the expensive `fsync` on a worker: `fsync` flushes the inode, so
+    /// a duplicate descriptor covers every byte written through the original
+    /// before the call. Rollover is safe without extra work — `maybe_rollover`
+    /// already fsyncs the outgoing segment when it holds unsynced entries (the
+    /// N2 fix), so entries written before a rollover are durable regardless of
+    /// which segment is active when the worker flushes.
+    pub fn flush_handle(&self) -> Result<FlushHandle, StorageError> {
+        let file = self
+            .segment
+            .try_clone_file()
+            .map_err(StorageError::Io)?;
+        Ok(FlushHandle {
+            file,
+            segment_first_index: self.segment_first_index,
+        })
+    }
+
     /// Bytes the durable log currently occupies on disk.
     ///
     /// Sums the segment files (not the in-memory index), which is what the
@@ -2321,6 +2363,33 @@ mod tests {
         storage.append(&[make_entry(5, 3, b"remote")]).unwrap();
         storage.sync_entries().unwrap();
         assert_eq!(storage.term(5).unwrap(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_handle_flushes_bytes_written_after_it_was_taken() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+        storage
+            .append(&[make_entry(1, 1, b"a")])
+            .unwrap();
+        storage.sync_entries().unwrap();
+
+        // The handle is taken *before* the next write and still covers it:
+        // `fsync` flushes the inode, not a snapshot of it.
+        let handle = storage.flush_handle().unwrap();
+        assert_eq!(handle.segment_first_index(), storage.first_index().unwrap());
+        storage
+            .append(&[make_entry(2, 1, b"b"), make_entry(3, 1, b"c")])
+            .unwrap();
+        handle.flush().unwrap();
+
+        // Everything written is durable now, so a reopen sees it even though
+        // `sync_entries` was never called for entries 2 and 3.
+        drop(storage);
+        let storage = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(storage.last_index().unwrap(), 3);
         let _ = fs::remove_dir_all(&dir);
     }
 
