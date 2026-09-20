@@ -780,3 +780,110 @@ fn read_index_is_served_only_on_the_leader() {
 
     c.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// Increment 4: multi-key histories (phantom check) + overlap under partition
+// ---------------------------------------------------------------------------
+
+/// INV4 over multiple keys: writes/reads alternate between two keys, plus a read
+/// of a never-written key (must be `None`) — this exercises the oracle's
+/// per-key phantom-value check, not just a single key.
+#[test]
+fn inv4_multi_key_history_linearizable() {
+    let _seed = ElectionSeed::enter(0x1_4E0);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+    let mut version = 0u64;
+    let keys: [&[u8]; 2] = [b"a", b"b"];
+
+    for r in 0..4u64 {
+        version += 1;
+        let value = ValueId(version);
+        let key = keys[(r % 2) as usize];
+        let put_call = CallId(r * 2 + 1);
+        let get_call = CallId(r * 2 + 2);
+
+        h.invoke(put_call, ClientId(0), SeqNo(r * 2 + 1), Op::Put { key: key.to_vec(), value }, ts);
+        ts += 1;
+        commit_put(&mut c, leader, key, value, r * 2 + 1);
+        h.complete(put_call, ts, OpResult::Ok(None));
+        ts += 1;
+
+        h.invoke(get_call, ClientId(0), SeqNo(r * 2 + 2), Op::Get { key: key.to_vec() }, ts);
+        ts += 1;
+        let read = c.sms[(leader - 1) as usize].get(key).expect("sm get");
+        h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+        ts += 1;
+    }
+
+    // A read of a never-written key must be None (no phantom).
+    let absent_call = CallId(99);
+    h.invoke(absent_call, ClientId(0), SeqNo(99), Op::Get { key: b"c".to_vec() }, ts);
+    ts += 1;
+    let read = c.sms[(leader - 1) as usize].get(b"c").expect("sm get");
+    assert_eq!(read, None, "a never-written key must read None");
+    h.complete(absent_call, ts, OpResult::Ok(None));
+
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (multi-key): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (multi-key): {outcome:?}"
+    );
+    c.cleanup();
+}
+
+/// INV4 with two clients whose operations overlap **during** a 2+1 partition:
+/// the majority keeps serving, the isolated follower is starved, and the history
+/// must still be linearizable.
+#[test]
+fn inv4_concurrent_ops_during_partition_linearizable() {
+    let _seed = ElectionSeed::enter(0x1_4F0);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+    let victim = (1..=3).find(|&i| i != leader).expect("a follower exists");
+    c.faults.isolate(victim);
+    let victim_len_before = c.committed[(victim - 1) as usize].len();
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+    let mut version = 0u64;
+
+    for r in 0..4u64 {
+        version += 1;
+        let value = ValueId(version);
+        let put_call = CallId(r * 4 + 1);
+        let get_call = CallId(r * 4 + 2);
+
+        h.invoke(put_call, ClientId(0), SeqNo(r), Op::Put { key: b"k".to_vec(), value }, ts);
+        ts += 1;
+        h.invoke(get_call, ClientId(1), SeqNo(r), Op::Get { key: b"k".to_vec() }, ts);
+        ts += 1;
+
+        commit_put(&mut c, leader, b"k", value, r * 4 + 1);
+        let read = c.sms[(leader - 1) as usize].get(b"k").expect("sm get");
+        h.complete(put_call, ts, OpResult::Ok(None));
+        ts += 1;
+        h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+        ts += 1;
+    }
+
+    assert_eq!(
+        c.committed[(victim - 1) as usize].len(),
+        victim_len_before,
+        "the isolated follower must stay starved"
+    );
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (overlap+partition): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (overlap+partition): {outcome:?}"
+    );
+    c.cleanup();
+}
+
