@@ -79,6 +79,8 @@ fn wal_opts(tag: &str) -> WalOptions {
 #[derive(Default, Clone)]
 struct Faults {
     isolated: BTreeSet<RaftId>,
+    /// Dropped in exactly one direction (`from` -> `to`).
+    oneway: BTreeSet<(RaftId, RaftId)>,
 }
 
 impl Faults {
@@ -86,9 +88,15 @@ impl Faults {
         self.isolated.insert(id);
     }
 
+    /// Drop messages in exactly one direction (`from` -> `to`).
+    fn oneway(&mut self, from: RaftId, to: RaftId) {
+        self.oneway.insert((from, to));
+    }
+
     /// `true` if a message from `from` to `to` must be dropped.
     fn drops(&self, from: RaftId, to: RaftId) -> bool {
         self.isolated.contains(&from) != self.isolated.contains(&to)
+            || self.oneway.contains(&(from, to))
     }
 }
 
@@ -533,6 +541,123 @@ fn inv4_client_history_is_linearizable_under_partition() {
 
     c.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// S16 (asymmetric partition) + INV4 across a mid-history failover
+// ---------------------------------------------------------------------------
+
+/// Commit `put(key, value)` on `leader` and assert the leader applied it.
+fn commit_put(c: &mut Cluster, leader: RaftId, key: &[u8], value: ValueId, seq: RaftId) {
+    assert!(
+        c.propose(leader, key, &vbytes(value), seq),
+        "leader accepts the put"
+    );
+    for _ in 0..400 {
+        c.round();
+    }
+    assert_eq!(
+        c.sms[(leader - 1) as usize]
+            .get(key)
+            .expect("sm get")
+            .as_deref()
+            .and_then(parse_v),
+        Some(value),
+        "leader must have applied the put"
+    );
+}
+
+/// Advance rounds until a node other than `avoid` reports itself leader.
+fn wait_new_leader(c: &mut Cluster, avoid: RaftId) -> RaftId {
+    for _ in 0..1500 {
+        c.round();
+        if let Some(l) = (1..=c.n).find(|&i| i != avoid && c.leader_of(i)) {
+            return l;
+        }
+    }
+    panic!("no new leader after failover");
+}
+
+/// S16: drop every follower→leader message. The leader keeps sending but never
+/// hears acknowledgements, so CheckQuorum must step it down; INV7 still holds.
+#[test]
+fn s16_asymmetric_partition_steps_down_leader() {
+    let _seed = ElectionSeed::enter(0x5160_0001);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+
+    for f in 1..=3 {
+        if f != leader {
+            c.faults.oneway(f, leader);
+        }
+    }
+    for _ in 0..1500 {
+        c.round();
+    }
+
+    assert!(
+        !c.leader_of(leader),
+        "an asymmetric partition must step the leader down (CheckQuorum)"
+    );
+    assert_single_leader_per_term(&c.leader_obs);
+    c.cleanup();
+}
+
+/// INV4 across a mid-history failover: isolate the leader, let the survivors
+/// elect a new one, redirect the client, and require the whole history to stay
+/// linearizable (oracle + checker).
+#[test]
+fn inv4_failover_mid_history_is_linearizable() {
+    let _seed = ElectionSeed::enter(0x1_4F0);
+    let mut c = Cluster::new(3);
+    let mut leader = elect(&mut c);
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+    let mut version = 0u64;
+    let mut failovers = 0u32;
+
+    for round in 0..6u64 {
+        if round == 2 {
+            c.faults.isolate(leader);
+            leader = wait_new_leader(&mut c, leader);
+            failovers += 1;
+        }
+
+        version += 1;
+        let value = ValueId(version);
+        let put_call = CallId(round * 2 + 1);
+        h.invoke(
+            put_call,
+            ClientId(0),
+            SeqNo(round * 2 + 1),
+            Op::Put { key: b"k".to_vec(), value },
+            ts,
+        );
+        ts += 1;
+        commit_put(&mut c, leader, b"k", value, round * 2 + 1);
+        h.complete(put_call, ts, OpResult::Ok(None));
+        ts += 1;
+
+        let get_call = CallId(round * 2 + 2);
+        h.invoke(get_call, ClientId(0), SeqNo(round * 2 + 2), Op::Get { key: b"k".to_vec() }, ts);
+        ts += 1;
+        let read = c.sms[(leader - 1) as usize].get(b"k").expect("sm get");
+        h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+        ts += 1;
+    }
+
+    assert_eq!(failovers, 1, "the scenario must exercise one mid-history failover");
+    let report = h.check();
+    assert!(report.passed(), "oracle failures after failover: {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker after failover: {outcome:?}"
+    );
+
+    c.cleanup();
+}
+
 
 
 
