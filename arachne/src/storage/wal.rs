@@ -1550,13 +1550,20 @@ impl Storage for WalStorage {
         }
         // Off-thread path: write (immediately readable to raft, not yet
         // durable), then let the flusher thread pay for the device.
+        let wrote_records = !entries.is_empty() || hard_state.is_some();
         if !entries.is_empty() {
             self.append_buffered(entries)?;
         }
         if let Some(hs) = hard_state {
             self.set_hard_state_buffered(hs)?;
         }
-        if self.pending_entry_fsync {
+        // Only a call that wrote records needs a flush. A cycle that wrote
+        // nothing (a heartbeat round, say) must complete without one: the
+        // caller processes cycles in submission order, so anything an earlier
+        // cycle wrote is already durable by the time this one is reported.
+        // Joining an earlier cycle's flush here made an idle read wait for the
+        // device for no reason.
+        if wrote_records {
             self.submit_flush().map(PersistSubmit::Offloaded)
         } else {
             Ok(PersistSubmit::Durable)

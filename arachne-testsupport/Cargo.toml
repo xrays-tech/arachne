@@ -17,6 +17,12 @@ publish = false
 # (enforced by scripts/check-deps.sh Gate A).
 arachne-seam = { workspace = true }
 
+# The in-memory transport needs a channel whose receiver actually *registers*
+# its waker: `std::sync::mpsc` cannot, which made every inbound raft message
+# wait for the receiving actor's next tick. `sync` only — this crate must still
+# never pull in the transport stack (enforced by scripts/check-deps.sh Gate C).
+tokio = { version = "1", features = ["sync"] }
+
 # Test-only (never a normal dependency): the stateright reference linearizability
 # checker, used solely in `#[cfg(test)]` to cross-validate the self-built
 # Wing-Gong checker (test-plan §4 T2 / decision D-T2). It is a dev-dependency,

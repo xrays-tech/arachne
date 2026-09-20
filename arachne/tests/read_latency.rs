@@ -173,6 +173,11 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
         // moving it off the actor changes where the wait happens, not how long
         // it is (see propsol v0.2.13 P and the handoff). Its value is that the
         // actor keeps ticking and serving while a slow disk is busy.
+        // The gate measures the **default** (synchronous) durability path: the
+        // offloaded pipeline is opt-in, and measurement showed it does not move
+        // these numbers — under `Always` the device flush is the bound (see
+        // propsol v0.2.13 P and the handoff). Its value is that the actor keeps
+        // ticking and serving while a slow disk is busy.
         let wal = WalStorage::open(&dir, wal_opts(i)).expect("open wal");
         let (tx, rx) = factory.create(node_id(i));
         let m = Arc::new(Metrics::new());
@@ -225,6 +230,17 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
         }
     }
     let baseline_p99 = percentile_99(&baseline);
+    // An idle cluster must answer a linearizable read in the low microseconds.
+    // This assertion exists because it once did not: the read waited a whole
+    // heartbeat interval for the ReadIndex round, because the in-memory test
+    // transport never woke the receiving actor (see the handoff §1.12). The
+    // relative budgets below could not see that, so it stayed hidden for
+    // several commits.
+    const IDLE_CEILING_US: u128 = 5_000;
+    assert!(
+        baseline_p99 <= IDLE_CEILING_US,
+        "an idle linearizable read must not wait for a tick: idle p99 {baseline_p99}us"
+    );
     assert!(
         baseline.len() >= GETS / 2,
         "the idle baseline produced too few samples ({}), the cluster is unhealthy",

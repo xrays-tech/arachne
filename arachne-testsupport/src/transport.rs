@@ -22,9 +22,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -74,7 +73,7 @@ impl std::error::Error for InMemoryClosed {}
 type Queued = (NodeId, TransportMessage);
 
 /// The shared switch: maps each connected node to its delivery channel.
-type Switch = Arc<Mutex<HashMap<NodeId, Sender<Queued>>>>;
+type Switch = Arc<Mutex<HashMap<NodeId, UnboundedSender<Queued>>>>;
 
 /// Test/simulator factory that wires up in-memory transport halves.
 ///
@@ -100,7 +99,7 @@ impl TransportFactory for InMemoryTransportFactory {
     type Rx = InMemoryRx;
 
     fn create(&self, me: NodeId) -> (Self::Tx, Self::Rx) {
-        let (tx, rx) = mpsc::channel::<Queued>();
+        let (tx, rx) = mpsc::unbounded_channel::<Queued>();
         // Register this node's delivery channel in the switch. A poisoned lock
         // is unrecoverable from a non-`Result` return, and this is a test-only
         // crate, so we surface it loudly rather than hide it.
@@ -156,15 +155,14 @@ impl Transport for InMemoryTx {
 /// The inbound half for one node.
 #[derive(Debug)]
 pub struct InMemoryRx {
-    receiver: Receiver<Queued>,
+    receiver: UnboundedReceiver<Queued>,
 }
 
 impl TransportRx for InMemoryRx {
-    fn recv(&mut self) -> impl Future<Output = Option<(NodeId, TransportMessage)>> + Send {
-        RecvFuture {
-            receiver: &mut self.receiver,
-            waker: None,
-        }
+    async fn recv(&mut self) -> Option<(NodeId, TransportMessage)> {
+        // The channel registers this task's waker, so an inbound message wakes
+        // the actor immediately instead of on its next tick.
+        self.receiver.recv().await
     }
 
     fn try_recv(&mut self) -> Option<(NodeId, TransportMessage)> {
@@ -186,41 +184,12 @@ impl InMemoryRx {
     ) -> Result<Option<(NodeId, TransportMessage)>, InMemoryClosed> {
         match self.receiver.try_recv() {
             Ok(item) => Ok(Some(item)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(InMemoryClosed),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(InMemoryClosed),
         }
     }
 }
 
-/// A hand-rolled future that pulls the next queued message off an mpsc channel.
-///
-/// It reports `Pending` (registering the current waker) when the channel is
-/// empty, so a real executor would wake it when a message arrives. In tests the
-/// producer enqueues first, so it is `Ready` on the first poll.
-struct RecvFuture<'a> {
-    // `&mut` (not `&`): a mutable borrow is `Send` whenever `Receiver: Send`,
-    // whereas a shared `&Receiver` would additionally require `Receiver: Sync`
-    // (which it is not). `recv(&mut self)` hands us exactly this mutable borrow.
-    receiver: &'a mut Receiver<Queued>,
-    waker: Option<Waker>,
-}
-
-impl Future for RecvFuture<'_> {
-    type Output = Option<Queued>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.receiver.try_recv() {
-            Ok(item) => Poll::Ready(Some(item)),
-            // The sender side was dropped and the queue is drained: closed.
-            Err(TryRecvError::Disconnected) => Poll::Ready(None),
-            // No message yet: register our waker and wait to be polled again.
-            Err(TryRecvError::Empty) => {
-                self.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-}
 
 /// A minimal `Wake` implementation that does nothing on wake.
 ///

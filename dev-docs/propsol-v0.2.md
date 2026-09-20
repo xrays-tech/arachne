@@ -222,6 +222,8 @@ rev O 把洪峰中的写/读 p99 从 ~100ms 降到 38–53ms（批持久化周�
 - **不**在 node binary 里默认打开，也不把 `read_latency` 门槛切到 pipeline 上（门槛测的是默认路径）；
 - 端到端正确性由 `lagging_follower_catches_up_with_offloaded_durability` 覆盖（同一套"写洪峰 → 快照 → follower 安装 → 重启 → 换主"场景跑在 pipeline 上）。
 
+**修好测试传输后的重测（重要）**：上面那组"pipeline 更差"的数字是在一个**有缺陷的内存传输**上测的——它的 `RecvFuture` 从未向通道注册 waker，导致每条入站 raft 消息最多等一个 heartbeat（详见 handoff §1.12）。修好后（idle 读 p99 从 10.8ms 回到 0.23–0.66ms）重测：同步 storm 33–70ms、pipeline 50–56ms，**结论不变**（`Always` 下设备是瓶颈）。另外新加的 idle 门槛当天就抓到 pipeline 的一个真问题：`persist_ready_records` 原先在"本次没写任何记录"时也会提交 flush，使一次空周期（例如一个 ReadIndex 轮次）搭上更早周期的 flush（idle 6.7ms）。现在只有**本次真的写了记录**才提交 flush——空记录周期直接 `Durable`，因为调用方按提交顺序完成周期，更早周期的负载在它被报告前必然已持久。
+
 **实现中发现的第二个要点**：不要像同步路径那样在 `land_records` 里显式写"commit 前进"的 HardState。raft 的 `prev_hs` 在 async 路径下不会被 `gen_light_ready` 更新，所以下一次 `ready()` 会自己带上这个 hs；若我们再显式写一次，磁盘上就会出现**重复的 HardState 记录**，并直接打破"末条撕裂=合法截断"的判定（实测：`structural tear at estimated index 3 (within committed window commit=2)`，`m2_wal_faults::torn_tail_recovers_and_still_serves_the_acked_write` 抓到）。删掉显式写入后，每个周期恰好一次 flush，状态机也简化成单阶段。
 
 ## 1. 目标与非目标

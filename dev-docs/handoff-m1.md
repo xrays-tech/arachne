@@ -252,19 +252,27 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 
 **新增覆盖**：`m2_snapshot.rs` 的追赶场景参数化后跑两遍——`lagging_follower_catches_up_through_a_snapshot`（默认同步）与 `lagging_follower_catches_up_with_offloaded_durability`（pipeline：写洪峰 → 快照 → follower 安装 → 重启 → 换主，全绿）。
 
-### 1.12 未结案：空闲时 `get` 的延迟 = 一个 heartbeat interval（**待修**）
+### 1.12 已结案：空闲 `get` = 一个 heartbeat interval —— 是**测试传输的 waker bug**，不是产品退化
 
-在追 rev P 的 idle p99（~11ms）时查到一个**可复现的具体问题**，尚未修复，记录如下。
+**现象**：空闲 3 节点内存集群上线性一致 `get` 几乎每次都等于一个 heartbeat interval（interval=10ms → 9.2–10.7ms；改成 50ms → 44–50ms，严格线性缩放），而弱读 ~0.2ms、写 1–2ms。加时间戳后确认 10ms **全部在 ReadIndex 的 quorum 阶段**（`quorum=9.27ms`、`apply=166ns`、`read_index == applied`）。
 
-**现象**：3 节点内存传输集群、空闲（无写洪峰）时，线性一致 `get` 的延迟几乎**每次都**等于一个 heartbeat interval（`read_latency` 的 idle 基线：interval=10ms → 样本 9.2–10.7ms；把 interval 改成 50ms → 44–50ms，**严格随周期线性缩放**）。同一轮里 `get_stale`（弱读）是 ~0.2ms、写是 ~1–2ms，所以不是 actor/apply 通道、也不是设备。
+**二分定位**（用"p99 是 0.4ms 还是 10ms"当判据，每次 checkout + 重建）：
 
-**定位**：临时给 `PendingRead` 加时间戳后测得，10ms **全部在一个阶段**——ReadIndex 的 quorum 确认（`quorum=9.27ms`，`apply=166ns`，且 `read_index == applied == 2`，没有等 apply）。即：`read_index()` 发出的带 ctx 心跳→follower 回包→leader 确认这一轮，要到下一个 heartbeat tick 才算完。
+| 提交 | idle p99 |
+|---|---|
+| `cb4a704`（apply 独立任务 + 门槛） | **42µs** |
+| `88ab876`（修忙循环） | **10.8ms** ← 退化出现在这里 |
+| `09aa51d` / `2ed0fbc` / HEAD | ~11ms（继承） |
 
-**已排除**：不是测试文件（`git diff cb4a704 HEAD -- arachne/tests/read_latency.rs` 只有一行注释）、不是 profile（一直是 heartbeat 10ms）、不是 rev O 的 `CYCLE_BURST` 批量（设成 1 仍然 46–49ms@50ms）、不是专用线程（`read_latency` 至今用 `tokio::spawn(runtime.run())`，没走 `spawn_dedicated`）；也不是传输唤醒问题（写路径的完整往返只要 1–2ms，同一套 mpsc 唤醒）。
+**根因**：`arachne-testsupport` 的内存传输用 **`std::sync::mpsc`**，它没有 waker 注册能力；手写的 `RecvFuture` 只把 `cx.waker().clone()` 存进自己的字段、**从未向通道订阅**。于是 actor 停在该 future 上时只能被**自己的 tick** 唤醒 → 每条入站 raft 消息最多等一个 heartbeat。`88ab876` 之前，"每轮发空批次 + 每次都 publish 进度"的忙循环一直在替它兜底（actor 始终醒着），所以读数很快；忙循环一修，问题立刻显形——这也解释了早先观察到的"每次写 ~22ms"（leader→follower、follower→leader 两次入站各等一个 tick）。
 
-**结论**：区间落在 `cb4a704`（那时 idle p99 = **372µs**）→ `0bcac99`（现在 ~10ms）之间的 runtime 改动里；`CYCLE_BURST` 与专用线程已排除，剩下的嫌疑集中在 P3 的 `step` 两相改造（`submit_ready` 捕获 + `finish_persisted` 产出 read_states，以及 `advance_apply` 的调用时机）与 `88ab876` 的 busy-loop 修复。
+**修复**（`arachne-testsupport`）：内存 switch 换成 `tokio::sync::mpsc::unbounded`（`send` 仍是同步的，`UnboundedReceiver` 正常注册 waker），删掉手写 future。testsupport 只新增 tokio 的 `sync` feature，`check-deps.sh` Gate C 仍全过（未引入 tonic）。
 
-**下一步（很便宜，约 15 分钟）**：把上面那个"改 interval 看是否线性缩放"的探针当判据，对 `cb4a704..0bcac99` 之间 7 个提交做二分（每次只重建 arachne + 该测试）；定位后修，并在 `read_latency` 里**补一条 idle 门槛断言**（当前门槛只比 storm/写比值，所以这条退化完全看不见——这正是它藏了这么久的原因）。
+**效果**：空闲读 p99 **10.8ms → 230–660µs**（比最早的 372µs 还好）；`read_latency` 整体 **4.2s → 2.2s**；workspace **374 passed** 全绿。
+
+**新增守卫**：`read_latency` 增加 **idle 门槛**（idle p99 ≤ 5ms）。这条守卫当天就抓到了第二个真问题：pipeline 下"空记录周期"会搭上更早周期的 flush（idle 6.7ms）——已在 `WalStorage::persist_ready_records` 修掉（只有本次真的写了记录才提交 flush；FIFO 已保证更早周期的负载在它被报告前已持久）。
+
+**对既有结论的反向影响**：此前所有基于内存传输的延迟/吞吐数字都被这个 tick 放大了，rev O / rev P 的数字应在修好的 harness 上重读。rev O 的批周期结论不变；rev P 的"设备是瓶颈、pipeline 不降 p99"在重测后也不变（修好 harness 后：同步 storm 33–70ms vs pipeline 50–56ms），但 pipeline 下"空闲读可能等一次在途 flush"这条已被记录并缓解。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
