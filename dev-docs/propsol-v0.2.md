@@ -162,6 +162,22 @@ M2 落地 §5.5.4 的快照与压缩时，需把三处此前只有文字规定�
 
 落点：§5.5.3 第 3/5/6 步、§5.5.4；实现 `arachne/src/storage/snapshot.rs`（新）、`meta.rs`、`wal.rs`、`consensus/raft_storage.rs`、`consensus/node.rs`、`runtime/mod.rs`。
 
+### N. v0.2.11：apply 独立任务的通道契约与反压口径（E-rev）
+
+M2 验收 ⑤ 要把 apply 从 actor loop 里挪出去（§347 / §701 R6）。挪动本身是结构问题，但一旦 apply 异步化，「什么时候可以回复客户端」「读什么时候算可见」「提案满了怎么办」就从「同一条控制流上的顺序」变成**跨任务的契约**，必须钉死。
+
+| 决策点 | 选择 | 否决的备选 | 理由 |
+|---|---|---|---|
+| apply 通道形态 | actor → apply **两**条通道：`ApplyRequest`（快照安装 + 已提交条目批量、快照序列化请求）有界；`ReadRequest`（弱读）独立有界 | ①单通道（弱读排在写积压后面）；②共享 `Arc<RwLock<SM>>` | ①`get_stale` 的契约是「读本地已应用状态」，让它排在写积压后面等于把弱读绑上写延迟。②seam 明确 `StateMachine: Send` 而非 `Sync`（单任务独占），加锁会把 apply 的临界区带进 actor。 |
+| apply → actor 进度 | **`watch` 单值**：`{applied_index, applied_bytes_total, failed}` | 有界/无界 mpsc 逐条进度 | actor 只需要「最新应用到哪」；逐条进度会在 actor 慢时反过来阻塞 apply。`watch` 只保最新值且不反压，`applied_bytes_total` 是累计量，与 actor 侧 `sent_bytes_total` 相减即得积压，不必逐条对账。`failed` 为**粘性**字段，合并更新也不会丢。 |
+| apply 滞后时的提案反压 | **字节口径**：`sent_bytes_total − applied_bytes_total ≥ proposal_queue_bytes`（Q7 的 64MB）→ 新提案回 `Busy`，计入 `proposal_busy_total` | ①按条数；②无界吸收 | Q7 已锁定「提案队列按字节计容、触顶 Busy」，但此前**从未接线**。把它对准「已提交但尚未 apply 的字节」才是这条承诺的真实含义：队列不是 actor 内存里的一个 Vec，而是「已经落盘、客户端还看不见」的那段日志。字节口径对大 value 更稳（Q7 原话）。 |
+| 通道满了怎么办 | actor 侧**持有一个待发批次**（`try_send` 失败就留着下轮再试），新到的已提交条目**合并**进去；合并时若新 Ready 带快照则**丢弃被覆盖的旧条目** | ①`send().await` 阻塞 actor；②丢弃条目 | ①阻塞 actor 等于把 apply 的背压传导成读延迟——正是 ⑤ 要消除的。②条目不能丢。合并安全：待发条目必 ≤ commit ≤ 新快照 index，被新快照完全覆盖。 |
+| 快照请求 | 走 `ApplyRequest` 通道（与 apply 同序），apply 任务返回 `(applied_index, bytes)`，actor 再 `term_at` + `create_snapshot` + `compact` | actor 直接读 SM | 同序才能保证快照 index 与内容是同一时刻；Q4 的「创建阻塞 apply」自然成立（apply 任务在序列化期间不 apply）。 |
+| 回复提案的判据 | actor 侧维护 `(client_id, seq_no) → index` 归属，`applied_index ≥ index` 即回复 | apply 任务回传「本批应用的 session 列表」 | actor 本来就知道自己发给 apply 的每条条目（含 index 与命令字节），归属在 actor 侧算只依赖累计进度，apply 任务保持「只管 apply」。 |
+| raft 的 `applied` 由谁推进 | **不碰**：raft-rs 的 `RawNode::advance` 在条目**交付**时（`commit_since_index`）就把 `applied` 推到交付点，`raft.applied` 合法地领先真实 SM 一个「apply 任务积压」。需要「SM 真正应用到哪」的地方（快照 index、读可见性、提案回复）一律用 apply 任务回报的 `applied_index` | 收到进度确认后 `advance_apply_to(applied)` | 实测该做法**直接 fatal**：`applied(1) is out of range [prev_applied(2), …]`——raft-rs 的 `applied_to` 禁止回退。异步 apply 下「交付」与「应用」本就分离，raft 领先是这套 API 的既定模型（所有 raft-rs 应用都这么做）；把两个口径混用才会撞上这条断言。 |
+| 延迟预算口径 | 同一轮内**三个参考量互相约束**：写 p99、弱读 p99、线性一致读 p99；断言「弱读 ≤ 4×写」「线性一致读 ≤ 3×弱读」+ 宽松绝对上限。时钟用 `tokio::time::Instant`（entropy Gate C 只禁 `std::time`） | ①绝对 p99 预算；②只比空载基线 | **实测教训**：`FsyncPolicy::Always` 下写路径每次全量落盘在本机约 10ms（macOS `sync_all`），洪峰中写/弱读/线性读 p99 **齐平在 ~100ms**——瓶颈是写路径的落盘序列化点，不是 apply。绝对阈值只会测出磁盘快慢（慢盘必挂、快盘无意义）；而「空载 vs 洪峰」比值同样由落盘决定。三量互相约束才是在测「apply 任务没有额外排队」：弱读若被 apply 积压拖住会先炸，读与弱读的差则正好是 ReadIndex 轮次 + 等待 read index 被 apply。真实数字：idle 0.5ms / storm 写 106ms、弱读 99ms、线性读 100ms。 |
+
+
 ---
 
 ## 1. 目标与非目标
@@ -722,4 +738,4 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 
 ---
 
-*v0.2.10 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）、逻辑增长触发快照、follower 安装快照的整体替换语义**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.11 完（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）、逻辑增长触发快照、follower 安装快照的整体替换语义**；**v0.2.11 apply 独立任务与反压口径（E-rev）：actor↔apply 两通道 + `watch` 进度、Q7 的 `proposal_queue_bytes` 真正接线为「已提交未 apply」的字节背压（触顶回 `Busy`）、快照请求同序入队、进度确认后才 `advance_apply`、延迟预算用空载/洪峰比值口径**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*

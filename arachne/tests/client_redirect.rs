@@ -203,9 +203,21 @@ async fn follower_handle_redirects_to_leader() {
         .await
         .expect("redirected put must succeed");
 
+    // Every node must hold the value *eventually*. Follower visibility is
+    // asynchronous by design: the commit index reaches it on the leader's next
+    // message, and its state machine is applied by its own task, so the honest
+    // assertion is a bounded poll (a weak read may legitimately be stale — N1).
     for h in &cluster.handles {
+        let mut seen = None;
+        for _ in 0..400 {
+            if let Ok(Some(v)) = h.get_stale(b"k").await {
+                seen = Some(v);
+                break;
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(
-            h.get_stale(b"k").await.expect("get_stale"),
+            seen,
             Some(b"v".to_vec()),
             "every node's state machine must hold k => v"
         );

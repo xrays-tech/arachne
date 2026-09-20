@@ -157,6 +157,22 @@ impl KvStateMachine {
         buf
     }
 
+    /// The idempotency session `(client_id, seq_no)` a command belongs to.
+    ///
+    /// `None` for an empty (leader no-op) entry or a truncated command. The
+    /// runtime uses this to attribute an entry it hands to the apply task back
+    /// to the client proposal waiting on it (propsol v0.2.11 N).
+    pub fn command_session(cmd: &[u8]) -> Option<(u64, u64)> {
+        // `[op:1][client_id:8][seq_no:8]` — the same layout `parse_command`
+        // validates, minus the payload.
+        if !matches!(cmd.first(), Some(&OP_PUT) | Some(&OP_DELETE)) {
+            return None;
+        }
+        let client_id = u64::from_le_bytes(cmd.get(1..9)?.try_into().ok()?);
+        let seq_no = u64::from_le_bytes(cmd.get(9..17)?.try_into().ok()?);
+        Some((client_id, seq_no))
+    }
+
     /// Whether the session `(client_id, seq_no)` has been applied, i.e. its
     /// result is cached in the session table.
     ///
@@ -362,6 +378,18 @@ mod tests {
 
     /// The same `(client_id, seq_no)` applies exactly once: a replay at a later
     /// index returns the cached result without re-mutating state.
+    #[test]
+    fn command_session_extracts_the_idempotency_key() {
+        let put = KvStateMachine::encode_put(7, 3, b"k", b"v");
+        assert_eq!(KvStateMachine::command_session(&put), Some((7, 3)));
+        let del = KvStateMachine::encode_delete(9, 4, b"k");
+        assert_eq!(KvStateMachine::command_session(&del), Some((9, 4)));
+        // A no-op entry (the leader's term record) has no session.
+        assert_eq!(KvStateMachine::command_session(&[]), None);
+        // So does a truncated command.
+        assert_eq!(KvStateMachine::command_session(&[1, 2, 3]), None);
+    }
+
     #[test]
     fn session_dedup_applies_exactly_once() {
         let mut sm = KvStateMachine::new();

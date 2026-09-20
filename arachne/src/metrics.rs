@@ -35,6 +35,13 @@ pub struct Metrics {
     snapshots_created_total: AtomicU64,
     /// Snapshots received from a leader and installed.
     snapshots_installed_total: AtomicU64,
+    /// Entries committed but not yet applied (the apply task's backlog).
+    apply_lag: AtomicU64,
+    /// Bytes committed but not yet applied (the backpressure signal, Q7).
+    apply_backlog_bytes: AtomicU64,
+    /// Proposals rejected with `Busy` because the apply backlog was over the
+    /// byte bound (propsol v0.2.11 N).
+    proposal_busy_total: AtomicU64,
 }
 
 impl Metrics {
@@ -108,6 +115,32 @@ impl Metrics {
     pub fn inc_snapshots_installed(&self) {
         self.snapshots_installed_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the apply backlog: entries (and bytes) committed but not applied.
+    pub fn set_apply_backlog(&self, entries: u64, bytes: u64) {
+        self.apply_lag.store(entries, Ordering::Relaxed);
+        self.apply_backlog_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Increment the counter of proposals rejected by apply backpressure.
+    pub fn inc_proposal_busy(&self) {
+        self.proposal_busy_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Entries committed but not yet applied.
+    pub fn apply_lag(&self) -> u64 {
+        self.apply_lag.load(Ordering::Relaxed)
+    }
+
+    /// Bytes committed but not yet applied.
+    pub fn apply_backlog_bytes(&self) -> u64 {
+        self.apply_backlog_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Proposals rejected with `Busy` by apply backpressure.
+    pub fn proposal_busy_total(&self) -> u64 {
+        self.proposal_busy_total.load(Ordering::Relaxed)
     }
 
     /// The on-disk WAL size in bytes.
@@ -245,6 +278,24 @@ impl Metrics {
             "Snapshots received from a leader and installed.",
             self.snapshots_installed_total.load(Ordering::Relaxed),
         );
+        gauge(
+            &mut out,
+            "arachne_apply_lag",
+            "Entries committed but not yet applied to the state machine.",
+            self.apply_lag.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "arachne_apply_backlog_bytes",
+            "Bytes committed but not yet applied (the proposal backpressure signal).",
+            self.apply_backlog_bytes.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "arachne_proposal_busy_total",
+            "Proposals rejected with Busy because the apply backlog was too deep.",
+            self.proposal_busy_total.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -300,6 +351,8 @@ mod tests {
         m.inc_snapshots_created();
         m.inc_snapshots_installed();
         m.inc_snapshots_installed();
+        m.set_apply_backlog(7, 2048);
+        m.inc_proposal_busy();
         let text = m.render();
         for name in [
             "arachne_term",
@@ -315,6 +368,9 @@ mod tests {
             "arachne_snapshot_last_size_bytes",
             "arachne_snapshots_created_total",
             "arachne_snapshots_installed_total",
+            "arachne_apply_lag",
+            "arachne_apply_backlog_bytes",
+            "arachne_proposal_busy_total",
         ] {
             assert!(text.contains(name), "missing {name}");
         }
@@ -333,6 +389,12 @@ mod tests {
         assert!(text.contains("# TYPE arachne_snapshots_created_total counter"));
         assert!(text.contains("arachne_snapshots_created_total 1"));
         assert!(text.contains("arachne_snapshots_installed_total 2"));
+        assert!(text.contains("arachne_apply_lag 7"));
+        assert!(text.contains("arachne_apply_backlog_bytes 2048"));
+        assert!(text.contains("arachne_proposal_busy_total 1"));
+        assert_eq!(m.apply_lag(), 7);
+        assert_eq!(m.apply_backlog_bytes(), 2048);
+        assert_eq!(m.proposal_busy_total(), 1);
         assert_eq!(m.wal_bytes(), 4096);
         assert!(m.is_leader());
         assert_eq!(m.leader_id(), 1);

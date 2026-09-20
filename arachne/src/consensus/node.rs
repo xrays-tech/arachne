@@ -480,6 +480,7 @@ where
         self.raw.advance_apply();
     }
 
+
     /// The highest log index applied so far (0 if none).
     pub fn applied_index(&self) -> LogIndex {
         self.raw.raft.raft_log.applied

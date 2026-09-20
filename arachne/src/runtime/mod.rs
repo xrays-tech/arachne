@@ -15,6 +15,14 @@
 //! successful reply means the write is durable and visible. Bounded by the
 //! caller's deadline (`Timeout`).
 //!
+//! Applying entries happens on a **separate task** that owns the state machine
+//! (propsol §347 / v0.2.11 N): a saturated apply path must not delay raft's
+//! ticks, inbound peer messages, or the ReadIndex round, which is what dragged
+//! read latency down under a write storm (risk R6). The actor hands committed
+//! work to the task over a bounded channel and learns progress over a `watch`;
+//! weak reads have their own channel so they never queue behind the write
+//! backlog, and proposals are backpressured with `Busy` on the byte bound Q7.
+//!
 //! The runtime is **generic over the transport** (`T`/`Tr`) so the same actor
 //! drives the in-memory transport in tests and the tonic transport in
 //! production; it names no concrete transport type.
@@ -26,7 +34,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use slog::Logger;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::client::{ArachneError, Handle};
 use crate::consensus::{NodeError, RaftNode, RaftNodeConfig};
@@ -35,7 +43,9 @@ use crate::profile::ProfileConfig;
 use crate::state_machine::KvStateMachine;
 use crate::storage::WalStorage;
 use crate::{LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx};
-use arachne_seam::storage::{ConfState as SeamConfState, Storage as _};
+use arachne_seam::storage::{
+    ConfState as SeamConfState, Snapshot as SeamSnapshot, Storage as _,
+};
 
 /// Approximate per-entry durable overhead (record header, type byte, and the
 /// index/term fields) used to size the snapshot trigger.
@@ -108,6 +118,10 @@ struct Pending {
     seq_no: u64,
     ack: Option<oneshot::Sender<Result<(), ArachneError>>>,
     deadline: Instant,
+    /// The log index carrying this proposal's entry, once the actor has handed
+    /// it to the apply task. `None` until then; the reply follows the applied
+    /// index (propsol v0.2.11 N).
+    index: Option<LogIndex>,
 }
 
 /// A linearizable (ReadIndex) read awaiting quorum confirmation and apply
@@ -131,16 +145,218 @@ struct PendingRead {
 /// Beyond this, new reads are rejected with `Busy`.
 const MAX_PENDING_READS: usize = 4096;
 
+/// How many apply batches may sit in the channel in front of the apply task.
+///
+/// This is the hard safety net, not the operative bound: the byte bound
+/// (`proposal_queue_bytes`, Q7) stops proposals long before 256 batches could
+/// pile up, so the actor rarely has to defer a batch at all.
+const APPLY_QUEUE_DEPTH: usize = 256;
+
+/// How many weak reads may be queued for the apply task.
+const READ_QUEUE_DEPTH: usize = MAX_PENDING_READS;
+
+/// How many queued weak reads the apply task serves before taking one unit of
+/// write work, so a read flood cannot starve apply.
+const READ_BURST: usize = 64;
+
+/// Committed entries for the apply task, in log order.
+///
+/// An installed snapshot and the entries that follow it travel in **one**
+/// batch: the task must never observe them out of order, and the entries start
+/// at `snapshot.index + 1`.
+struct ApplyBatch {
+    /// A snapshot to `restore` before the entries, if one was installed.
+    snapshot: Option<SeamSnapshot>,
+    /// Committed entries `(index, data)`, ascending.
+    entries: Vec<(LogIndex, Vec<u8>)>,
+}
+
+/// Requests the actor sends to the apply task, in order.
+enum ApplyRequest {
+    /// Apply a batch.
+    Batch(ApplyBatch),
+    /// Serialize the applied state for a local snapshot. Sent on this channel
+    /// so the snapshot index is exactly the applied index at that point — and
+    /// so serializing blocks apply, which is what Q4 accepted.
+    Snapshot {
+        ack: oneshot::Sender<Result<(LogIndex, Vec<u8>), String>>,
+    },
+}
+
+/// A weak read (`get_stale`, propsol N1), on its **own** channel so it never
+/// waits behind the write backlog.
+struct ReadRequest {
+    key: Vec<u8>,
+    ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
+}
+
+/// The apply task's published state.
+///
+/// A `watch` keeps only the newest value and never blocks the apply task on a
+/// slow actor; `applied_bytes_total` is cumulative, so the actor derives the
+/// backlog by subtracting what it has sent (propsol v0.2.11 N).
+#[derive(Clone, Default)]
+struct ApplyProgress {
+    /// Highest applied log index.
+    applied_index: LogIndex,
+    /// Cumulative bytes of entries applied.
+    applied_bytes_total: u64,
+    /// Sticky fail-stop reason: once set, the node stops.
+    failed: Option<String>,
+}
+
+/// Owns the state machine and applies committed work off the actor's loop.
+struct ApplyTask {
+    sm: KvStateMachine,
+    applies: mpsc::Receiver<ApplyRequest>,
+    reads: mpsc::Receiver<ReadRequest>,
+    progress: watch::Sender<ApplyProgress>,
+    applied_bytes_total: u64,
+    failed: Option<String>,
+}
+
+impl ApplyTask {
+    /// Serve queued weak reads, then one unit of write work, then wait.
+    ///
+    /// Reads jump the queue (a weak read must not wait for the write backlog)
+    /// but are served in bounded bursts, so they cannot starve apply.
+    async fn run(mut self) {
+        let mut reads_open = true;
+        loop {
+            if reads_open {
+                for _ in 0..READ_BURST {
+                    match self.reads.try_recv() {
+                        Ok(req) => self.serve_read(req),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            reads_open = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            match self.applies.try_recv() {
+                Ok(req) => {
+                    if !self.handle(req) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+
+            tokio::select! {
+                biased;
+                maybe = self.reads.recv(), if reads_open => {
+                    match maybe {
+                        Some(req) => self.serve_read(req),
+                        // The actor dropped its read sender; keep applying.
+                        None => reads_open = false,
+                    }
+                }
+                maybe = self.applies.recv() => {
+                    match maybe {
+                        Some(req) => {
+                            if !self.handle(req) {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fn serve_read(&self, req: ReadRequest) {
+        let value = self.sm.get(&req.key).map_err(|e| {
+            ArachneError::Unrecoverable(format!("state machine read failed: {e}"))
+        });
+        let _ = req.ack.send(value);
+    }
+
+    /// Returns `false` when the task must stop.
+    fn handle(&mut self, req: ApplyRequest) -> bool {
+        match req {
+            ApplyRequest::Batch(batch) => {
+                if let Some(snapshot) = batch.snapshot
+                    && let Err(e) = self.sm.restore(&snapshot.data)
+                {
+                    return self.fail(format!(
+                        "state machine restore failed for the snapshot at {}: {e}",
+                        snapshot.meta.index
+                    ));
+                }
+                for (index, data) in batch.entries {
+                    if let Err(e) = self.sm.apply(index, &data) {
+                        return self.fail(format!("state machine apply failed: {e}"));
+                    }
+                    self.applied_bytes_total += data.len() as u64 + ENTRY_FRAMING_BYTES;
+                }
+                self.publish();
+                true
+            }
+            ApplyRequest::Snapshot { ack } => {
+                let result = self
+                    .sm
+                    .snapshot()
+                    .map(|data| (self.sm.applied_index(), data))
+                    .map_err(|e| e.to_string());
+                let _ = ack.send(result);
+                true
+            }
+        }
+    }
+
+    fn fail(&mut self, reason: String) -> bool {
+        self.failed = Some(reason);
+        self.publish();
+        false
+    }
+
+    fn publish(&self) {
+        let _ = self.progress.send(ApplyProgress {
+            applied_index: self.sm.applied_index(),
+            applied_bytes_total: self.applied_bytes_total,
+            failed: self.failed.clone(),
+        });
+    }
+}
+
 enum Outcome {
     Tick,
     Inbound(Option<(NodeId, TransportMessage)>),
+    /// The apply task published new progress (or stopped).
+    Progress(Result<(), watch::error::RecvError>),
     Command(Option<Command>),
 }
 
 /// The node runtime actor.
 pub struct Runtime<T: Transport, Tr: TransportRx> {
     node: RaftNode<WalStorage, T, Tr>,
-    sm: KvStateMachine,
+    /// The apply task, handed to `run` to spawn. `None` once running.
+    apply_task: Option<ApplyTask>,
+    /// Committed work for the apply task (bounded; see [`APPLY_QUEUE_DEPTH`]).
+    applies: mpsc::Sender<ApplyRequest>,
+    /// Weak reads, on their own channel so they never queue behind writes.
+    reads: mpsc::Sender<ReadRequest>,
+    /// The apply task's published progress.
+    progress: watch::Receiver<ApplyProgress>,
+    /// A batch that did not fit the apply channel, retried next cycle. At most
+    /// one, so a full channel cannot grow the actor's memory without bound.
+    deferred: Option<ApplyBatch>,
+    /// A local snapshot the apply task is serializing.
+    snapshot_wait: Option<oneshot::Receiver<Result<(LogIndex, Vec<u8>), String>>>,
+    /// The last confirmed applied index (from the apply task).
+    applied_index: LogIndex,
+    /// Cumulative bytes confirmed applied.
+    applied_bytes_total: u64,
+    /// Cumulative bytes handed to the apply task (for backlog accounting).
+    sent_bytes_total: u64,
+    /// Byte bound on committed-but-unapplied work (Q7 `proposal_queue_bytes`).
+    proposal_queue_bytes: u64,
     metrics: Arc<Metrics>,
     raft_id: RaftId,
     self_node: NodeId,
@@ -169,12 +385,12 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     /// When the physical WAL size was last sampled (see
     /// [`WAL_SAMPLE_INTERVAL`]).
     last_wal_sample: Instant,
-    /// Bytes of applied log written since the last snapshot — the trigger's
-    /// input. This is the *logical* growth of the log, not the physical size
-    /// of the segment files: v1 compacts whole segments, so a segment holding
-    /// a compacted prefix keeps its bytes until it rolls over, and using
+    /// Applied bytes at the last snapshot — the trigger counts growth since
+    /// then. This is the *logical* growth of the log, not the physical size of
+    /// the segment files: v1 compacts whole segments, so a segment holding a
+    /// compacted prefix keeps its bytes until it rolls over, and using
     /// physical size would re-fire the trigger on every entry.
-    bytes_since_snapshot: u64,
+    applied_bytes_at_snapshot: u64,
     /// The index of the newest snapshot this node created or installed. Guards
     /// against re-taking a snapshot at an index that is already covered.
     snapshot_index: LogIndex,
@@ -212,6 +428,24 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             )));
         }
 
+        // The apply task owns the state machine from here on (propsol N).
+        let applied_index = sm.applied_index();
+        let (applies, applies_rx) = mpsc::channel(APPLY_QUEUE_DEPTH);
+        let (reads, reads_rx) = mpsc::channel(READ_QUEUE_DEPTH);
+        let (progress_tx, progress) = watch::channel(ApplyProgress {
+            applied_index,
+            applied_bytes_total: 0,
+            failed: None,
+        });
+        let apply_task = ApplyTask {
+            sm,
+            applies: applies_rx,
+            reads: reads_rx,
+            progress: progress_tx,
+            applied_bytes_total: 0,
+            failed: None,
+        };
+
         let node = RaftNode::new_with_config(
             config.self_raft_id,
             config.peers.clone(),
@@ -245,7 +479,16 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         let period = Duration::from_millis(config.profile.heartbeat_interval_ms.max(1));
         let runtime = Self {
             node,
-            sm,
+            apply_task: Some(apply_task),
+            applies,
+            reads,
+            progress,
+            deferred: None,
+            snapshot_wait: None,
+            applied_index,
+            applied_bytes_total: 0,
+            sent_bytes_total: 0,
+            proposal_queue_bytes: config.profile.proposal_queue_bytes,
             metrics: config.metrics,
             raft_id: config.self_raft_id,
             self_node: config.self_node_id,
@@ -264,7 +507,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             voters,
             snapshot_threshold_bytes: config.profile.snapshot_threshold_bytes,
             last_wal_sample: Instant::now(),
-            bytes_since_snapshot: 0,
+            applied_bytes_at_snapshot: 0,
             snapshot_index,
         };
         runtime.refresh_metrics();
@@ -273,12 +516,16 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
 
     /// Run the actor until the transport closes or the command channel ends.
     pub async fn run(mut self) {
+        if let Some(task) = self.apply_task.take() {
+            tokio::spawn(task.run());
+        }
         loop {
             let outcome = tokio::select! {
                 biased;
                 _ = self.tick.tick() => Outcome::Tick,
-                msg = self.node.rx().recv() => Outcome::Inbound(msg),
+                progress = self.progress.changed() => Outcome::Progress(progress),
                 cmd = self.commands.recv() => Outcome::Command(cmd),
+                msg = self.node.rx().recv() => Outcome::Inbound(msg),
             };
             match outcome {
                 Outcome::Tick => self.node.tick(),
@@ -288,6 +535,22 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }
                 }
                 Outcome::Inbound(None) => break,
+                // Progress is absorbed at the top of `drive_cycle`; this event
+                // just wakes the loop so replies and reads see it promptly.
+                Outcome::Progress(Ok(())) => {}
+                Outcome::Progress(Err(_)) => {
+                    // The apply task is gone. It publishes a failure reason
+                    // before stopping, so prefer that.
+                    let reason = self
+                        .progress
+                        .borrow()
+                        .failed
+                        .clone()
+                        .unwrap_or_else(|| "the apply task stopped".to_string());
+                    self.fail_all_pending(&reason);
+                    self.metrics.set_is_leader(false);
+                    break;
+                }
                 Outcome::Command(Some(cmd)) => self.handle_command(cmd),
                 Outcome::Command(None) => break,
             }
@@ -302,6 +565,12 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// read-states, then resolve reads and reply to pendings. Returns `false`
     /// on a fatal (fail-stop) error.
     async fn drive_cycle(&mut self) -> bool {
+        // Apply progress first: replies to proposals and the resolution of
+        // ReadIndex reads both depend on the applied index (propsol N).
+        if !self.absorb_progress() || !self.poll_snapshot() {
+            return false;
+        }
+
         let outcome = match self.node.step().await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -311,36 +580,13 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         };
 
-        if let Some(snapshot) = outcome.snapshot {
-            // An installed snapshot replaces the *entire* state, including the
-            // idempotency session table (propsol §5.5.4): a follower that
-            // restored without it would re-apply retried writes. The storage
-            // already persisted the snapshot and reset the log, so this is the
-            // in-memory half of the install.
-            if let Err(e) = self.sm.restore(&snapshot.data) {
-                self.fail_all_pending(&format!(
-                    "state machine restore failed for the snapshot at {}: {e}",
-                    snapshot.meta.index
-                ));
-                self.metrics.set_is_leader(false);
-                return false;
-            }
-            self.snapshot_index = self.snapshot_index.max(snapshot.meta.index);
-            // The installed snapshot already covers everything applied so far,
-            // so the local trigger starts counting from here.
-            self.bytes_since_snapshot = 0;
-            self.metrics.inc_snapshots_installed();
-        }
-
-        for (index, data) in outcome.committed {
-            if let Err(e) = self.sm.apply(index, &data) {
-                self.fail_all_pending(&format!("state machine apply failed: {e}"));
-                self.metrics.set_is_leader(false);
-                return false;
-            }
-            // Approximate the durable footprint of this entry (framing, type
-            // byte, index/term header, payload) for the snapshot trigger.
-            self.bytes_since_snapshot += data.len() as u64 + ENTRY_FRAMING_BYTES;
+        // Hand committed work to the apply task. It owns the state machine, so
+        // a saturated apply path can no longer keep the actor from ticking or
+        // from answering the ReadIndex round (propsol §347).
+        if !self.enqueue_apply(outcome.snapshot, outcome.committed) {
+            self.fail_all_pending("the apply task stopped");
+            self.metrics.set_is_leader(false);
+            return false;
         }
 
         // Quorum-confirmed read states (propsol §5.4 step 2): record the read
@@ -358,7 +604,6 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         }
 
-        self.node.advance_apply();
         self.resolve_reads();
         self.reply_pendings();
         if !self.maybe_snapshot() {
@@ -366,6 +611,107 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         }
         self.refresh_metrics();
         true
+    }
+
+    /// Apply the task's progress to the actor's view, and advance raft's
+    /// applied index to match (propsol N). Returns `false` on a fail-stop.
+    fn absorb_progress(&mut self) -> bool {
+        let progress = self.progress.borrow().clone();
+        self.applied_index = progress.applied_index;
+        self.applied_bytes_total = progress.applied_bytes_total;
+        if let Some(reason) = progress.failed {
+            self.fail_all_pending(&reason);
+            self.metrics.set_is_leader(false);
+            return false;
+        }
+        // raft's own `applied` is advanced by `RawNode::advance` when the
+        // entries are *handed over* (`commit_since_index`), so it legitimately
+        // leads the state machine by whatever the apply task still has queued.
+        // Moving it here would be moving it backwards — raft-rs treats that as
+        // fatal — and it is not needed: everything that depends on "what the
+        // state machine has really applied" (snapshots, reads, replies) goes
+        // through `self.applied_index` (propsol v0.2.11 N).
+        true
+    }
+
+    /// Bytes committed but not yet applied — the backpressure signal (Q7).
+    fn apply_backlog_bytes(&self) -> u64 {
+        self.sent_bytes_total.saturating_sub(self.applied_bytes_total)
+    }
+
+    /// Hand committed work to the apply task, attributing entries to waiting
+    /// proposals. Returns `false` if the apply task is gone.
+    fn enqueue_apply(
+        &mut self,
+        snapshot: Option<SeamSnapshot>,
+        entries: Vec<(LogIndex, Vec<u8>)>,
+    ) -> bool {
+        if let Some(snapshot) = &snapshot {
+            // Storage already persisted it; the apply task restores it in order
+            // with the entries that follow, and a restore failure is a
+            // fail-stop reported as progress.
+            self.snapshot_index = self.snapshot_index.max(snapshot.meta.index);
+            // The snapshot covers everything applied so far, so the local
+            // trigger starts counting from here.
+            self.applied_bytes_at_snapshot = self.applied_bytes_total;
+            self.metrics.inc_snapshots_installed();
+        }
+
+        for (index, data) in &entries {
+            // Attribute before the data moves: the actor knows which session
+            // each entry carries, so a reply needs only the applied index.
+            if let Some((client_id, seq_no)) = KvStateMachine::command_session(data)
+                && let Some(p) = self
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.index.is_none() && p.client_id == client_id && p.seq_no == seq_no)
+            {
+                p.index = Some(*index);
+            }
+            self.sent_bytes_total += data.len() as u64 + ENTRY_FRAMING_BYTES;
+        }
+
+        let batch = match self.deferred.take() {
+            Some(mut waiting) => {
+                if let Some(snapshot) = snapshot {
+                    // A newer snapshot supersedes what is still waiting: the
+                    // deferred entries are at or below its index.
+                    waiting = ApplyBatch {
+                        snapshot: Some(snapshot),
+                        entries,
+                    };
+                } else {
+                    waiting.entries.extend(entries);
+                }
+                waiting
+            }
+            None => ApplyBatch { snapshot, entries },
+        };
+        self.deferred = Some(batch);
+        self.flush_deferred()
+    }
+
+    /// Move the deferred batch into the apply channel if there is room. The
+    /// actor never awaits here: blocking on apply would hand the apply path's
+    /// backpressure to raft's ticks and to reads, which is the opposite of the
+    /// point (propsol N). Returns `false` if the task is gone.
+    fn flush_deferred(&mut self) -> bool {
+        let Some(batch) = self.deferred.take() else {
+            return true;
+        };
+        match self.applies.try_reserve() {
+            Ok(permit) => {
+                permit.send(ApplyRequest::Batch(batch));
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                // Keep it for the next cycle; the byte bound has already
+                // stopped new proposals from deepening the backlog.
+                self.deferred = Some(batch);
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => false,
+        }
     }
 
     /// Take a local snapshot and compact the log once the WAL outgrows
@@ -376,7 +722,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// [`Self::snapshot_index`] — a snapshot is only ever taken at an index
     /// strictly newer than the one already covered.
     fn maybe_snapshot(&mut self) -> bool {
-        let applied = self.sm.applied_index();
+        let applied = self.applied_index;
         let now = Instant::now();
         if now.saturating_duration_since(self.last_wal_sample) >= WAL_SAMPLE_INTERVAL {
             self.last_wal_sample = now;
@@ -390,26 +736,60 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         }
 
+        let grew = self
+            .applied_bytes_total
+            .saturating_sub(self.applied_bytes_at_snapshot);
         if self.snapshot_threshold_bytes == 0
             || applied <= self.snapshot_index
-            || self.bytes_since_snapshot < self.snapshot_threshold_bytes
+            || grew < self.snapshot_threshold_bytes
+            || self.snapshot_wait.is_some()
         {
             return true;
         }
 
-        // The snapshot is of the applied state, so its index must be the
-        // applied index: a snapshot ahead of what this node applied would let
-        // compaction drop entries it never wrote to the state machine.
-        let term = match self.node.term_at(applied) {
-            Ok(term) => term,
-            Err(e) => {
-                self.fail_all_pending(&format!("cannot resolve the term at {applied}: {e}"));
+        // Ask the apply task to serialize the applied state. The request rides
+        // the apply channel so its index is exactly the applied index at that
+        // point, and serializing blocks apply — which is what Q4 accepted
+        // (propsol N).
+        let (ack, rx) = oneshot::channel();
+        match self.applies.try_send(ApplyRequest::Snapshot { ack }) {
+            Ok(()) => {
+                self.snapshot_wait = Some(rx);
+                true
+            }
+            // No room right now: retry on a later cycle.
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.fail_all_pending("the apply task stopped");
+                self.metrics.set_is_leader(false);
+                false
+            }
+        }
+    }
+
+    /// Finish a local snapshot once the apply task has serialized it.
+    ///
+    /// The task reports the index it serialized at, so compaction can never
+    /// drop an entry the snapshot does not cover. Returns `false` on a
+    /// fail-stop.
+    fn poll_snapshot(&mut self) -> bool {
+        let Some(mut rx) = self.snapshot_wait.take() else {
+            return true;
+        };
+        let result = match rx.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.snapshot_wait = Some(rx);
+                return true;
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.fail_all_pending("the apply task stopped while serializing a snapshot");
                 self.metrics.set_is_leader(false);
                 return false;
             }
+            Ok(result) => result,
         };
-        let data = match self.sm.snapshot() {
-            Ok(data) => data,
+        let (index, data) = match result {
+            Ok(pair) => pair,
             Err(e) => {
                 self.fail_all_pending(&format!("state machine snapshot failed: {e}"));
                 self.metrics.set_is_leader(false);
@@ -417,22 +797,29 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         };
         let size_bytes = data.len() as u64;
+        let term = match self.node.term_at(index) {
+            Ok(term) => term,
+            Err(e) => {
+                self.fail_all_pending(&format!("cannot resolve the term at {index}: {e}"));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
+        };
         let conf_state = SeamConfState {
             voters: self.voters.clone(),
             learners: Vec::new(),
         };
-
-        // Q4: snapshot creation blocks apply. It is measured every time so the
-        // >1s budget alarm has data (propsol §8.2).
+        // Q4: creation blocks apply (in the apply task). It is measured every
+        // time so the >1s budget alarm has data (propsol §8.2).
         let started = Instant::now();
-        if let Err(e) = self.node.create_snapshot(applied, term, conf_state, data) {
+        if let Err(e) = self.node.create_snapshot(index, term, conf_state, data) {
             self.fail_all_pending(&format!("snapshot creation failed: {e}"));
             self.metrics.set_is_leader(false);
             return false;
         }
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        self.snapshot_index = applied;
-        self.bytes_since_snapshot = 0;
+        self.snapshot_index = index;
+        self.applied_bytes_at_snapshot = self.applied_bytes_total;
         self.metrics.set_snapshot_last(elapsed_ms, size_bytes);
         self.metrics.inc_snapshots_created();
         true
@@ -452,12 +839,21 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }));
                     return;
                 }
+                // Q7: the bound is on committed-but-unapplied bytes — the log
+                // the client cannot see yet — so a lagging apply path sheds
+                // proposals instead of growing without bound (propsol N).
+                if self.apply_backlog_bytes() >= self.proposal_queue_bytes {
+                    self.metrics.inc_proposal_busy();
+                    let _ = ack.send(Err(ArachneError::Busy));
+                    return;
+                }
                 match self.node.propose(&cmd) {
                     Ok(()) => self.pending.push(Pending {
                         client_id,
                         seq_no,
                         ack: Some(ack),
                         deadline: Instant::now() + self.propose_timeout,
+                        index: None,
                     }),
                     Err(_) => {
                         // A dropped proposal means we are (effectively) not the
@@ -470,7 +866,19 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 }
             }
             Command::GetStale { key, ack } => {
-                let _ = ack.send(self.read_local(&key));
+                // The apply task owns the state machine. This rides its own
+                // channel, so a weak read never queues behind the write
+                // backlog (propsol N1 / v0.2.11 N).
+                if let Err(err) = self.reads.try_send(ReadRequest { key, ack }) {
+                    match err {
+                        mpsc::error::TrySendError::Full(req) => {
+                            let _ = req.ack.send(Err(ArachneError::Busy));
+                        }
+                        mpsc::error::TrySendError::Closed(req) => {
+                            let _ = req.ack.send(Err(ArachneError::ShuttingDown));
+                        }
+                    }
+                }
             }
             Command::Read { key, ack } => {
                 // Only the leader can serve a linearizable read (propsol §5.4
@@ -506,18 +914,16 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         }
     }
 
-    fn read_local(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ArachneError> {
-        self.sm
-            .get(key)
-            .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")))
-    }
-
     /// Reply to proposals that have been applied, and time out overdue ones.
     fn reply_pendings(&mut self) {
         let now = Instant::now();
         let mut still = Vec::with_capacity(self.pending.len());
         for mut p in self.pending.drain(..) {
-            if self.sm.applied_session(p.client_id, p.seq_no) {
+            // The entry the proposal was attributed to is applied once the
+            // applied index reaches it (propsol v0.2.11 N). A proposal whose
+            // entry never reached the apply task keeps `None` and times out.
+            let applied = matches!(p.index, Some(index) if self.applied_index >= index);
+            if applied {
                 if let Some(ack) = p.ack.take() {
                     let _ = ack.send(Ok(()));
                 }
@@ -559,10 +965,23 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
 
             let applied = matches!(
                 r.read_index,
-                Some(idx) if self.sm.applied_index() >= idx
+                Some(idx) if self.applied_index >= idx
             );
             if applied {
-                let _ = r.ack.take().map(|ack| ack.send(self.read_local(&r.key)));
+                if let Some(ack) = r.ack.take() {
+                    // Fetch through the apply task (it owns the state machine)
+                    // and let it reply directly to the caller.
+                    if let Err(err) = self.reads.try_send(ReadRequest { key: r.key, ack }) {
+                        match err {
+                            mpsc::error::TrySendError::Full(req) => {
+                                let _ = req.ack.send(Err(ArachneError::Busy));
+                            }
+                            mpsc::error::TrySendError::Closed(req) => {
+                                let _ = req.ack.send(Err(ArachneError::ShuttingDown));
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -619,7 +1038,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         let hs = self.node.hard_state();
         self.metrics.set_term(hs.term);
         self.metrics.set_commit_index(hs.commit);
-        self.metrics.set_applied_index(self.sm.applied_index());
+        self.metrics.set_applied_index(self.applied_index);
+        self.metrics.set_apply_backlog(
+            hs.commit.saturating_sub(self.applied_index),
+            self.apply_backlog_bytes(),
+        );
         self.metrics.set_leader_id(self.node.leader_id());
         self.metrics
             .set_is_leader(self.node.leader_id() == self.raft_id);
@@ -632,8 +1055,8 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         &self.self_node
     }
 
-    /// The highest applied log index.
+    /// The highest applied log index (as reported by the apply task).
     pub fn applied_index(&self) -> LogIndex {
-        self.sm.applied_index()
+        self.applied_index
     }
 }

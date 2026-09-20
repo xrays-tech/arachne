@@ -214,12 +214,31 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 
 **该 ④ 测试暴露并修掉一个客户端错误映射缺陷（`client/handle.rs`）**：重定向链里若某个 peer 已经消失（其命令通道关闭），原实现把该 peer 的 **`ShuttingDown`**（"本节点正在关闭"）原样抛给调用方——语义完全错位，且与 §2.1 承诺的 `QuorumUnavailable` 不符。现在：目标不是自己且报 `ShuttingDown` → 视为"该 peer 不可达"，继续尝试下一个候选；所有 peer 都不可达 → `QuorumUnavailable`。目标是**自己**时的 `ShuttingDown` 仍原样上抛（那才是真的本节点在关闭）。`put`/`get` 两条重定向路径同改。
 
-**M2 验收进度**：①（快照/压缩/追赶）与 ②（追赶中杀 leader）已证；④（杀多数派：写与线性读 `QuorumUnavailable`、`get_stale` 仍可用）已证；③（任意分区拓扑下 `get` 线性一致，INV14 S02/S16）由 stage 3c 的 9 种形态覆盖；⑤（apply 独立任务下写洪峰时 `get` p99 有界 + 延迟预算基准入 CI）**未做**。
+**M2 验收进度**：①②③④ 已证；⑤ 已落地（apply 独立任务 + Q7 反压 + 延迟冒烟门槛入 CI，见 §1.10）。
 
 **如实声明（M2 仍未做）**：
 - 快照传输仍是**单条 `Ready` 承载**，未分片流式（§5.5.4 的 server-streaming 分片随传输层快照 RPC 落地）；安装期间本地读返回 `Busy` 也未实现（v1 安装是同步阻塞的）。
 - 字节级 `wal_trailing_keep` 窗口未接线（旋钮只在 `ProfileConfig`，未下沉 `WalConfig`），慢 follower 一律走快照路径（rev M 已记录：优化而非正确性）。
 - `snapshot_last_duration_ms` 已上报，但 `>1s` 的**告警发射**在 `arachne-node` 侧，尚未接线。
+
+### 1.10 M2 第三块：apply 独立任务 + 反压 + 延迟冒烟门槛（M2 验收 ⑤，propsol v0.2.11 N）
+
+设计权威：propsol **rev N**（8 行决议：通道形态、进度用 `watch`、Q7 字节反压、通道满时合并待发批次、快照请求同序入队、回复归属在 actor 侧算、raft `applied` 不碰、延迟预算口径）。实现：
+
+- **apply 任务**（`runtime/mod.rs` 新 `ApplyTask`）：独占 `KvStateMachine`，从 actor 收 `ApplyRequest`（批量 = 可选快照 + 紧随条目，或快照序列化请求），向 actor 发 `watch` 进度 `{applied_index, applied_bytes_total, failed}`。actor 不再持有 SM。
+- **弱读独立通道**：`get_stale` 与线性读取值走 `ReadRequest` 专用通道，apply 任务**优先**以有界突发（`READ_BURST=64`）服务，再处理一个写单元 → 弱读不排写积压后面，也不会饿死 apply。
+- **提案反压（Q7 首次真正接线）**：actor 记 `sent_bytes_total`，apply 任务回累计 `applied_bytes_total`，`backlog ≥ proposal_queue_bytes`（64MB）即回 `Busy` 并计 `proposal_busy_total`。此前该旋钮只在 `ProfileConfig` 里躺着，从未生效。
+- **通道满不阻塞 actor**：`try_reserve` 失败就把批次留在 `deferred` 下轮再试，新到条目**合并**进去（同序；若新 Ready 带快照则丢弃被覆盖的待发条目）——`send().await` 会把 apply 的背压变成读延迟，正是 ⑤ 要消除的。
+- **快照**：actor 发 `ApplyRequest::Snapshot`（与 apply 同序，index 精确），任务返回 `(applied_index, bytes)` 后 actor 才 `term_at` + `create_snapshot` + `compact`；Q4 的「创建阻塞 apply」自然成立。
+- **回复提案**：actor 在把条目交给 apply 时按命令字节提取 `(client_id, seq_no) → index`（新增 `KvStateMachine::command_session`），`applied_index ≥ index` 即回复。指标新增 `apply_lag`、`apply_backlog_bytes`、`proposal_busy_total`。
+
+**踩到并修正的两个真问题**：
+1. **不能按「进度确认」推进 raft 的 applied**：第一版在 `absorb_progress` 里调 `advance_apply_to(applied_index)`，直接 fatal——`applied(1) is out of range [prev_applied(2), …]`。raft-rs 的 `RawNode::advance` 在条目**交付**时就把 `applied` 推到交付点（`commit_since_index`），异步 apply 下「交付」与「应用」本就分离；`applied_to` 又禁止回退。改成**完全不碰**，凡需要「SM 真正应用到哪」的地方（快照 index、读可见性、提案回复）一律用 apply 任务回报的 `applied_index`。rev N 该行已按实测改写。
+2. **`client_redirect` 的即时可见断言过强**：`follower_handle_redirects_to_leader` 原本在 leader ack 后立刻断言**每个节点**的 `get_stale` 都能看到值。这在同步 apply 时代也是靠时序侥幸（follower 要靠 leader 的下一条消息才知道 commit），apply 异步化后窗口变大；改为有界轮询（弱读本可陈旧，N1）。**注意**：这不是把 bug 测过去——该测试的语义是「写最终落到每个节点」，而「弱读立即可见」从来不是承诺。
+
+**延迟冒烟门槛（`arachne/tests/read_latency.rs`，随 `cargo test --workspace` 进 CI）**：3 节点真实 runtime，120 次 `get` 采样；同一轮内测三个量——写 p99、弱读 p99、线性一致读 p99，断言「弱读 ≤ 4×写」「线性读 ≤ 3×弱读」+ 2s 绝对上限。**为什么不是绝对 p99 预算**（这是本轮最有价值的实测结论）：`FsyncPolicy::Always` 下写路径每次全量落盘在本机约 **10ms**（macOS `sync_all` 是整设备刷新），洪峰中 actor 的 `drive_cycle` 就是 11–12ms；实测 idle 0.5ms、洪峰**写 106ms / 弱读 99ms / 线性读 100ms 三者齐平**——瓶颈是写路径的落盘序列化点，apply 任务没有额外排队（这正是 ⑤ 要证的东西）。绝对阈值只会测出磁盘快慢；「空载 vs 洪峰」比值同样由落盘决定。三量互相约束才在测「apply 没加队列」。稳定性：连跑 3 次比值 0.5–0.9× 与 1.2–1.6×，余量充足。
+
+**如实声明（接线到此为止的部分）**：阻塞式存储 I/O（fsync）仍在 async worker 线程上同步执行，是洪峰中一切客户端延迟的共同上界；把 WAL 落盘挪到专用阻塞线程/`spawn_blocking`（或异步 I/O 后端）是**下一步**的独立增量，本轮未做也未宣称。另：本轮未改 `BatchMs` 语义（其注释仍写 "advisory until P4"）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
