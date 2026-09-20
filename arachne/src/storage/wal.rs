@@ -184,6 +184,12 @@ pub struct StorageStats {
     pub dir_fsyncs: u64,
     /// Number of records removed by auto-truncation during recovery.
     pub wal_truncated_records: u64,
+    /// Real `fsync`s performed **off the actor thread** by the durability
+    /// pipeline (propsol v0.2.13 P). One such flush covers every entry and
+    /// HardState record written into the segment since the previous flush, so
+    /// it is counted here rather than in `entry_fsyncs`/`hard_state_fsyncs`
+    /// (which count the synchronous barriers).
+    pub offloaded_fsyncs: u64,
 }
 
 /// The outcome of a [`WalStorage::force_recovery`] rewrite (propsol §6.1).
@@ -935,6 +941,51 @@ impl WalStorage {
             file,
             segment_first_index: self.segment_first_index,
         })
+    }
+
+    /// Append entries **without** flushing them (propsol v0.2.13 P).
+    ///
+    /// The records become readable to raft (and to recovery) but are only
+    /// durable after [`FlushHandle::flush`] plus [`WalStorage::note_flushed`],
+    /// or after `sync_entries`. Named separately from [`Storage::append`] so the
+    /// pipeline's intent is visible at the call site; on its own it has exactly
+    /// the same effect.
+    pub fn append_buffered(&mut self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        self.append(entries)
+    }
+
+    /// Write a HardState record **without** flushing it (propsol v0.2.13 P).
+    ///
+    /// The pipeline writes the commit advance here and lets one off-thread
+    /// flush cover both it and the entries written before it in the same
+    /// segment — which is what preserves I1 without paying a second device
+    /// flush. `self.hard_state` (the in-memory view raft reads) is updated
+    /// immediately, as with the flushing variant.
+    pub fn set_hard_state_buffered(&mut self, hs: &HardState) -> Result<(), StorageError> {
+        let payload = encode_hard_state(hs.term, hs.vote, hs.commit);
+        self.segment
+            .append_record(RecordType::HardState, &payload)
+            .map_err(segment_err_to_storage_err)?;
+        // The record is in the active segment and unsynced: a rollover must
+        // flush this segment before switching (the N2 rule), exactly as for
+        // unfsynced entries.
+        self.pending_entry_fsync = true;
+        self.hard_state = hs.clone();
+        Ok(())
+    }
+
+    /// Bookkeeping after a worker's [`FlushHandle::flush`] succeeded.
+    ///
+    /// Durability itself happened in `flush`; this tells the WAL, its counters
+    /// and any [`FsyncObserver`] about it (propsol v0.2.13 P). A flush of a
+    /// segment that is no longer active needs no notification: `maybe_rollover`
+    /// already flushed and notified for the outgoing segment.
+    pub fn note_flushed(&mut self, handle: &FlushHandle) {
+        self.stats.offloaded_fsyncs += 1;
+        if handle.segment_first_index == self.segment_first_index {
+            self.pending_entry_fsync = false;
+            self.notify_fsynced();
+        }
     }
 
     /// Bytes the durable log currently occupies on disk.
@@ -2390,6 +2441,55 @@ mod tests {
         drop(storage);
         let storage = WalStorage::open(&dir, opts).unwrap();
         assert_eq!(storage.last_index().unwrap(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffered_writes_become_durable_only_after_an_offloaded_flush() {
+        use arachne_testsupport::FsyncLedger;
+        use std::sync::Arc;
+
+        let dir = temp_dir();
+        let ledger = Arc::new(FsyncLedger::new());
+        let opts = WalOptions {
+            fsync_observer: Some(Arc::clone(&ledger) as Arc<dyn FsyncObserver>),
+            ..test_opts()
+        };
+        let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+
+        // Write an entry and a commit through the *buffered* path: readable to
+        // raft, not yet durable, and no synchronous flush was paid for.
+        storage.append_buffered(&[make_entry(1, 1, b"a")]).unwrap();
+        let hs = HardState {
+            term: 1,
+            vote: None,
+            commit: 1,
+        };
+        storage.set_hard_state_buffered(&hs).unwrap();
+        assert_eq!(storage.initial_state().unwrap().hard_state.commit, 1);
+        assert!(!ledger.union_covers(1, 1), "nothing is durable yet");
+
+        // The pipeline's flush happens on a worker; `note_flushed` is how the
+        // WAL learns about it (counters + observer).
+        let handle = storage.flush_handle().unwrap();
+        handle.flush().unwrap();
+        storage.note_flushed(&handle);
+
+        assert!(
+            ledger.union_covers(1, 1),
+            "the offloaded flush must make the entry durable for INV1's ledger"
+        );
+        assert_eq!(storage.stats().offloaded_fsyncs, 1);
+        assert_eq!(
+            storage.stats().hard_state_fsyncs,
+            0,
+            "the commit was made durable by the offloaded flush, not by a second one"
+        );
+
+        // And the record really is on disk: a reopen recovers it.
+        drop(storage);
+        let storage = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(storage.initial_state().unwrap().hard_state.commit, 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
