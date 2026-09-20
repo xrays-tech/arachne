@@ -104,6 +104,7 @@ impl Faults {
 /// A deterministic 3-node cluster with harness-controlled delivery.
 struct Cluster {
     n: RaftId,
+    factory: InMemoryTransportFactory,
     dirs: Vec<PathBuf>,
     nodes: Vec<Option<TestNode>>,
     sms: Vec<KvStateMachine>,
@@ -138,6 +139,7 @@ impl Cluster {
 
         Self {
             n,
+            factory,
             dirs,
             nodes,
             sms,
@@ -213,6 +215,27 @@ impl Cluster {
         }
         node.advance_apply();
         reads
+    }
+
+    /// Crash node `i` (task death): drop the node; its WAL dir is retained.
+    fn crash(&mut self, i: RaftId) {
+        self.nodes[(i - 1) as usize] = None;
+    }
+
+    /// Restart node `i` from its WAL, losing volatile state: reopen storage,
+    /// rebuild the raft node (replaying the durable log), and reset the
+    /// in-memory state machine.
+    fn bounce(&mut self, i: RaftId) {
+        let idx = (i - 1) as usize;
+        let dir = self.dirs[idx].clone();
+        let tag = format!("n{i}");
+        let wal = WalStorage::open(&dir, wal_opts(&tag)).expect("reopen wal");
+        let (tx, rx) = self.factory.create(node_id(i));
+        let node = RaftNode::new(i, peers_of(i, self.n), wal, tx, rx, 0, &logger())
+            .expect("rebuild node");
+        self.nodes[idx] = Some(node);
+        self.sms[idx] = KvStateMachine::new();
+        self.committed[idx].clear();
     }
 
     fn leader_of(&self, id: RaftId) -> bool {
@@ -1224,4 +1247,44 @@ fn inv4_same_seq_retry_across_failover_merges() {
     c.cleanup();
 }
 
+/// S01 (true crash): a follower is crashed (task death) and restarted from its
+/// WAL with volatile state lost; it must recover by replay/catch-up, with all
+/// nodes converging to identical logs (INV8) and state (INV3), INV7 holding.
+#[test]
+fn s01_true_crash_wal_restart_recovers() {
+    let _seed = ElectionSeed::enter(0x1_900);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
 
+    // Commit v1 and replicate to everyone.
+    commit_put(&mut c, leader, b"k", ValueId(1), 1);
+    for _ in 0..200 {
+        c.round();
+    }
+
+    let follower = (1..=3).find(|&i| i != leader).expect("a follower exists");
+    c.crash(follower);
+    assert!(
+        c.nodes[(follower - 1) as usize].is_none(),
+        "the follower must be down"
+    );
+
+    // The majority commits v2 while the follower is down.
+    commit_put(&mut c, leader, b"k", ValueId(2), 2);
+
+    // Restart the follower from its WAL (volatile state lost).
+    c.bounce(follower);
+    for _ in 0..1000 {
+        c.round();
+    }
+
+    assert_eq!(
+        c.sms[(follower - 1) as usize].get(b"k").expect("sm get"),
+        Some(vbytes(ValueId(2))),
+        "the restarted follower must recover the committed value"
+    );
+    assert_log_matching(&c.committed);
+    assert_state_agreement(&c, &[1, 2, 3]);
+    assert_single_leader_per_term(&c.leader_obs);
+    c.cleanup();
+}
