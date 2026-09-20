@@ -15,7 +15,7 @@ use arachne::client::Handle;
 use arachne::consensus::RaftNodeConfig;
 use arachne::runtime::{Runtime, RuntimeConfig};
 use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
+use arachne::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
 use arachne_transport_tonic::TonicTransportFactory;
 use slog::Drain;
 
@@ -125,11 +125,49 @@ async fn follower_write_redirects_to_leader_over_tonic() {
         .expect("a leader must be elected");
     let follower = (0..3).find(|i| *i != leader).expect("a follower exists");
 
-    // Write through a FOLLOWER's handle: redirected to the leader.
-    handles[follower]
-        .put(b"k", b"v")
-        .await
-        .expect("follower put must redirect and succeed");
+    // Wait until the CHOSEN FOLLOWER knows the leader: a redirect needs a hint,
+    // and a freshly elected leader has not necessarily reached every follower
+    // yet. A missing hint surfaces as `QuorumUnavailable`, which the handle does
+    // not retry, so asserting a single put here would be racy (it failed on a
+    // 2-core CI runner).
+    let mut follower_knows_leader = false;
+    for _ in 0..800 {
+        if handles[follower].leader_hint().await.is_some() {
+            follower_knows_leader = true;
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        follower_knows_leader,
+        "the follower must learn the leader before a redirect can be attempted"
+    );
+
+    // Write through a FOLLOWER's handle: redirected to the leader. Retry the
+    // transient window errors (`Timeout` / `QuorumUnavailable` / `NotLeader`) —
+    // a leadership change right after the election is not what this test is
+    // about; the redirect itself is (all retries failing still fails the test).
+    let mut last_err = String::new();
+    let mut wrote = false;
+    for _ in 0..200 {
+        match handles[follower].put(b"k", b"v").await {
+            Ok(()) => {
+                wrote = true;
+                break;
+            }
+            Err(e @ ArachneError::Timeout)
+            | Err(e @ ArachneError::QuorumUnavailable)
+            | Err(e @ ArachneError::NotLeader { .. }) => {
+                last_err = e.to_string();
+                tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("follower put failed with a non-transient error: {e}"),
+        }
+    }
+    assert!(
+        wrote,
+        "follower put must redirect and succeed (last transient error: {last_err})"
+    );
 
     // All three nodes converge on the value.
     for i in 0..3 {
