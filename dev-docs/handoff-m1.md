@@ -145,9 +145,9 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **M1 ④（L2）覆盖小结**：S01/S02/S16；INV3/4/7/8/9；双跑确定性；INV4 共 9 种形态（顺序、分区下、换主、并发、多键、分区下并发、ReadIndex 读、故障下 ReadIndex 读+恢复、换主后同 seq 重试 at-most-once）；oracle 负路径（幻值/跨键）；真实 crash+WAL 重启。
 - **剩余（非阻塞）**：更大规模/随机种子历史与更多故障组合。~~follower 服务读的完整来回~~ 已由 `follower_read_index_round_trip_completes` 覆盖（运行时契约差异已记入 `client/mod.rs`）；~~oracle ② 空转~~ 已由 `oracle_check_two_uses_real_log_ids` 激活；~~3b（real-tonic-on-turmoil）~~ **已解决**（§1.6）。
 
-### 1.7 首次 CI 暴露并修复的两个问题（`d788878` + 本次修复）
+### 1.7 CI 暴露并修复的问题（`d788878` + `d13d129` + `a26d21d`）
 
-仓库首次 push 到 GitHub 后 CI 变红（`l2` job 通过），暴露出两个问题：
+仓库首次 push 到 GitHub 后 CI 多次变红（`l2` job 一直通过），暴露出三个问题（其中第 3 个是真正的读路径 liveness bug）：
 
 1. **测试竞态（`d788878`）**：`three_node_client.rs` 只等"存在一个 leader"，随后对 follower 的 handle 只 `put` 一次。重定向需要 leader hint，而新选出的 leader 未必已到达每个 follower；缺 hint 返回 `QuorumUnavailable`（handle 不重试）。本地 macOS 侥幸通过，2 核 CI runner 上失败。改为：先等该 follower 报告 leader hint，再对窗口期错误做**有界重试**（全部失败仍判失败，重定向契约仍被断言）。
 2. **`WalStorage::append` 缺覆盖语义（严重，本次修复）**：raft 在选举后会把**冲突后缀**重新交给存储（follower 必须覆盖上任短命 leader 的条目）。`append` 原本假设纯尾部追加、只用 `debug_assert` 守连续性 → debug 下 panic（`append continuity violation: expected 2, got 1`，actor 任务死亡）→ 测试在后段 `get_stale` 收到 `ShuttingDown`；**release 下 `debug_assert` 被编译掉，会写入重复 index，静默损坏日志**。现在 `append` 在追加前先截断到首个入参 index（复用 force-recovery 的物理截断，改名 `truncate_log_to`）；覆盖**已提交**条目属 raft 安全违规，故 fail-stop。新增 3 个单测（冲突后缀重写 + 重开后的持久性、从 index 1 覆盖、拒绝覆盖已提交）。
@@ -176,6 +176,8 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - **顺带澄清一个语义细节（重要）**：`RaftNode::hard_state().commit` 是 raft 的**内存** commit，可能**领先于持久化 commit**（要到下一个 `step()` 才落盘）。因此 **INV2 的基准必须是"已持久化 commit"**（`DurabilityLedger::persisted_commit`），而不是内存值——我第一版扫描拿内存值当基准，被这个差异判成**假违规**（实测该 follower 的持久 HardState 只有 `(term1,commit0)`、`(term1,commit1)`，而内存 commit 已是 2）。**ack 路径不受影响**：runtime 只在 `step()` 落盘 commit 之后才 apply + ack。
   - **未做**：在 `persist_ready` 与 `deliver`/`apply` 之间**精确注入**崩溃，需要生产代码注入点（测试 feature 下的 hook）→ 需要一条设计记录。
 - **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；ready 阶段的**精确**崩溃注入（同上）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
+
+3. **客户端读截止时间短于 actor 的 ReadIndex 预算（`a26d21d`，本次 CI 再次暴露）**：`Handle` 原本把**所有**操作都限制在一个 `election_timeout` 内——对写是对的（runtime 的 propose 超时相同），对读太短：runtime 的 ReadIndex 路径每次等 `read_index_timeout_ms`（= 2×election）并可重试一次，actor 合法地可能用约 `2×read_index_timeout`（≈4×election）才给出结果。于是客户端在 actor 尚在解析读时就放弃，把一次慢的 ReadIndex 轮次变成客户端可见的 `Timeout`/503。现在读有独立截止：两次 ReadIndex 等待 + 一个 election 的调度余量。CI 上的表现正是 L3 杀 leader 测试偶发失败（换主后新 leader "读不到"杀前值）——实际是读超时而非数据丢失；修完后 CI 绿。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
