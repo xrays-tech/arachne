@@ -23,7 +23,7 @@ use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne::{NodeId, RaftId, StateMachine, TransportFactory};
 use arachne_testsupport::{
     block_on, check_linearizable, CallId, CheckOutcome, ClientId, History, InMemoryRx,
-    InMemoryTransportFactory, InMemoryTx, KvState, Op, OpResult, SeqNo, ValueId,
+    InMemoryTransportFactory, InMemoryTx, Invariant, KvState, Op, OpResult, SeqNo, ValueId,
 };
 use raft::{clear_election_rng_seed, set_election_rng_seed};
 use slog::{o, Drain, Logger};
@@ -952,3 +952,43 @@ fn inv4_concurrent_ops_spanning_failover_linearizable() {
     );
     c.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// Increment 6: the oracle's phantom NEGATIVE path (injected violations)
+// ---------------------------------------------------------------------------
+
+/// A read returning a value that was never written must be flagged as a
+/// phantom by the oracle (exercises the check's negative path at L2).
+#[test]
+fn oracle_flags_injected_phantom_read() {
+    let mut h = History::new();
+    h.invoke(CallId(1), ClientId(0), SeqNo(0), Op::Get { key: b"k".to_vec() }, 0)
+        .complete(CallId(1), 1, OpResult::Ok(Some(ValueId(999))));
+
+    let report = h.check();
+    assert!(!report.passed(), "an injected phantom must fail the oracle");
+    assert!(
+        report.violated().contains(&Invariant::PhantomValue),
+        "it must be tagged as a phantom violation: {}",
+        report.render()
+    );
+}
+
+/// A read of key `b` returning a value that was only ever written to key `a`
+/// (cross-key confusion) must also be flagged as a phantom.
+#[test]
+fn oracle_flags_cross_key_phantom_read() {
+    let mut h = History::new();
+    h.invoke(CallId(1), ClientId(0), SeqNo(0), Op::Put { key: b"a".to_vec(), value: ValueId(1) }, 0)
+        .complete(CallId(1), 1, OpResult::Ok(None));
+    h.invoke(CallId(2), ClientId(0), SeqNo(1), Op::Get { key: b"b".to_vec() }, 2)
+        .complete(CallId(2), 3, OpResult::Ok(Some(ValueId(1))));
+
+    let report = h.check();
+    assert!(
+        report.violated().contains(&Invariant::PhantomValue),
+        "a cross-key read must be a phantom: {}",
+        report.render()
+    );
+}
+
