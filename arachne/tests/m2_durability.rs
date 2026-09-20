@@ -36,7 +36,8 @@ use arachne::consensus::RaftNode;
 use arachne::state_machine::KvStateMachine;
 use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne::{
-    FsyncObserver, NodeId, RaftId, StateMachine, Transport, TransportFactory, TransportMessage,
+    FsyncObserver, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportFactory,
+    TransportMessage,
 };
 use arachne_testsupport::{
     block_on, DurabilityLedger, FaultSchedule, FaultyStorage, InMemoryRx, InMemoryTransportFactory,
@@ -194,6 +195,9 @@ struct Cluster {
     schedules: Vec<FaultSchedule>,
     nodes: Vec<Option<TestNode>>,
     sms: Vec<KvStateMachine>,
+    /// Per-node log of `(index, data)` applied to the state machine, in order.
+    /// Cleared on a bounce (volatile state is lost and replayed from the WAL).
+    committed: Vec<Vec<(LogIndex, Vec<u8>)>>,
     /// Nodes that fail-stopped (`step` returned an error): no longer driven and
     /// no longer delivered to, like a dead actor.
     dead: Vec<bool>,
@@ -216,6 +220,7 @@ impl Cluster {
             schedules,
             nodes: Vec::new(),
             sms: (0..n).map(|_| KvStateMachine::new()).collect(),
+            committed: (0..n).map(|_| Vec::new()).collect(),
             dead: vec![false; n as usize],
             step_errors: vec![None; n as usize],
         };
@@ -277,6 +282,7 @@ impl Cluster {
                 Ok(outcome) => {
                     for (idx, data) in outcome.committed {
                         self.sms[i].apply(idx, &data).expect("apply");
+                        self.committed[i].push((idx, data));
                     }
                     node.advance_apply();
                 }
@@ -325,8 +331,72 @@ impl Cluster {
         let idx = (i - 1) as usize;
         self.nodes[idx] = Some(node);
         self.sms[idx] = KvStateMachine::new();
+        self.committed[idx].clear();
         self.dead[idx] = false;
         self.step_errors[idx] = None;
+    }
+
+    /// The target node's durable commit index (`HardState.commit` in memory —
+    /// durable because `set_hard_state` fsyncs before returning).
+    fn durable_commit(&self, i: RaftId) -> LogIndex {
+        self.nodes[(i - 1) as usize]
+            .as_ref()
+            .expect("node present")
+            .hard_state()
+            .commit
+    }
+
+    /// The target node's applied log as `(index, data)` pairs, in commit order.
+    fn committed_log(&self, i: RaftId) -> &[(LogIndex, Vec<u8>)] {
+        &self.committed[(i - 1) as usize]
+    }
+
+    /// The target node's state-machine snapshot (INV3's comparison unit).
+    fn snapshot(&self, i: RaftId) -> Vec<u8> {
+        self.sms[(i - 1) as usize].snapshot().expect("snapshot")
+    }
+
+    /// Tick+step+apply node `i` **without delivering any message**: this is the
+    /// pure WAL-replay path (a restarted node replaying its durable log).
+    fn drive_local(&mut self, i: RaftId, rounds: usize) {
+        let idx = (i - 1) as usize;
+        for _ in 0..rounds {
+            if self.dead[idx] {
+                return;
+            }
+            let Some(node) = self.nodes[idx].as_mut() else {
+                return;
+            };
+            node.tick();
+            match block_on(node.step()) {
+                Ok(outcome) => {
+                    for (ix, data) in outcome.committed {
+                        self.sms[idx].apply(ix, &data).expect("apply");
+                        self.committed[idx].push((ix, data));
+                    }
+                    node.advance_apply();
+                }
+                Err(e) => {
+                    self.dead[idx] = true;
+                    self.step_errors[idx] = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    /// Assert every live node's state-machine snapshot is byte-identical (INV3).
+    fn assert_converged(&self) {
+        let snaps: Vec<(RaftId, Vec<u8>)> = (1..=self.n)
+            .filter(|&i| self.nodes[(i - 1) as usize].is_some())
+            .map(|i| (i, self.snapshot(i)))
+            .collect();
+        for w in snaps.windows(2) {
+            assert_eq!(
+                w[0].1, w[1].1,
+                "INV3 violated: nodes {} and {} disagree on state",
+                w[0].0, w[1].0
+            );
+        }
     }
 
     fn leader(&self) -> Option<RaftId> {
@@ -505,6 +575,118 @@ fn failing_fsync_fail_stops_and_never_propagates_entries() {
     );
 
     c.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// INV2: crash sweep — restart replays the committed prefix deterministically
+// ---------------------------------------------------------------------------
+
+/// IN2: crash a node at several points in the run, restart it on its WAL, and
+/// drive **pure replay** (no delivery). The pre-crash applied prefix must be
+/// reproduced byte-for-byte and never lost, the durable commit must not
+/// regress, and (when the replay lands on the same prefix) the state machine
+/// must be byte-identical — INV3's determinism. The node then rejoins and every
+/// node converges on one state.
+///
+/// The crash points are harness-visible boundaries around `RaftNode::step`
+/// (before the step, between the step and applying its committed entries, and
+/// after applying), swept over both the leader and a follower. A precise
+/// in-`step` injection point (between persist and deliver) would need a
+/// production hook; this covers the boundaries a harness can express.
+#[test]
+fn inv2_crash_sweep_replays_the_committed_prefix() {
+    // (crash target role, extra rounds driven after the first commit)
+    let cases: &[(&str, usize)] = &[
+        ("leader", 0),
+        ("leader", 40),
+        ("follower", 0),
+        ("follower", 40),
+        ("follower", 160),
+    ];
+
+    for (role, extra_rounds) in cases {
+        let mut c = Cluster::new(3);
+        let leader = elect(&mut c);
+        let target = if *role == "leader" {
+            leader
+        } else {
+            (1..=3).find(|&i| i != leader).expect("a follower exists")
+        };
+        let tag = format!("role={role}, extra_rounds={extra_rounds}");
+
+        // Commit a first write so a durable committed prefix exists, then drive
+        // the requested extra rounds (the crash point moves later each case).
+        commit_put(&mut c, leader, 1);
+        for _ in 0..*extra_rounds {
+            c.round();
+        }
+
+        // Capture the target's pre-crash **durable** state.
+        //
+        // `RaftNode::hard_state().commit` is raft's *in-memory* commit and can
+        // lead the durable commit until the next `step()` persists it (the
+        // client-ack path is safe: the runtime applies and acks only after
+        // `step` persisted the commit). INV2's floor is the **persisted** commit,
+        // which the durability ledger records.
+        let persisted_commit = c.ledgers[(target - 1) as usize].persisted_commit();
+        let before_applied = c.committed_log(target).to_vec();
+        let durable_prefix: Vec<(LogIndex, Vec<u8>)> = before_applied
+            .iter()
+            .filter(|(ix, _)| *ix <= persisted_commit)
+            .cloned()
+            .collect();
+        assert!(
+            !durable_prefix.is_empty(),
+            "the target must have a durable committed prefix [{tag}], ledger={:?}",
+            c.ledgers[(target - 1) as usize]
+                .hard_states()
+                .iter()
+                .map(|h| (h.term, h.commit))
+                .collect::<Vec<_>>()
+        );
+
+        // Crash it; the survivors keep making progress on their quorum.
+        c.crash(target);
+        for _ in 0..200 {
+            c.round();
+        }
+
+        // Restart on the WAL. Immediately after the bounce, raft's commit is the
+        // one recovered from disk — before any replay advances it.
+        c.bounce(target);
+        let recovered_commit = c.durable_commit(target);
+        assert!(
+            recovered_commit >= persisted_commit,
+            "INV2 violated: the persisted commit was not recovered ({persisted_commit} -> {recovered_commit}) [{tag}]"
+        );
+
+        // Replay the WAL with **no delivery** (the pure recovery path).
+        c.drive_local(target, 400);
+        let after_applied = c.committed_log(target);
+
+        // INV2: no durably committed entry is silently lost — the durable
+        // prefix is reproduced, in order and content-identical.
+        assert!(
+            after_applied.len() >= durable_prefix.len(),
+            "INV2 violated: WAL replay lost durably committed entries ({} -> {}) [{tag}]",
+            durable_prefix.len(),
+            after_applied.len()
+        );
+        for (i, expected) in durable_prefix.iter().enumerate() {
+            assert_eq!(
+                after_applied[i], *expected,
+                "INV2 violated: replay changed durable entry {i} [{tag}]"
+            );
+        }
+
+        // Rejoin: drive the whole cluster and assert convergence (INV3/INV8).
+        for _ in 0..800 {
+            c.round();
+        }
+        c.assert_converged();
+
+        c.cleanup();
+    }
 }
 
 // ---------------------------------------------------------------------------

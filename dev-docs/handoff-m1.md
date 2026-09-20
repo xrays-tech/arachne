@@ -169,7 +169,13 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - **撕裂尾**（最后 1 字节缺失）→ 合法截断，且**在该目录上重启 runtime 后仍能读回 acked 值**。
   - **更正**：我先前的记录称 INV6 "只由 `fuzz/` + L4 承担"是**错的**——`arachne/tests/wal_mutation.rs`（M0 ②）早已有 PR 级确定性变异电池（合成 WAL：全偏移截断 + 位翻转 + len 破坏 + 非末段 fail-start + 已提交区不丢）。本文件补的是**活 WAL**、**META 变异**与**恢复后仍可服务**。
   - **边界（如实声明）**：META 不记录"期望的最后 index"，且 N3 明确规定"有 META 无 segment = 合法空日志"（`meta_only_dir_reopens_as_empty_log`）。因此**移除已提交前缀字节的变异会得到更短的前缀（甚至空日志）**，恢复无法与"本来就是空"区分——INV6 的两象限允许这一结果。故强断言（acked 前缀必须在场）只施加于"不可能移除已提交字节"的变异（无变异基线、尾 1 字节撕裂）。
-- **仍未覆盖（M2 剩余）**：`slow_fsync`（需文件层时序）；**INV2 的 ready 阶段逐点崩溃扫描**（在 `persist_ready` 与 `deliver`/`apply` 之间精确注入崩溃需要生产代码注入点；现有覆盖是轮次级 crash+bounce）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
+- **INV2 崩溃扫描（本轮补齐，`m2_durability.rs` 第 6 项）**：在 **harness 可表达**的崩溃点（`step` 之前 / `step` 之后未 apply / apply 之后）扫描「崩溃目标（leader 或 follower）× 崩溃时刻」，重启后**仅驱动该节点、不投递消息**以走纯 WAL 回放：
+  - 重启后立即读到的 commit（从盘上 HardState 恢复）≥ 崩溃前**已持久化**的 commit；
+  - 崩溃前**已持久化**的已提交前缀在回放后逐字节重现（顺序与内容一致）→ 不丢已提交条目；
+  - 之后重新入群，全节点状态快照一致（INV3/INV8）。
+  - **顺带澄清一个语义细节（重要）**：`RaftNode::hard_state().commit` 是 raft 的**内存** commit，可能**领先于持久化 commit**（要到下一个 `step()` 才落盘）。因此 **INV2 的基准必须是"已持久化 commit"**（`DurabilityLedger::persisted_commit`），而不是内存值——我第一版扫描拿内存值当基准，被这个差异判成**假违规**（实测该 follower 的持久 HardState 只有 `(term1,commit0)`、`(term1,commit1)`，而内存 commit 已是 2）。**ack 路径不受影响**：runtime 只在 `step()` 落盘 commit 之后才 apply + ack。
+  - **未做**：在 `persist_ready` 与 `deliver`/`apply` 之间**精确注入**崩溃，需要生产代码注入点（测试 feature 下的 hook）→ 需要一条设计记录。
+- **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；ready 阶段的**精确**崩溃注入（同上）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
