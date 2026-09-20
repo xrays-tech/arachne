@@ -58,6 +58,12 @@ jobs:
         # run here via `cargo test --workspace`.
         run: cargo test --workspace
 
+      - name: Test the fault-injection feature (INV2 precise crash sweep)
+        # The ready-stage crash hook (propsol v0.2.9 L) is a non-default,
+        # release-excluded feature, so its INV2 sweep needs its own run. The
+        # release-feature gate below proves it is absent from shipped artifacts.
+        run: cargo test -p arachne --features fault-injection --test m2_durability
+
       - name: Build lean core (no default features)
         run: cargo build -p arachne --no-default-features
 

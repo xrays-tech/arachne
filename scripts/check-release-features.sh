@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 #
-# check-release-features.sh — the D-ART-testobs gate (test-plan §3.3).
+# check-release-features.sh — the test-only-feature gate (D-ART-testobs, and
+# propsol v0.2.9 L for `fault-injection`).
 #
-# `arachne-node` may carry a `test-observability` feature: the single recorded
-# exception to the "no test code in production" rule. It appends structured
-# stdout markers (`ready` / `shutdown`) that the L4 fault injector uses for
-# phase-precise kills, and changes nothing else.
+# Two crates carry a test-only feature. Each is the recorded exception to the
+# "no test code in production" rule, changes nothing but test instrumentation,
+# and must be opt-in only:
 #
-# This gate proves that the **default** (release / publish) artifact does not
-# contain it:
+#   * `arachne-node` / `test-observability` — structured stdout markers
+#     (`ready` / `shutdown`) for the L4 fault injector.
+#   * `arachne` / `fault-injection` — a crash hook at `RaftNode::step`'s
+#     ready-stage boundaries for INV2's precise crash sweep (propsol v0.2.9 L).
 #
-#   Gate A — feature resolution: `arachne-node` has no default features, so
-#            `test-observability` is opt-in only.
-#   Gate B — artifact check: the default release binary does **not** contain the
-#            marker payload, while a build *with* the feature does. This proves
-#            the flag is not a no-op AND that the shipped binary is the clean
-#            one.
+# This gate proves the **default** (release / publish) artifacts exclude both:
+#
+#   Gate A — feature resolution: neither feature is a default feature.
+#   Gate B — artifact check: `arachne-node`'s default release binary does not
+#            contain the observability marker, while a build with the feature
+#            does (so the flag is not a no-op and the shipped binary is clean).
+#   Gate C — artifact check: `arachne`'s default release rlib does not contain
+#            the fault-injection sentinel, while a build with the feature does.
 #
 # Degrades gracefully: a missing/renamed package fails loudly rather than
 # passing vacuously.
@@ -26,27 +30,45 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 # --- 1. Feature-resolution check -------------------------------------------
-echo "== check-release-features: Gate A (test-observability must be opt-in) =="
+echo "== check-release-features: Gate A (test-only features must be opt-in) =="
 metadata="$(cargo metadata --no-deps --format-version 1)"
-default_features="$(printf '%s' "${metadata}" | python3 -c '
+default_features_of() {
+  printf '%s' "${metadata}" | python3 -c '
 import sys, json
+name = sys.argv[1]
 meta = json.load(sys.stdin)
 for p in meta["packages"]:
-    if p["name"] == "arachne-node":
+    if p["name"] == name:
         print(",".join(p.get("features", {}).get("default", [])))
         break
 else:
     print("<<missing>>")
-')"
-if [ "${default_features}" = "<<missing>>" ]; then
+' "$1"
+}
+
+node_defaults="$(default_features_of arachne-node)"
+if [ "${node_defaults}" = "<<missing>>" ]; then
   echo "FAIL (Gate A): no `arachne-node` package in the workspace metadata"
   exit 1
 fi
-if [ -n "${default_features}" ]; then
-  echo "FAIL (Gate A): arachne-node has non-empty default features: ${default_features}"
+if [ -n "${node_defaults}" ]; then
+  echo "FAIL (Gate A): arachne-node has non-empty default features: ${node_defaults}"
   exit 1
 fi
-echo "PASS (Gate A): arachne-node has no default features (test-observability is opt-in)"
+
+core_defaults="$(default_features_of arachne)"
+if [ "${core_defaults}" = "<<missing>>" ]; then
+  echo "FAIL (Gate A): no `arachne` package in the workspace metadata"
+  exit 1
+fi
+case ",${core_defaults}," in
+  *,fault-injection,*)
+    echo "FAIL (Gate A): `fault-injection` is a default feature of arachne (${core_defaults})"
+    exit 1
+    ;;
+esac
+echo "PASS (Gate A): neither test-only feature is a default feature"
+echo "        arachne-node defaults: [${node_defaults}]; arachne defaults: [${core_defaults}]"
 
 # --- 2. Artifact check ------------------------------------------------------
 target_dir="$(printf '%s' "${metadata}" | python3 -c '
@@ -94,6 +116,65 @@ fi
 # Leave a clean (default-feature) artifact on disk.
 cargo build -p arachne-node --release >/dev/null
 echo "PASS (Gate B): default release binary excludes the markers (sha256 ${default_hash:0:12}…)"
+
+# --- 3. Core release artifact: the fault-injection hook ---------------------
+#
+# Build `arachne` and print the rlib cargo reports for it. The JSON stream is
+# emitted even when the unit is fresh, and it names the artifact for the feature
+# set just built — mtime is unreliable because the default and feature variants
+# coexist in `release/deps/`.
+build_core_rlib() {
+  cargo build -p arachne --release "$@" --message-format=json 2>/dev/null | python3 -c '
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("reason") != "compiler-artifact":
+        continue
+    if msg.get("target", {}).get("name") != "arachne":
+        continue
+    for f in msg.get("filenames", []):
+        if f.endswith(".rlib"):
+            print(f)
+            break
+    break
+'
+}
+
+echo ""
+echo "== check-release-features: Gate C (arachne release artifact must exclude the fault-injection hook) =="
+hook_sentinel="arachne-fault-injection-hook"
+
+# Default (release/publish) build: the hook must be absent.
+rlib="$(build_core_rlib)"
+if [ -z "${rlib}" ] || [ ! -f "${rlib}" ]; then
+  echo "FAIL (Gate C): could not locate the arachne release rlib"
+  exit 1
+fi
+if grep -a -q -F "${hook_sentinel}" "${rlib}"; then
+  echo "FAIL (Gate C): the default release rlib contains the fault-injection hook (${rlib})"
+  exit 1
+fi
+echo "PASS (Gate C): default release rlib excludes the fault-injection hook"
+
+# Feature build: the hook must be present (proves the gate is not vacuous).
+rlib="$(build_core_rlib --features fault-injection)"
+if [ -z "${rlib}" ] || [ ! -f "${rlib}" ]; then
+  echo "FAIL (Gate C): could not locate the arachne feature rlib"
+  exit 1
+fi
+if ! grep -a -q -F "${hook_sentinel}" "${rlib}"; then
+  echo "FAIL (Gate C): the feature build lacks the hook (the feature is a no-op?)"
+  exit 1
+fi
+
+# Leave a clean (default-feature) artifact on disk.
+build_core_rlib >/dev/null
 
 echo ""
 echo "check-release-features: ALL GATES PASSED"
