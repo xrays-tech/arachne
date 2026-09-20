@@ -610,6 +610,33 @@ fn inv4_client_history_is_linearizable_under_partition() {
 
 /// Commit `put(key, value)` on `leader` and assert the leader applied it.
 fn commit_put(c: &mut Cluster, leader: RaftId, key: &[u8], value: ValueId, seq: RaftId) {
+    let _ = commit_put_logged(c, leader, key, value, seq);
+}
+
+/// The committed log index of the most recent committed entry whose payload is
+/// `cmd` on `node`.
+fn committed_index_of(c: &Cluster, node: RaftId, cmd: &[u8]) -> Option<u64> {
+    c.committed[(node - 1) as usize]
+        .iter()
+        .rev()
+        .find(|(_, data)| data.as_slice() == cmd)
+        .map(|(index, _)| *index)
+}
+
+/// Commit `put(key, value)` on `leader`, assert the leader applied it, and
+/// return the **raft log index** the command was committed at.
+///
+/// The index is what oracle check ② (`one-log-id-per-seq`) compares, so tests
+/// can record a real `log_id` via `History::complete_logged` instead of leaving
+/// the check without input (it is vacuous when no log ids are recorded).
+fn commit_put_logged(
+    c: &mut Cluster,
+    leader: RaftId,
+    key: &[u8],
+    value: ValueId,
+    seq: RaftId,
+) -> u64 {
+    let cmd = KvStateMachine::encode_put(1, seq, key, &vbytes(value));
     assert!(
         c.propose(leader, key, &vbytes(value), seq),
         "leader accepts the put"
@@ -626,6 +653,7 @@ fn commit_put(c: &mut Cluster, leader: RaftId, key: &[u8], value: ValueId, seq: 
         Some(value),
         "leader must have applied the put"
     );
+    committed_index_of(c, leader, &cmd).expect("the put must be in the committed log")
 }
 
 /// Advance rounds until a node other than `avoid` reports itself leader.
@@ -818,6 +846,86 @@ fn read_index_is_served_only_on_the_leader() {
         }
     }
     assert!(!served_locally, "a follower must not serve ReadIndex itself");
+
+    c.cleanup();
+}
+
+/// The **follower-served read round-trip** that propsol §5.4 describes exists at
+/// the raft layer, and this test covers it end to end: a follower's ReadIndex
+/// request is forwarded to the leader, confirmed by a quorum heartbeat round,
+/// echoed back, and the follower then emits **its own** read state at the
+/// confirmed index — after which the follower's local state machine has applied
+/// far enough to serve the read (forward → quorum → response → local serve).
+///
+/// Arachne's M1 **runtime** deliberately does not expose this path to clients:
+/// `Runtime` rejects a read on a follower with `NotLeader` and the client
+/// redirects to the leader instead (a client-side redirect, propsol §3.3), so
+/// the client-visible contract is leader-served reads. Pinning the underlying
+/// capability here means enabling follower-served reads later is a runtime-policy
+/// change, not a protocol unknown.
+#[test]
+fn follower_read_index_round_trip_completes() {
+    let _seed = ElectionSeed::enter(0x0_5E4D);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+    // Commit once so ReadIndex is not rejected for a missing committed entry in
+    // the leader's term.
+    commit_put(&mut c, leader, b"k", ValueId(1), 1);
+
+    let follower = (1..=3).find(|&i| i != leader).expect("a follower exists");
+    let ctx = vec![9u8; 8];
+    c.nodes[(follower - 1) as usize]
+        .as_mut()
+        .expect("follower present")
+        .read_index(ctx.clone());
+
+    // Full rounds WITH delivery: the follower forwards to the leader, the leader
+    // confirms with a quorum round, and the follower emits its own read state.
+    let mut read_index = None;
+    for _ in 0..200 {
+        c.round();
+        if let Some((_, _, idx)) = c
+            .read_states
+            .iter()
+            .find(|(n, ctx_seen, _)| *n == follower && ctx_seen == &ctx)
+        {
+            read_index = Some(*idx);
+            break;
+        }
+    }
+    let read_index = read_index
+        .expect("the follower must complete the forwarded ReadIndex round-trip");
+
+    // The follower must apply up to the confirmed index before it may serve the
+    // read locally (the "wait for applied >= read_index" step).
+    for _ in 0..200 {
+        if c.nodes[(follower - 1) as usize]
+            .as_ref()
+            .expect("follower present")
+            .applied_index()
+            >= read_index
+        {
+            break;
+        }
+        c.round();
+    }
+    assert!(
+        c.nodes[(follower - 1) as usize]
+            .as_ref()
+            .expect("follower present")
+            .applied_index()
+            >= read_index,
+        "the follower must apply up to the confirmed read index"
+    );
+    assert_eq!(
+        c.sms[(follower - 1) as usize]
+            .get(b"k")
+            .expect("sm get")
+            .as_deref()
+            .and_then(parse_v),
+        Some(ValueId(1)),
+        "the follower's local state machine must serve the committed value"
+    );
 
     c.cleanup();
 }
@@ -1078,6 +1186,91 @@ fn read_via_read_index(
         "the leader must apply up to the read index before serving the read"
     );
     c.sms[i].get(key).expect("sm get")
+}
+
+/// Oracle check ② ("at most one log id per `(client, seq)`") is **not vacuous**:
+/// the harness records the real committed log index via `complete_logged`, so a
+/// normal write carries exactly one log id (and passes), while committing the
+/// same `(client, seq)` twice carries two and is flagged.
+///
+/// At M1 there is no session dedup (that is M3), so the negative half is the
+/// realistic case: it pins the check's failure path to real log indices instead
+/// of trusting a synthetic history.
+#[test]
+fn oracle_check_two_uses_real_log_ids() {
+    let _seed = ElectionSeed::enter(0x0_2E7);
+    let mut c = Cluster::new(3);
+    let leader = elect(&mut c);
+
+    // Positive: one committed log id for one `(client, seq)`.
+    let mut h = History::new();
+    h.invoke(
+        CallId(1),
+        ClientId(0),
+        SeqNo(7),
+        Op::Put {
+            key: b"k".to_vec(),
+            value: ValueId(1),
+        },
+        0,
+    );
+    let idx = commit_put_logged(&mut c, leader, b"k", ValueId(1), 7);
+    h.complete_logged(CallId(1), 2, OpResult::Ok(None), idx);
+
+    let reduced = h.merge_retries();
+    assert_eq!(reduced.ops.len(), 1);
+    assert_eq!(
+        reduced.ops[0].log_ids,
+        vec![idx],
+        "the real committed log index must reach check ② (otherwise it is vacuous)"
+    );
+    let report = h.check();
+    assert!(
+        report.passed(),
+        "one log id per seq must pass: {}",
+        report.render()
+    );
+
+    // Negative: the same `(client, seq)` committed twice (no session dedup at
+    // M1) has two distinct log ids, which check ② must flag.
+    let mut dup = History::new();
+    dup.invoke(
+        CallId(10),
+        ClientId(0),
+        SeqNo(9),
+        Op::Put {
+            key: b"d".to_vec(),
+            value: ValueId(1),
+        },
+        10,
+    );
+    let first = commit_put_logged(&mut c, leader, b"d", ValueId(1), 9);
+    dup.complete_logged(CallId(10), 11, OpResult::Ok(None), first);
+    dup.invoke(
+        CallId(11),
+        ClientId(0),
+        SeqNo(9),
+        Op::Put {
+            key: b"d".to_vec(),
+            value: ValueId(1),
+        },
+        12,
+    );
+    let second = commit_put_logged(&mut c, leader, b"d", ValueId(1), 9);
+    assert_ne!(
+        first, second,
+        "the duplicate commit must occupy a different log index"
+    );
+    dup.complete_logged(CallId(11), 13, OpResult::Ok(None), second);
+
+    let report = dup.check();
+    assert!(
+        report.violated().contains(&Invariant::OneLogIdPerSeq),
+        "a duplicate commit of one seq must violate ②: {}",
+        report.render()
+    );
+
+    c.cleanup();
 }
 
 /// INV4 where the client's reads are served through the ReadIndex path rather

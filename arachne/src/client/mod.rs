@@ -30,6 +30,19 @@
 //! The embedded/L1/L2 model assumes client and node share a process, so
 //! redirects are client-side (one hop, node stays stateless) rather than a
 //! server-side proxy.
+//!
+//! # Follower-served reads (M1 boundary)
+//!
+//! propsol §5.4 says a follower must "forward" a linearizable read. The raft
+//! layer supports exactly that round-trip — an L2 scenario
+//! (`follower_read_index_round_trip_completes`) drives a follower's ReadIndex
+//! request through forward → quorum → response → local serve — but the M1
+//! **runtime** deliberately does not expose it to clients: a read on a follower
+//! is rejected with [`ArachneError::NotLeader`] and the **client** redirects to
+//! the leader (a client-side redirect, propsol §3.3 — the node stays
+//! stateless). So the client-visible contract is leader-served reads, and a
+//! server-side read proxy is **not** implemented at M1. Enabling follower-served
+//! reads later is a runtime-policy change, not a protocol change.
 
 mod handle;
 
