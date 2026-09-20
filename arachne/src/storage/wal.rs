@@ -600,15 +600,17 @@ impl WalStorage {
 
     // ---- force-recovery (propsol §6.1) ----
 
-    /// Discard every log entry with index greater than `keep` (the
-    /// **uncommitted tail**), leaving the durable log at `1..=keep`.
+    /// Truncate the durable log to `1..=keep`, discarding every entry after
+    /// `keep` (and any records following them in the active segment).
     ///
-    /// This is destructive and is only called by [`WalStorage::force_recovery`].
-    /// It is a no-op (returning `0`) when the log already ends at `keep`, so a
-    /// node with no uncommitted entries is untouched. The retained segment is
-    /// truncated in place and every later segment is removed; the in-memory
-    /// log/segment state is then updated to match.
-    fn discard_uncommitted_tail(&mut self, keep: LogIndex) -> Result<u64, StorageError> {
+    /// Called by [`WalStorage::append`] to overwrite a **conflicting suffix**
+    /// (raft re-sends entries after a leader change; the storage must overwrite
+    /// from the first differing index) and by [`WalStorage::force_recovery`] to
+    /// drop the uncommitted tail. It is a no-op (returning `0`) when the log
+    /// already ends at `keep`. The retained segment is truncated in place and
+    /// every later segment is removed; the in-memory log/segment state is then
+    /// updated to match.
+    fn truncate_log_to(&mut self, keep: LogIndex) -> Result<u64, StorageError> {
         let last = self.entries.last().map(|e| e.index).unwrap_or(0);
         if last <= keep {
             return Ok(0);
@@ -756,7 +758,7 @@ impl WalStorage {
 
         let commit = wal.hard_state.commit;
         let previous_term = wal.hard_state.term;
-        let discarded = wal.discard_uncommitted_tail(commit)?;
+        let discarded = wal.truncate_log_to(commit)?;
         // New hard state: bump the term and vote for self. `vote = 1` because
         // this node is voter 1 of the reset single-voter cluster.
         wal.set_hard_state(&HardState {
@@ -858,6 +860,30 @@ impl Storage for WalStorage {
     }
 
     fn append(&mut self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        // Overwrite semantics. raft can hand the storage a **conflicting
+        // suffix** after an election: a follower that persisted a short-lived
+        // leader's entry must replace it with the new leader's entry. The seam
+        // has no separate truncate call (compaction is M2), so `append` must
+        // truncate to the first incoming index before appending — exactly what
+        // `MemStorage` does, and what keeps the log contiguous.
+        if let Some(first) = entries.first() {
+            let last = self.entries.last().map(|e| e.index).unwrap_or(0);
+            if first.index <= last {
+                let keep = first.index.saturating_sub(1);
+                // A committed entry is never overwritten by a correct leader;
+                // truncating one would be a safety violation, so fail-stop
+                // rather than silently discard committed data.
+                if keep < self.hard_state.commit {
+                    return Err(StorageError::Unrecoverable {
+                        detail: format!(
+                            "append would overwrite committed entries: first={}, commit={}",
+                            first.index, self.hard_state.commit
+                        ),
+                    });
+                }
+                self.truncate_log_to(keep)?;
+            }
+        }
         for entry in entries {
             // Continuity hardening: the next entry must be last_index + 1.
             let last = self.entries.last().map(|e| e.index).unwrap_or(0);
@@ -2002,6 +2028,92 @@ mod tests {
             }
             Err(e) => panic!("expected a node_id mismatch, got error: {e}"),
             Ok(_) => panic!("expected a node_id mismatch, got Ok"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- Append overwrite (conflicting suffix after an election) ----
+
+    /// raft re-sends a conflicting suffix after an election; `append` must
+    /// overwrite from the first incoming index rather than duplicate it.
+    #[test]
+    fn append_overwrites_a_conflicting_suffix() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut wal = WalStorage::open(&dir, opts.clone()).unwrap();
+            wal.append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+            ])
+            .unwrap();
+            wal.sync_entries().unwrap();
+        }
+        {
+            let mut wal = WalStorage::open(&dir, opts.clone()).unwrap();
+            // Entries 2 and 3 come back from a new term: overwrite them.
+            wal.append(&[make_entry(2, 2, b"B"), make_entry(3, 2, b"C")])
+                .unwrap();
+            wal.sync_entries().unwrap();
+            let got = wal.entries(1, 4, None).unwrap();
+            let idx_term: Vec<(u64, u64)> = got.iter().map(|e| (e.index, e.term)).collect();
+            assert_eq!(idx_term, vec![(1, 1), (2, 2), (3, 2)]);
+            let data: Vec<&[u8]> = got.iter().map(|e| e.data.as_slice()).collect();
+            assert_eq!(data, vec![b"a".as_slice(), b"B", b"C"]);
+        }
+        // The overwrite is durable across a reopen.
+        let wal = WalStorage::open(&dir, opts).unwrap();
+        let got = wal.entries(1, 4, None).unwrap();
+        let idx_term: Vec<(u64, u64)> = got.iter().map(|e| (e.index, e.term)).collect();
+        assert_eq!(idx_term, vec![(1, 1), (2, 2), (3, 2)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Overwriting from index 1 replaces the whole log.
+    #[test]
+    fn append_overwrites_from_index_one() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut wal = WalStorage::open(&dir, opts.clone()).unwrap();
+        wal.append(&[make_entry(1, 1, b"a"), make_entry(2, 1, b"b")])
+            .unwrap();
+        wal.append(&[make_entry(1, 2, b"A")]).unwrap();
+        wal.sync_entries().unwrap();
+        let got = wal.entries(1, 2, None).unwrap();
+        assert_eq!(got.len(), 1, "the conflicting suffix must be discarded");
+        assert_eq!(
+            (got[0].index, got[0].term, got[0].data.as_slice()),
+            (1, 2, b"A".as_slice())
+        );
+        drop(wal);
+        let wal = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(wal.last_index().unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Overwriting a committed entry is a raft safety violation: fail-stop
+    /// rather than silently discard committed data.
+    #[test]
+    fn append_refuses_to_overwrite_committed_entries() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut wal = WalStorage::open(&dir, opts).unwrap();
+        wal.append(&[make_entry(1, 1, b"a"), make_entry(2, 1, b"b")])
+            .unwrap();
+        wal.set_hard_state(&HardState {
+            term: 1,
+            vote: None,
+            commit: 2,
+        })
+        .unwrap();
+        match wal.append(&[make_entry(2, 2, b"B")]) {
+            Err(StorageError::Unrecoverable { detail }) => {
+                assert!(detail.contains("committed"), "unexpected detail: {detail}");
+            }
+            other => {
+                panic!("expected a fail-stop on overwriting committed entries, got {other:?}")
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }
