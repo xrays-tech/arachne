@@ -207,6 +207,8 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - 用**杀掉再重启**（`crash`/`bounce`）而非分区来制造落后：被分区节点会不断竞选抬高 term，可能换主，而新主日志没压缩过、直接用日志就能把 follower 补上——测试会"绕过"快照路径假绿。重启节点任期陈旧、选举计时器重置，无法干扰现任 leader。
   - leader 调 `snapshot_and_compact`（runtime `maybe_snapshot` 的直接形态）后断言：快照文件落盘、**水位以下的条目确实读不到了**（`term_at(snap_index-1)` 为 Err）、`term_at(snap_index)` 仍可答；随后再写两条，follower 重启后必须"快照恢复 + 尾部回放"两半都走。
   - 断言 follower 的**条目日志跳过了快照覆盖的区间**（`!contains(victim_applied_before+1)`）却包含 `snap_index+1`，且最终 `applied_index`、状态机快照、重叠 index 内容与全组一致（INV3/INV8/INV7）。
+  - **两个变体**：`s03_restarted_follower_catches_up_through_a_snapshot`（跑过一段、被杀、带短 WAL 重启）与 `s04_new_follower_catches_up_through_a_snapshot`（**从未参与过**的新成员：空数据目录 → leader 首次 append 被拒 → `next_idx` 回退到 1 → 快照）；`double_run_snapshot_scenario_is_deterministic` 对**两种模式**各跑两遍比对 trace 与各节点日志。
+  - **顺带发现一条运维边界（重要，值得进 runbook）**：把**已经 ack 过条目**的节点磁盘清空后再放回，raft 会**直接 fatal**——heartbeat 携带 `min(matched, committed)`，而 leader 记着该节点 `matched=6`、对方 `last_index=0`，`commit_to(6)` 越界即 panic（实测 `to_commit 6 is out of range [last_index 0]`；栈在 `handle_heartbeat`）。即"从旧备份/空盘恢复一个成员"**不是**普通复制能处理的场景，必须先把成员移除再加回（M3 ConfChange）或走 `force-recovery`。真正的新成员（从未 ack 过，`matched=0`）没有这个问题——这也是 S04 必须在 `elect` **之前**就把该节点拿掉的原因。已记入 propsol/本文件，M3 成员变更时要一并处理。
   - 为此给确定性 harness 补上了 runtime 的**安装半边**：`round()`/`step_local()`/`step_local_apply()` 现在遇 `StepOutcome.snapshot` 会先 `sm.restore` 再 apply（此前只 apply `committed`，装了快照的状态机会因 `applied` 不连续而 `IndexViolation`）。
 - `arachne/tests/quorum_loss.rs`（**M2 验收 ④**）：3 节点杀掉 leader + 一个 follower → 唯一存活节点**永远无法组成多数派**；断言 `put` 与线性一致 `get` 都在有界时间内返回 **`QuorumUnavailable`**（既不成功也不挂死），`get_stale` 仍从本地状态机正常返回值（N1 弱读），并且两个 peer 恢复后集群重新选主、继续写入、断电前的写入仍在。
 

@@ -474,22 +474,56 @@ fn double_run_same_seed_is_deterministic() {
 // through the snapshot
 // ---------------------------------------------------------------------------
 
-/// S03 (M2 acceptance ①): elect a leader, commit a few writes, **kill** a
-/// follower, commit more writes while the leader compacts its log, then
-/// restart the follower and let it catch up.
+/// How the lagging voter in [`run_snapshot_catchup`] is brought up.
+#[derive(Clone, Copy, Debug)]
+enum Lagging {
+    /// It was running, then killed: it restarts with a short but non-empty WAL
+    /// (so raft asks for entries, gets `Compacted`, and switches to a
+    /// snapshot).
+    Restarted,
+    /// It is a *new* member: removed before it ever participated, so the
+    /// leader's `matched` for it stays 0, and it starts on a wiped data dir.
+    /// raft's first append is rejected, `next_idx` walks back to 0, and the
+    /// snapshot path is taken. This is "a new follower catches up", without
+    /// the ConfChange that M3 will bring.
+    ///
+    /// The distinction from [`Lagging::Restarted`] is not cosmetic: wiping a
+    /// node that has *already acknowledged* entries leaves the leader's
+    /// `matched` above the node's last index, and raft fatals on the next
+    /// heartbeat (`to_commit N is out of range [last_index M]`) because a
+    /// heartbeat commits up to `min(matched, committed)`. Recovering a node
+    /// from an older/emptied disk is therefore *not* supported by plain
+    /// replication — it needs the member removed and re-added (M3 ConfChange)
+    /// or `force-recovery` (propsol §6); see the handoff.
+    BrandNew,
+}
+
+/// S03/S04 (M2 acceptance ①): elect a leader, commit a few writes, remove one
+/// voter from the cluster, commit more writes while the leader compacts its
+/// log, then bring the voter back and let it catch up.
 ///
 /// The node is killed rather than partitioned on purpose: a partitioned node
 /// campaigns and raises the term, which can change leaders and let the new
 /// leader serve the follower from its *un-compacted* log, making the test pass
 /// without ever exercising snapshot transfer. A restarted node has a fresh
 /// election timer and a stale term, so it cannot disrupt the leader.
-fn run_snapshot_catchup(seed: u64) -> Outcome {
+fn run_snapshot_catchup(seed: u64, mode: Lagging) -> Outcome {
     let _seed = ElectionSeed::enter(seed);
     let mut c = Cluster::new(3);
     let all: [RaftId; 3] = [1, 2, 3];
+    let brand_new = matches!(mode, Lagging::BrandNew);
+    // A *new* member is removed before it participates at all, so the leader
+    // never records a `matched` for it (see `Lagging::BrandNew`).
+    let new_victim: RaftId = 3;
+    if brand_new {
+        c.crash(new_victim);
+        std::fs::remove_dir_all(&c.dirs[(new_victim - 1) as usize]).expect("wipe the new dir");
+        std::fs::create_dir_all(&c.dirs[(new_victim - 1) as usize]).expect("recreate the dir");
+    }
 
     // 1. Elect, then commit writes that will end up *inside* the snapshot.
     let leader = elect(&mut c);
+    assert!(!brand_new || leader != new_victim, "the new member cannot lead");
     let leader_idx = (leader - 1) as usize;
     for i in 0..5u64 {
         assert!(
@@ -503,10 +537,17 @@ fn run_snapshot_catchup(seed: u64) -> Outcome {
     let early_applied = c.sms[leader_idx].applied_index();
     assert!(early_applied >= 5, "the early writes must be applied");
 
-    // 2. A follower goes away, and the majority keeps writing.
-    let victim = (1..=3).find(|&i| i != leader).expect("a follower exists");
+    // 2. A voter goes away, and the majority keeps writing. The restarted one
+    //    is killed only now, so its WAL holds the early writes it acknowledged.
+    let victim = if brand_new {
+        new_victim
+    } else {
+        (1..=3).find(|&i| i != leader).expect("a follower exists")
+    };
     let victim_idx = (victim - 1) as usize;
-    c.crash(victim);
+    if !brand_new {
+        c.crash(victim);
+    }
     let victim_applied_before = c.sms[victim_idx].applied_index();
     for i in 0..10u64 {
         assert!(
@@ -575,8 +616,9 @@ fn run_snapshot_catchup(seed: u64) -> Outcome {
         "the post-snapshot writes must be applied ({tail_index} <= {snap_index})"
     );
 
-    // 5. The follower restarts from its short WAL and must be brought up by the
-    //    leader's snapshot: its `next_idx` is below the leader's first index.
+    // 5. The voter comes back and must be brought up by the leader's snapshot:
+    //    a restarted one asks for entries below the watermark, a brand-new one
+    //    has an empty log, and both end up at `next_idx < first_index`.
     c.bounce(victim);
     for _ in 0..600 {
         c.round();
@@ -586,7 +628,7 @@ fn run_snapshot_catchup(seed: u64) -> Outcome {
     assert_eq!(
         c.sms[victim_idx].applied_index(),
         c.sms[leader_idx].applied_index(),
-        "the restarted node must reach the leader's applied index"
+        "the lagging node must reach the leader's applied index"
     );
     assert_state_agreement(&c, &all);
     assert_log_matching(&c.committed);
@@ -630,8 +672,8 @@ fn run_snapshot_catchup(seed: u64) -> Outcome {
 }
 
 #[test]
-fn s03_lagging_node_catches_up_through_a_snapshot() {
-    let out = run_snapshot_catchup(0x5030_0001);
+fn s03_restarted_follower_catches_up_through_a_snapshot() {
+    let out = run_snapshot_catchup(0x5030_0001, Lagging::Restarted);
     assert!(!out.leader_trace.is_empty(), "a leader must appear in the trace");
     // Every node ends up with applied work, and the snapshot-covered prefix is
     // missing from the lagging node's entry log (see the scenario's asserts).
@@ -642,11 +684,31 @@ fn s03_lagging_node_catches_up_through_a_snapshot() {
 }
 
 #[test]
+fn s04_new_follower_catches_up_through_a_snapshot() {
+    let out = run_snapshot_catchup(0x5040_0001, Lagging::BrandNew);
+    assert!(!out.leader_trace.is_empty(), "a leader must appear in the trace");
+    // The new voter starts with an empty log, so its committed log holds only
+    // what the leader sent *after* the snapshot.
+    assert!(
+        out.committed.iter().all(|log| !log.is_empty()),
+        "every node must have applied work"
+    );
+}
+
+#[test]
 fn double_run_snapshot_scenario_is_deterministic() {
-    let a = run_snapshot_catchup(0x5030_0001);
-    let b = run_snapshot_catchup(0x5030_0001);
-    assert_eq!(a.leader_trace, b.leader_trace, "same seed ⇒ same leader trace");
-    assert_eq!(a.committed, b.committed, "same seed ⇒ same committed logs");
+    for mode in [Lagging::Restarted, Lagging::BrandNew] {
+        let a = run_snapshot_catchup(0x5030_0001, mode);
+        let b = run_snapshot_catchup(0x5030_0001, mode);
+        assert_eq!(
+            a.leader_trace, b.leader_trace,
+            "same seed ⇒ same leader trace ({mode:?})"
+        );
+        assert_eq!(
+            a.committed, b.committed,
+            "same seed ⇒ same committed logs ({mode:?})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
