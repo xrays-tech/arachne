@@ -174,8 +174,8 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - 崩溃前**已持久化**的已提交前缀在回放后逐字节重现（顺序与内容一致）→ 不丢已提交条目；
   - 之后重新入群，全节点状态快照一致（INV3/INV8）。
   - **顺带澄清一个语义细节（重要）**：`RaftNode::hard_state().commit` 是 raft 的**内存** commit，可能**领先于持久化 commit**（要到下一个 `step()` 才落盘）。因此 **INV2 的基准必须是"已持久化 commit"**（`DurabilityLedger::persisted_commit`），而不是内存值——我第一版扫描拿内存值当基准，被这个差异判成**假违规**（实测该 follower 的持久 HardState 只有 `(term1,commit0)`、`(term1,commit1)`，而内存 commit 已是 2）。**ack 路径不受影响**：runtime 只在 `step()` 落盘 commit 之后才 apply + ack。
-  - **未做**：在 `persist_ready` 与 `deliver`/`apply` 之间**精确注入**崩溃，需要生产代码注入点（测试 feature 下的 hook）→ 需要一条设计记录。
-- **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；ready 阶段的**精确**崩溃注入（同上）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
+  - **精确崩溃注入（本轮补齐，propsol v0.2.9 L）**：新增**默认关闭**的 crate feature `fault-injection`（`arachne/src/fault_injection.rs`），在 `RaftNode::step` 的 `AfterPersist`（entries+HardState 已落盘、尚未发出任何消息）与 `AfterDeliver`（消息已发、尚未 apply）两个边界提供 **thread-local 一次性**崩溃 hook；关闭时调用点被 `#[cfg]` 完全编译掉（零行为改变、零运行时开销）。`m2_durability.rs` 新增 `inv2_precise_ready_stage_crash_replays_the_durable_prefix`（feature 开启时运行；leader/follower × 两阶段共 4 例）：崩溃后从 WAL **纯回放**，断言恢复出的 commit ≥ 崩溃前**已持久化** commit、applied ≥ 该 commit、**leader 已 ack 的写入不丢**、重新入群后全节点状态一致。CI 增加 `cargo test -p arachne --features fault-injection --test m2_durability` 一步；`scripts/check-release-features.sh` 新增 **Gate C**（默认 release rlib **不含** hook 哨兵、feature 构建含之——用 `--message-format=json` 取产物，避免 mtime 误判）。
+- **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；INV5 属 M3（会话去重）；I3（快照 meta fsync 先于快照回执）与快照路径要到 M2 快照落地后才适用。
 
 3. **客户端读截止时间短于 actor 的 ReadIndex 预算（`a26d21d`，本次 CI 再次暴露）**：`Handle` 原本把**所有**操作都限制在一个 `election_timeout` 内——对写是对的（runtime 的 propose 超时相同），对读太短：runtime 的 ReadIndex 路径每次等 `read_index_timeout_ms`（= 2×election）并可重试一次，actor 合法地可能用约 `2×read_index_timeout`（≈4×election）才给出结果。于是客户端在 actor 尚在解析读时就放弃，把一次慢的 ReadIndex 轮次变成客户端可见的 `Timeout`/503。现在读有独立截止：两次 ReadIndex 等待 + 一个 election 的调度余量。CI 上的表现正是 L3 杀 leader 测试偶发失败（换主后新 leader "读不到"杀前值）——实际是读超时而非数据丢失；修完后 CI 绿。
 
