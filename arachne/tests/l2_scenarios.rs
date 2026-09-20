@@ -886,3 +886,59 @@ fn inv4_concurrent_ops_during_partition_linearizable() {
     );
     c.cleanup();
 }
+
+/// INV4 where a client operation's real-time interval **spans a leadership
+/// change**: the put/get are invoked before the failover and complete after it,
+/// on the new leader. Exercises the interplay of concurrency and failover.
+#[test]
+fn inv4_concurrent_ops_spanning_failover_linearizable() {
+    let _seed = ElectionSeed::enter(0x1_500);
+    let mut c = Cluster::new(3);
+    let mut leader = elect(&mut c);
+    let initial_leader = leader;
+
+    let mut h = History::new();
+    let mut ts = 0u64;
+    let mut version = 0u64;
+
+    for r in 0..5u64 {
+        version += 1;
+        let value = ValueId(version);
+        let put_call = CallId(r * 4 + 1);
+        let get_call = CallId(r * 4 + 2);
+
+        // Invoke both ops...
+        h.invoke(put_call, ClientId(0), SeqNo(r), Op::Put { key: b"k".to_vec(), value }, ts);
+        ts += 1;
+        h.invoke(get_call, ClientId(1), SeqNo(r), Op::Get { key: b"k".to_vec() }, ts);
+        ts += 1;
+
+        // ...then, mid-op, the leader fails over; the ops complete on the new
+        // leader (their intervals span the leadership change).
+        if r == 2 {
+            c.faults.isolate(leader);
+            leader = wait_new_leader(&mut c, leader);
+        }
+
+        commit_put(&mut c, leader, b"k", value, r * 4 + 1);
+        let read = c.sms[(leader - 1) as usize].get(b"k").expect("sm get");
+        h.complete(put_call, ts, OpResult::Ok(None));
+        ts += 1;
+        h.complete(get_call, ts, OpResult::Ok(read.as_deref().and_then(parse_v)));
+        ts += 1;
+    }
+
+    assert!(
+        c.leader_obs.iter().any(|&(_, l)| l != initial_leader),
+        "the trace must show a leader change caused by the failover"
+    );
+    let report = h.check();
+    assert!(report.passed(), "oracle failures (spanning failover): {}", report.render());
+    let outcome = check_linearizable(&h, &KvState::new());
+    assert!(
+        matches!(outcome, CheckOutcome::Linearizable),
+        "checker (spanning failover): {outcome:?}"
+    );
+    c.cleanup();
+}
+
