@@ -1032,6 +1032,10 @@ fn read_via_read_index(
         }
         c.round();
     }
+    assert!(
+        c.nodes[i].as_ref().expect("leader present").applied_index() >= read_index,
+        "the leader must apply up to the read index before serving the read"
+    );
     c.sms[i].get(key).expect("sm get")
 }
 
@@ -1084,4 +1088,3 @@ fn inv4_reads_via_read_index_are_linearizable() {
     );
     c.cleanup();
 }
-
