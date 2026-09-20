@@ -7,12 +7,46 @@
 ## 1. 现状总览
 
 - **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
-- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）** 与 **(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）**；**未完成 (C) stage 3（transport I/O 接缝 + turmoil SimNetwork + S01/S02/S16 + INV3/4/7/8/9 + 双跑门禁）+ M1-5/(D)**（(A) 已覆盖 M1-5 的 L3 前置与冒烟主体，(D) 的杀 leader / CLI 集成测试仍待做）。
+- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）**、**(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）** 与 **(C) stage 3a/3c**（3a transport I/O 接缝 `edd913d`；3c inc.1–10 见 §3(C)，L2 场景 18 项全绿）；**`(D)/M1-5` 已收尾（commit `adb2bd7`，含 `6c79886` 的持久化 commit 修复，见 §1.5）**；**stage 3b（real tonic over turmoil）仍为已记录 spike**。
 - **✅ 已恢复**：oracle provider 故障（模型 id 无法解析 + 空结果）已解决；(C) stage 1 确认门禁已补跑并 **GO**，stage 2 门禁亦 **GO**。
+
+### 1.5 本轮收尾（**已提交**：`6c79886` 修复 + `adb2bd7` 收尾）
+
+面向 `(D)/M1-5` 与 L4 义务的一轮收尾：
+
+1. **跨进程 `409 + leader hint`（M1 验收③）**
+   - `Handle::without_redirect()`（`arachne/src/client/handle.rs`）：`max_redirects` 改为 **handle 级**字段（移出共享 `Arc<HandleInner>`），单发克隆把 `NotLeader{hint}` 原样返回。
+   - `arachne-node` HTTP 改用 `node.handle().without_redirect()`；`NodeHttp::map_error` 新增 `Timeout`/`Busy` → **503**（原先 `Timeout` 落 500，与验收②"不挂死 + 服务不可用类状态"不一致）。
+   - 测试：`arachne/tests/client_redirect.rs`（**新**：redirect 路径 + 单发 hint 断言）、`arachne-node/tests/multi_node.rs`（非 leader 必须回 `409` 且 hint 指向**真实 leader**）。
+   - **顺带发现（重要）**：`arachne/src/runtime/tests.rs` 从未被声明（`runtime/mod.rs` 无 `mod tests;`，且其中的 `Node::new(...)` 类型早已不存在）——**从未编译、从未运行**的死代码（自 `2b8b046` 起）。已**删除**；其覆盖由 `client_runtime.rs`/`read_index.rs`/新的 `client_redirect.rs` 承担。
+2. **杀 leader（M1 验收①②）**
+   - `multi_node.rs` 新增 `killing_the_leader_elects_a_new_one_and_writes_never_hang`：SIGKILL leader 进程 → 幸存者接管；窗口内写只能是 `409`/`503`，**绝不挂死**（HTTP 读超时返回 `None` 即判失败）；新 leader 仍服务杀前已提交值。
+   - `l2_scenarios.rs` 新增 `new_leader_within_two_election_windows_after_leader_loss`：**确定性 tick 计数**断言换主 ≤ `2×election_tick`（固定种子实测 **16 轮 / 预算 20**）。Gate C 禁止 `tests/` 读真实时钟，故 L3 只能做有界轮询；严格的时序上界由 L2 的 tick 版承担。
+3. **bin CLI 集成测试（test-plan §3.3）**：新增 `arachne-node/tests/cli.rs`（**11 项**）+ 共享 `arachne-node/tests/common/mod.rs`：`--help`/参数错误退出码、配置不可读/校验失败 fail-start、**flock 冲突**、**META cluster_id 不一致**、**SIGTERM 优雅关闭并释放锁**、`/readyz` + `/metrics` + 404/405，以及 4 项 `force-recovery`（见下）。
+4. **D-ART-testobs**：`arachne-node` 新增 `test-observability` feature（**默认关**；启用时仅追加 stdout marker `{"event":"ready"|"shutdown",…}`，零行为改变，已实测）。新增 `scripts/check-release-features.sh`（Gate A：无默认 feature；Gate B：release 产物**不含** marker，而 feature 构建含之且二者 hash 不同），已接入 CI。
+5. **L4 已 ack 写入**：`l4/kill_loop.sh` 每轮发起真实 `PUT /kv/...`（200 = 已提交 + 已 apply），`kill -9` 后重启用线性一致 `GET` 读回复验；循环结束再额外重启一次复验**最后一次**写入。**顺带修复**：`l4/node.toml` / `kill_loop.sh` / `verify_wal.sh` 生成的配置缺 `rpc_timeout_ms`，在 M1-1 引入 profile 校验后**必然 fail-start**（实测复现）——三者已补齐；`l4/README.md` 的"M0 空命题"声明已更新。
+6. **`force-recovery` 子命令（propsol §6.1）——现已实现**
+   - **存储层**：`WalStorage::force_recovery(dir, node_id, new_cluster_id, config, ts)` + `ForceRecoveryReport`（`arachne/src/storage/wal.rs`，已从 `storage::mod` 导出）。语义：读 META → 以**旧** cluster_id 打开（取得数据目录锁，拒绝并发进程）→ **丢弃未提交尾部**（index > commit；跨 segment 正确截断，丢弃 0 条时为 no-op）→ 写新 HardState（`term+1`、`vote=self`、`commit` 不变）→ 重写 META（默认换 cluster_id）。单测 5 项（丢弃尾部 + 轮换 cluster_id / 保留 cluster_id / 零 commit 丢弃全部 / 锁占用拒绝 / node_id 不一致拒绝）。
+   - **M1 membership 边界（如实声明）**：membership 到 **M3** 才持久化 `ConfState`（`raft_storage.rs` 自述静态），故本方法**不**持久化 `ConfState=[self]`；由 CLI 生成/打印**单票 config**（`initial_cluster=[self]`）使该后置条件成立。M3 落地后可去掉这层 config 依赖。
+   - **CLI**：`arachne-node force-recovery --config <path> --i-know-data-loss [--keep-cluster-id] [--out-config <path>]`（`arachne-node/src/force_recovery.rs`）。前置条件：必须显式 `--i-know-data-loss`（否则 exit 2）；旧成员可达性预检（3s TCP，可达则**告警**）；数据目录锁（占用 → exit 1）。`--out-config` 写出可直接启动的单票 config。退出码 0/1/2。单测 5 项 + CLI 集成 4 项（含端到端：acked 写入跨 force-recovery 存活 + cluster_id 轮换 + 单票 config 复起）。
+7. **发现并修复：持久化的 `commit` 从未被写入（严重）**
+   - **现象**：`force-recovery` 报 `commit=0`，把已 ack 的写入全部当作"未提交尾部"丢弃；端到端表现为恢复后 `GET` 返回 not found。
+   - **根因**：raft-rs 把 commit 前进放在 **`LightReady::commit_index`** 上，**不是** `Ready::hs`（`hs` 只在 term/vote 变化时携带），且 `LightReady` 路径会同时推进 raft 内部的 `prev_hs.commit`。`RaftNode::step()` 只持久化了 `ready.hs()`，于是 **commit 一旦前进就再也不会被写盘**，`initial_state()` 报出的 commit 永久滞后。
+   - **为何此前没暴露**：单节点/多数派重启后会把日志**重新 commit**，指标与数据看起来正常；L4 的"commit/applied 不回退"也因重新 commit 而通过。只有"按 commit 截断"的 force-recovery 会暴露它。**这也说明 L4 原来的 commit 不回退断言对 commit 持久性其实不敏感。**
+   - **修复**：`step()` 在 `advance` 之后，若 `light.commit_index()` 为 `Some(c)`，以当前 in-memory term/vote + `c` 调 `set_hard_state`（I1：逐次 fsync），与 raft-rs 自带示例 `examples/single_mem_node` 的用法一致。**代价**：每次 commit 前进多一次 HardState fsync（正确性优先）。
+   - **回归测试**：`arachne/tests/force_recovery.rs::runtime_persists_the_committed_index_for_force_recovery`（真实 `Runtime` actor：put 后停机，断言 `force_recovery` 报出 `commit >= 1` 且 `discarded == 0`）。
+   - **建议**：值得在 propsol 补一条 rev 说明"durable HardState 必须包含最新 commit（I1 的一部分）"，但**未擅自改动** v0.2.8 设计文档。
+
+**验证（`6c79886` + `adb2bd7`）**：`cargo test --workspace` = **321 passed / 0 failed**（294 → 321）；`check-deps.sh`、`check-entropy.sh`、`check-release-features.sh` 全绿；`cargo build --workspace --all-targets`、`--examples` 无告警；`l4/kill_loop.sh`（3 轮 acked 写入）本地 PASS；`force-recovery` 端到端手工复验通过（恢复后 acked 值仍在）。
 
 ### 提交线（新 → 旧）
 ```
-6226ec2 M1-4 (C) stage 3c inc.10: 真实 crash + WAL 重启                     ← HEAD
+adb2bd7 M1-5 (D): 跨进程 409+hint + 杀 leader 断言 + force-recovery CLI + bin CLI 测试 + test-observability  ← HEAD
+6c79886 fix(consensus): 持久化 LightReady 的 commit 前进（durable HardState 的 commit）
+635da14 docs: M1 handoff — (C) stage 3c inc.10 gate GO + replay/resync sharpening
+cbf1a85 M1-4 (C) stage 3c inc.10: gate P3 sharpen（隔离 WAL replay 与 resync）
+e4bedbe docs: M1 handoff — (C) stage 3c inc.10（真实 crash + WAL 重启）
+6226ec2 M1-4 (C) stage 3c inc.10: 真实 crash + WAL 重启
 bdfea02 docs: (C) stage 3c inc.9（换主后同 seq 重试）
 2159fd9 M1-4 (C) stage 3c inc.9: 换主后同 seq 重试（at-most-once）
 fba2aca docs: (C) stage 3c inc.8 门禁 GO
@@ -95,14 +129,19 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **M1 ④（L2）覆盖小结**：S01/S02/S16；INV3/4/7/8/9；双跑确定性；INV4 共 9 种形态（顺序、分区下、换主、并发、多键、分区下并发、ReadIndex 读、故障下 ReadIndex 读+恢复、换主后同 seq 重试 at-most-once）；oracle 负路径（幻值/跨键）；真实 crash+WAL 重启。
 - **剩余（非阻塞）**：follower 服务读的完整来回（转发→quorum→resp→本地服务；当前客户端契约是经 leader 读）；用 `complete_logged` 记录真实 log id 以激活 oracle ②（当前 harness 无 log id，② 为空转）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
 
-### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
-- (A) 已交付 3 进程成形/写读/复制冒烟（`arachne-node/tests/multi_node.rs`）。**本项剩余**：杀 leader ≤2×election_timeout 出新主；期间写返回 `NotLeader`/`QuorumUnavailable` 而非挂死（②）。
-- **已知契约缺口（(D) 需处理）**：多进程下非 leader 写当前是 **503（QuorumUnavailable）**，不是文档的 **409+hint**——`Handle` redirect 只认进程内 peer。修法建议：给 `Handle` 加**不重定向的单发**路径（如 `max_redirects=0` 开关或 `try_put`），让 `NodeHttp::map_error`（已能渲染 409+hint）透传原始 `NotLeader{hint}`；跨进程**自动跟随** hint 还需要 HTTP-port 映射（config 暂无），M1 只做「409+hint body」即可。
-- **另一 (D) 注意**：失联旧 leader 的 propose 超时映射为 **500**（`ArachneError::Timeout`），不是 503——② 的断言要么容忍 500，要么调整 `map_error`。
-- bin CLI 集成测试（§3.3）：配置校验/flock/META 不一致 fail-start/优雅关闭/`/readyz`/`/metrics`。
+### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
+- ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
+- ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
+- ✅ 失联旧 leader 的 propose 超时 `ArachneError::Timeout` 现映射 **503**（原 500）。
+- ✅ bin CLI 集成测试（§3.3）：`arachne-node/tests/cli.rs`（11 项）+ `tests/common/mod.rs`。
+- ✅ **`force-recovery` 子命令已实现**（存储层原语 + CLI + 端到端测试，见 §1.5.6）。**唯一 M1 边界**：membership 到 M3 才持久化 `ConfState`，故单票 membership 由命令生成的 `initial_cluster=[self]` config 提供（M3 后去掉该依赖）。
 
 ### M1 验收对照（propsol §10）
-① 杀 leader ≤2×election_timeout 出新主（→ M1-5/(D)）② 期间写返回 `NotLeader`/`QuorumUnavailable` 不挂死（**客户端面已在 `8cbc765` 证明**；(A) 已证多进程非 leader 写返回 503 不挂死；杀主窗口面待 (D)）③ hint 失效经 seeds 轮询恢复（Handle 已实现 seeds 兜底）④ 含切主窗口的 put/get 线性一致（**读路径已由 (B) ReadIndex 落地**；端到端线性化验证仍需 (C)/L2 分区注入）⑤ crate 文档首页语义表/错误矩阵（**已完成** `151066a`，并在 (B) 校正 `get` 行为）。
+① 杀 leader 后 ≤2×election_timeout 出新主 —— **已证**：L2 确定性 tick 计数（≤2×election_tick，实测 16/20）+ L3 进程 SIGKILL 换主。
+② 期间写返回 `NotLeader`/`QuorumUnavailable` 不挂死 —— **已证**：L3 窗口内写只接受 409/503，挂死即判失败；客户端面 `8cbc765`；`Timeout` 现映射 503。
+③ hint 失效经 seeds 轮询恢复 —— **契约已打通**：跨进程 `409`+hint 可达（`without_redirect`）；`Handle` 的 seeds 兜底已实现（`client_runtime`/`read_index` 覆盖）。
+④ 含切主窗口的 put/get 线性一致 —— **已在 L2（内存传输）证明**：stage 3c inc.4–10（分区/换主/并发/多键/ReadIndex 读/故障下 ReadIndex 读/换主后同 seq 重试 at-most-once 共 9 种形态）；**real-tonic-on-turmoil（stage 3b）仍为已记录 spike**。
+⑤ crate 文档首页语义表/错误矩阵 —— **已完成**（`151066a`，并在 (B) 校正 `get` 行为）。
 
 ## 4. 环境注意（踩过的坑）
 
@@ -121,15 +160,24 @@ cargo build --examples
 cargo build -p arachne --no-default-features
 bash scripts/check-deps.sh
 bash scripts/check-entropy.sh
+bash scripts/check-release-features.sh          # D-ART-testobs（release 产物排除 test-observability）
 # 3 节点真实网络（库级）：
 cargo test -p arachne-transport-tonic --test three_node -- --nocapture
 cargo test -p arachne-transport-tonic --test three_node_client -- --nocapture
-# 3 进程真实集群（bin 级，L3 冒烟）：
+# 3 进程真实集群（bin 级，L3 冒烟 + 杀 leader）：
 cargo test -p arachne-node --test multi_node -- --nocapture
+cargo test -p arachne-node --test cli -- --nocapture
 cargo test -p arachne-transport-tonic --test multi_node_bind -- --nocapture
 # ReadIndex 读路径（进程内 3 节点）：
 cargo test -p arachne --test read_index -- --nocapture
+# 客户端重定向契约（普通 handle + 单发 handle）：
+cargo test -p arachne --test client_redirect -- --nocapture
+# 持久化 commit 回归（真实 Runtime actor + force-recovery）：
+cargo test -p arachne --test force_recovery -- --nocapture
+# L4 真机 kill -9（每轮一次 acked 写入 + 崩溃后复验；需真实磁盘）：
+ARACHNE_L4_ITERATIONS=3 bash l4/kill_loop.sh
 ```
+**本地注意**：若 `CARGO_TARGET_DIR` 在仓库外（本机默认 `~/.cargo/global-target`），沙箱可能拒绝写入；测试时用仓库内目录覆盖，如 `CARGO_TARGET_DIR=.dsh-target cargo test --workspace`。
 
 ## 6. 协作约定（沿用）
 - 生产代码禁 `unwrap`/`expect`/`panic!`/`unsafe`；TDD；改后必编译+测试。
