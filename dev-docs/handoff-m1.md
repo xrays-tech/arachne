@@ -86,7 +86,7 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 - **增量 2（已完成，commit d895d1c）**：`Faults` 增单向丢包；**S16**（丢所有 follower→leader 消息 → CheckQuorum 将 leader 降级；INV7 仍成立）+ **换主 INV4**（历史中隔离 leader、幸存者选新主、客户端改投新主，整段 put/get 历史经 oracle+checker 判定线性一致；断言恰有一次换主）。`l2_scenarios` 6/6。
 - **增量 3（已完成，commit 2b3e3b0；门禁 GO，ora-9；P4 空白已修 777fd6f）**：**并发 INV4**（两客户端 put/get 实时区间重叠 → 真正驱动检查器的并发搜索路径；oracle+checker 双通过）+ **ReadIndex 局部性**（leader 的 `read_index` 经全量投递产生读状态；follower 在不投递时不自服务读，只转发）。harness 记录全量读状态 `(node,ctx,index)`；`l2_scenarios` 8/8。
 - **增量 4（已完成，commit dfc92be；门禁 GO，ora-9；P4 修正 5c4d6e4）：多键 INV4 + 分区下并发**：多键（"a"/"b"）写读交替 + 读一个从未写过的键断言为 `None`——使 oracle 首次跑在真正**多键**历史上（跨键混淆会被 harness 直断言 + checker 逐键模型 + oracle 正向幻值检查共同捕获；**注意**：absent-key 的 `None` 读走 oracle 的跳过路径，其"负路径"由 testsupport 单测 `phantom_read_is_a_violation_with_witness` 覆盖）；两客户端实时重叠区间在隔离一个 follower 的 2+1 分区下由多数侧服务、历史仍线性一致（断言被隔离者确实饥饿）。`l2_scenarios` 10/10。
-- **增量 5（已完成，commit 2f35da1）：INV4 跨越换主**：某次 put/get 在换主前被调用、换主后在**新 leader** 上完成（其实时区间横跨 leadership change）；oracle+checker 仍判定线性一致，并断言轨迹出现非初始 leader。`l2_scenarios` 11/11。
+- **增量 5（已完成，commit 2f35da1；门禁 GO，ora-9；P4/保留加强 97f785a）：INV4 跨越换主**：某次 put/get 在换主前被调用、换主后在**新 leader** 上完成（其实时区间横跨 leadership change）；oracle+checker 仍判定线性一致，并断言轨迹出现非初始 leader；加强：对该换主轨迹断言 INV7，且**新 leader 必须保留换主前已提交的条目**（独立键 `"old"`）。`l2_scenarios` 11/11。
 - **增量 6（未开始）候选**：把 ReadIndex 完成的读接入 oracle/checker（客户端读路径尚未串起）；真实 crash+WAL 重启（当前 crash 用隔离建模，volatile 丢失已在 M0 覆盖）；更大规模/随机种子历史；3b（real-tonic-on-turmoil）仍为已记录 spike（`l2/tests/in_sim.rs` `#[ignore]`）。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①）
