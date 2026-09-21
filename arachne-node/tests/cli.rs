@@ -447,3 +447,109 @@ fn force_recovery_refuses_a_locked_data_dir() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// The membership ops subcommands: usage errors, then the full path — CLI →
+/// operator endpoint → actor → durable state, read back over `/members`
+/// (propsol §5.3, rev S S5).
+#[test]
+fn membership_ops_commands_and_endpoints() {
+    // Usage errors exit 2 and print the usage line.
+    for bad in [
+        vec!["add-learner", "--config"],
+        vec!["promote", "--config", "x.toml"],
+        vec!["remove", "--config", "x.toml", "--id", "abc"],
+        vec!["members", "--nope"],
+    ] {
+        let out = Command::new(BIN)
+            .args(&bad)
+            .output()
+            .unwrap_or_else(|e| panic!("run {bad:?}: {e}"));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad:?} must be a usage error; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("usage: arachne-node"));
+    }
+
+    let help = Command::new(BIN)
+        .args(["add-learner", "--help"])
+        .output()
+        .expect("run --help");
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("add-learner <raft-id>"));
+
+    // A live single-node cluster to operate on.
+    let tree = TempTree::new("members-ops");
+    let data = tree.path("data");
+    std::fs::create_dir_all(&data).expect("create data dir");
+    let http = alloc_port();
+    let cfg = tree.path("n.toml");
+    write_single_node_config(&cfg, "cli-members", "n1", alloc_port(), http, &data);
+    let mut child = spawn_node(&cfg, &tree.path("n.log"));
+    let addr: SocketAddr = format!("127.0.0.1:{http}").parse().expect("addr");
+    assert!(
+        wait_ready(addr, 300),
+        "/readyz must become 200; log:\n{}",
+        read_log(&tree.path("n.log"))
+    );
+
+    // The read starts from the bootstrap configuration.
+    let (status, body) = http_request(addr, "GET", "/members").expect("/members must answer");
+    assert_eq!(status, 200, "got body: {body:?}");
+    assert!(body.contains("voters=1"), "got body: {body:?}");
+    assert!(body.contains("learners=\n") || body.ends_with("learners=\n"));
+
+    // Add a learner through the CLI (a separate process, as an operator would).
+    let add = Command::new(BIN)
+        .args([
+            "add-learner",
+            "--config",
+            cfg.to_str().expect("utf-8 path"),
+            "--id",
+            "2",
+        ])
+        .output()
+        .expect("run add-learner");
+    assert!(
+        add.status.success(),
+        "add-learner must succeed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // A `200` means applied, so the read-back must already show it.
+    let (status, body) = http_request(addr, "GET", "/members").expect("/members must answer");
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("learners=2"),
+        "the learner must be durable once the command returns; got body: {body:?}"
+    );
+
+    // Promoting a learner that never answered is a precondition failure: the
+    // CLI reports it and exits non-zero rather than claiming success.
+    let promote = Command::new(BIN)
+        .args([
+            "promote",
+            "--config",
+            cfg.to_str().expect("utf-8 path"),
+            "--id",
+            "2",
+        ])
+        .output()
+        .expect("run promote");
+    assert_eq!(promote.status.code(), Some(1), "a refused change exits 1");
+    let stderr = String::from_utf8_lossy(&promote.stderr);
+    assert!(
+        stderr.contains("412") && stderr.contains("not caught up"),
+        "the refusal must be reported with its status; got: {stderr:?}"
+    );
+
+    // The state machine is untouched by all of this: a write still works.
+    let (status, _) = http_request(addr, "PUT", "/kv/k/v").expect("put");
+    assert_eq!(status, 200);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

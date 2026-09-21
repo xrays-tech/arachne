@@ -34,7 +34,9 @@ use arachne_node::node::Arachne;
 
 const USAGE: &str = "usage: arachne-node --config <path.toml>\n       \
 arachne-node force-recovery --config <path.toml> --i-know-data-loss \
-[--keep-cluster-id] [--out-config <path.toml>]";
+[--keep-cluster-id] [--out-config <path.toml>]\n       \
+arachne-node add-learner|promote|remove|transfer-leader|members \
+--config <path.toml> [--id <raft-id>] [--http <ip:port>]";
 
 /// Structured stdout markers for the L4 fault injector (decision
 /// D-ART-testobs, test-plan §3.3).
@@ -82,15 +84,29 @@ impl HttpHandler for NodeHttp {
         if let Some(rest) = path_only.strip_prefix("/kv/") {
             return self.handle_kv(method, rest, query);
         }
+        if let Some(rest) = path_only.strip_prefix("/members") {
+            return self.handle_members(method, rest);
+        }
         match path_only {
+            // Read-only endpoints: any other method is a `405`, checked here
+            // rather than relying on the dispatcher's method list (which the
+            // membership surface widened to include `POST`).
             "/readyz" => {
+                if method != "GET" {
+                    return HttpResponse::method_not_allowed();
+                }
                 if self.metrics.is_ready() {
                     HttpResponse::text("ready\n")
                 } else {
                     HttpResponse::unavailable("not ready\n")
                 }
             }
-            "/metrics" => HttpResponse::ok("text/plain; version=0.0.4", self.metrics.render()),
+            "/metrics" => {
+                if method != "GET" {
+                    return HttpResponse::method_not_allowed();
+                }
+                HttpResponse::ok("text/plain; version=0.0.4", self.metrics.render())
+            }
             _ => HttpResponse::not_found(),
         }
     }
@@ -129,6 +145,62 @@ impl NodeHttp {
         }
     }
 
+    /// Operator surface for membership (propsol §5.3, rev S S5).
+    ///
+    /// * `GET /members` → `voters=1,2,3 learners=4` (local state, any node).
+    /// * `POST /members/add-learner/<id>` — add a learner.
+    /// * `POST /members/promote/<id>` — promote a caught-up learner.
+    /// * `POST /members/remove/<id>` — remove a member (a leader hands over
+    ///   first; the *new* leader performs the removal, so a caller that hits a
+    ///   non-leader sees the usual `409` + hint).
+    /// * `POST /members/transfer-leader/<id>` — hand leadership over.
+    ///
+    /// A successful change replies only once it is **applied** (durable), not
+    /// merely proposed, so an operator can read back `/members` right after a
+    /// `200` and see the new configuration.
+    fn handle_members(&self, method: &str, rest: &str) -> HttpResponse {
+        if rest.is_empty() {
+            if method != "GET" {
+                return HttpResponse::method_not_allowed();
+            }
+            return match self.rt.block_on(self.kv.membership()) {
+                Ok((voters, learners)) => HttpResponse::text(format!(
+                    "voters={} learners={}\n",
+                    Self::join_ids(&voters),
+                    Self::join_ids(&learners)
+                )),
+                Err(e) => Self::map_error(e),
+            };
+        }
+        if method != "POST" {
+            return HttpResponse::method_not_allowed();
+        }
+        let Some((op, id)) = rest.trim_start_matches('/').split_once('/') else {
+            return HttpResponse::bad_request();
+        };
+        let Ok(id) = id.parse::<u64>() else {
+            return HttpResponse::bad_request();
+        };
+        let result = match op {
+            "add-learner" => self.rt.block_on(self.kv.add_learner(id)),
+            "promote" => self.rt.block_on(self.kv.promote_learner(id)),
+            "remove" => self.rt.block_on(self.kv.remove_member(id)),
+            "transfer-leader" => self.rt.block_on(self.kv.transfer_leader(id)),
+            _ => return HttpResponse::not_found(),
+        };
+        match result {
+            Ok(()) => HttpResponse::text("ok\n"),
+            Err(e) => Self::map_error(e),
+        }
+    }
+
+    fn join_ids(ids: &[u64]) -> String {
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     fn map_error(error: ArachneError) -> HttpResponse {
         match error {
             ArachneError::NotLeader { leader_hint } => {
@@ -154,6 +226,28 @@ impl NodeHttp {
             }
             // Back-pressure (proposal / read-wait queue full): retry later.
             ArachneError::Busy => HttpResponse::unavailable("busy (retry later)\n"),
+            // Single-step membership discipline: another change is in flight.
+            // `409` because retrying the *same* request is what fixes it.
+            ArachneError::ConfChangePending => {
+                HttpResponse::conflict("a configuration change is already pending\n")
+            }
+            // The request needs a leadership handover first (propsol §5.3 hard
+            // constraint 3). Following the leader hint and retrying is what an
+            // operator (or the ops CLI on the leader) does; `409` marks it as a
+            // state conflict rather than a bad request.
+            ArachneError::LeaderRemovalRequiresTransfer => HttpResponse::conflict(
+                "removing the leader requires a transfer; retry on the leader after it moves\n",
+            ),
+            // Promoting a learner that is behind or silent: a precondition
+            // failure, so `412` rather than `400` (the request is well formed)
+            // or `409` (retrying unchanged will not help).
+            ArachneError::LearnerNotCaughtUp { behind, threshold } => HttpResponse {
+                status: 412,
+                reason: "Precondition Failed",
+                content_type: "text/plain; charset=utf-8",
+                body: format!("learner not caught up: behind {behind} entries (threshold {threshold})\n")
+                    .into_bytes(),
+            },
             ArachneError::ShuttingDown => HttpResponse::unavailable("shutting down\n"),
             other => {
                 let detail = format!("{other}\n");
@@ -179,6 +273,16 @@ impl NodeHttp {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+
+    // The membership ops subcommands (propsol §5.3, rev S S5) talk to a running
+    // node and exit immediately; like `force-recovery` they own their usage and
+    // exit codes (0/1/2).
+    if args
+        .get(1)
+        .is_some_and(|name| arachne_node::members::Op::from_name(name).is_some())
+    {
+        std::process::exit(arachne_node::members::main(&args));
+    }
 
     // The `force-recovery` subcommand (propsol §6.1) is dispatched before the
     // normal node path; it owns its own usage and exit codes (0/1/2).

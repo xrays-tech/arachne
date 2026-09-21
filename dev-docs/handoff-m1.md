@@ -414,7 +414,13 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - **一个未复现的抖动（记录在案）**：本轮的第一次 workspace 全量跑出现 `passed=263 failed=1`（cargo 在首个失败二进制后停止，所以总数偏低），但**失败测试名没有被捕获**（汇总脚本只统计 `test result` 行），随后连跑两次均 393/0。与 §1.17 记录的那个未定位抖动同类：CI 是权威门禁且会打印失败用例名，若再现按 CI 日志定位。
 - **INV-4 已落地**（`a_learner_that_crashes_at_promotion_recovers_and_converges`，连跑绿）：第 4 节点追平后**断电**（abort 其 runtime）→ 在它缺席时 `promote_learner(4)` 仍成功（门用的是它最近一次应答的进度：`matched > 0` 且不落后）→ 三票仍可写 → 用**同一 data_dir** 重启（`spawn_cluster_node_at`，并把新 handle 重新注册给所有节点）→ 重新追平，且**它自己的持久成员配置收敛为 4 voter、不再含 learner**。这条断言的要点：成员是"日志 + 快照"的函数，不是"崩溃节点记住了什么"（I6/I8）。
   顺带把 post-mortem 读 WAL 的 helper 改成**带重试**（崩溃节点的目录锁是异步释放的，第一次跑就撞上 `data directory is locked` ✗）。
-- **S5 剩余**：`arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）——M3 验收 ①②③⑥ 已全部覆盖，这一项是运维面而非验收项。
+- **运维面已落地（S5c）**：
+  - 节点端点：`GET /members` → `voters=1 learners=2`（**本地状态读**，任何节点都能答、失去多数派也不会挂）；`POST /members/{add-learner,promote,remove,transfer-leader}/<raft-id>`。`200` 表示**已 apply（已持久）**，所以命令返回后立刻读 `/members` 就能看到新配置。
+  - 子命令：`arachne-node add-learner|promote|remove|transfer-leader|members --config <toml> [--id <raft-id>] [--http <ip:port>]`（退出码 0/1/2，与 `force-recovery` 一致）。子命令是**独立进程** ⇒ 走 HTTP 而非 in-process `Handle`；**不跟随 hint**（hint 是 raft 地址，不是操作端点地址），遇 `409` 打印 leader 提示并退出非零，由运维指向该节点。例外是移除当前 leader：节点回 `409 requires a transfer`，CLI 先 `transfer-leader/0`（0 = 任意其他 voter）再重试——与 `Handle::remove_member` 的复合动作同构，只是跨进程。
+  - 配套：`Handle::membership()` + `Command::Membership`（本地状态读）；HTTP 调度器放行 `POST`（原仅 GET/PUT/DELETE，`dispatch_line` 的白名单，已在文档与回归测试注释里同步）；错误映射新增 `409`（pending / requires-transfer）与 `412`（learner not caught up）。
+  - 测试：`members` 模块 5 项单测（命令名往返、路径、`--id` 必填但读不需要、未知/缺值参数、`--http` 覆盖）+ `cli.rs` 端到端 1 项（用法错误 → 2；`add-learner` 独立进程 → 0 且 `/members` 立刻显示 `learners=2`；`promote` 未追平 → 1 且 stderr 带 `412 not caught up`；期间 KV 写仍成功）。
+  - **一个自己踩的坑（已修，且这次抓到了名字）**：放行 `POST` 后，`http::tests::serves_readyz_and_metrics_and_errors` 立刻红了——`POST /readyz` 以前是被**调度器**挡成 405，现在能进 handler，而 handler 不看方法 ✗。修法是让"只读端点"由 **handler 自己**判方法（`/readyz`、`/metrics` 非 GET → 405），而不是依赖调度器的白名单——契约写在真正实现它的地方。这一条也顺带说明上一轮那个"未定位抖动"可能不是抖动：**汇总脚本不打印失败用例名，容易把确定性失败误当抖动**；本轮开始把全量输出 `tee` 到日志 ✓。
+- **M3 验收 ①②③④⑤⑥ 全部覆盖，ConfChange/Learner/会话幂等收尾完成**；剩余的是 M2 遗留的**快照传输分块与 `snapshot_transfer_rate_bps` 接线**（跨 crate，需传输 RPC）。
 - 验证：workspace 393/0、fault-injection 409/0（含新增 INV-4）、l2 3/0、四门禁全 PASS；S5a 的 CI run（35613202715）**success**。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**

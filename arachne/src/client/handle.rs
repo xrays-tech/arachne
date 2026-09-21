@@ -196,6 +196,23 @@ impl Handle {
         }
     }
 
+    /// The applied membership of this node: `(voters, learners)` (propsol
+    /// §5.3, rev S).
+    ///
+    /// Local-state read: it answers on any node, leader or not, which is what
+    /// an operator inspecting a cluster wants — and it cannot hang on a lost
+    /// quorum.
+    pub async fn membership(&self) -> Result<(Vec<RaftId>, Vec<RaftId>), ArachneError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(Command::Membership { ack: ack_tx })
+            .await
+            .map_err(|_| ArachneError::ShuttingDown)?;
+        let deadline = Instant::now() + self.inner.timeout;
+        self.await_oneshot(ack_rx, deadline).await?
+    }
+
     /// Hand leadership to `node_id` (propsol §5.3; Q3 makes this public).
     ///
     /// Resolves once the leadership has **actually moved**, not when raft

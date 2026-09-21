@@ -78,6 +78,20 @@ impl HttpResponse {
         }
     }
 
+    /// `409 Conflict` with an explanatory body.
+    ///
+    /// Used for "the cluster is in a state where this request cannot be
+    /// honoured yet" (no leader, a configuration change already pending,
+    /// a leadership handover needed first) — all of which a retry can fix.
+    pub fn conflict(body: &str) -> Self {
+        Self {
+            status: 409,
+            reason: "Conflict",
+            content_type: "text/plain; charset=utf-8",
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
     /// `400 Bad Request`.
     pub fn bad_request() -> Self {
         Self {
@@ -235,17 +249,18 @@ fn drain_request(reader: &mut impl BufRead, max: usize) -> std::io::Result<()> {
 
 /// Route a parsed request line to a response.
 ///
-/// `GET`, `PUT`, and `DELETE` are dispatched to the handler (the KV write/read
-/// surface uses all three). Every other method is rejected with `405 Method
-/// Not Allowed` *before* the handler runs. An empty method or path is a `400`
-/// Bad Request.
+/// `GET`, `PUT`, `DELETE`, and `POST` are dispatched to the handler: the KV
+/// surface uses the first three, and the membership ops surface (`/members/…`,
+/// rev S) uses `POST` for its actions. Every other method is rejected with
+/// `405 Method Not Allowed` *before* the handler runs. An empty method or path
+/// is a `400` Bad Request.
 fn dispatch_line<H: HttpHandler>(line: &str, handler: &H) -> HttpResponse {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
     if method.is_empty() || path.is_empty() {
         HttpResponse::bad_request()
-    } else if matches!(method, "GET" | "PUT" | "DELETE") {
+    } else if matches!(method, "GET" | "PUT" | "DELETE" | "POST") {
         handler.handle(method, path)
     } else {
         HttpResponse::method_not_allowed()
@@ -306,10 +321,24 @@ mod tests {
     impl HttpHandler for TestHandler {
         fn handle(&self, method: &str, path: &str) -> HttpResponse {
             match path {
-                "/readyz" => HttpResponse::text("ready\n"),
-                "/metrics" => HttpResponse::ok("text/plain; version=0.0.4", "arachne_term 1\n"),
-                // Echo the method + path so tests can prove `PUT`/`DELETE` are
-                // routed to the handler (not rejected as `405`).
+                // Read-only, exactly like the node's real handler: the
+                // dispatcher now lets `POST` through (the membership ops
+                // surface needs it), so "this endpoint is GET-only" is the
+                // handler's job, not the dispatcher's.
+                "/readyz" => {
+                    if method != "GET" {
+                        return HttpResponse::method_not_allowed();
+                    }
+                    HttpResponse::text("ready\n")
+                }
+                "/metrics" => {
+                    if method != "GET" {
+                        return HttpResponse::method_not_allowed();
+                    }
+                    HttpResponse::ok("text/plain; version=0.0.4", "arachne_term 1\n")
+                }
+                // Echo the method + path so tests can prove `PUT`/`DELETE`/
+                // `POST` are routed to the handler (not rejected as `405`).
                 "/kv/x" => HttpResponse::text(format!("{method} {path}\n")),
                 _ => HttpResponse::not_found(),
             }
@@ -370,7 +399,8 @@ mod tests {
     }
 
     /// `GET`, `PUT`, and `DELETE` are all routed to the handler (the KV
-    /// write/read surface uses all three); any other method is rejected with
+    /// write/read surface uses three of them and the membership ops surface
+    /// uses `POST`); any other method is rejected with
     /// `405` before the handler runs. This is the regression test for the bug
     /// where `dispatch_line` rejected every non-`GET` method with `405`.
     #[test]
@@ -384,6 +414,11 @@ mod tests {
         let delete = request(addr, "DELETE /kv/x HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(delete.starts_with("HTTP/1.1 200 OK"), "got: {delete}");
         assert!(delete.ends_with("DELETE /kv/x\n"), "got: {delete}");
+
+        // `POST` is the membership ops surface's method (rev S S5).
+        let post = request(addr, "POST /kv/x HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(post.starts_with("HTTP/1.1 200 OK"), "got: {post}");
+        assert!(post.ends_with("POST /kv/x\n"), "got: {post}");
 
         // A method the server does not serve is still rejected with 405.
         let unknown = request(addr, "PATCH /kv/x HTTP/1.1\r\nHost: x\r\n\r\n");

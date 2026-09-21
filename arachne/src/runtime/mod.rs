@@ -84,6 +84,16 @@ pub enum Command {
         /// Reply channel.
         ack: oneshot::Sender<Result<(), ArachneError>>,
     },
+    /// Report the applied membership configuration (rev S S5, ops surface).
+    ///
+    /// Answered from local durable state, so any node can serve it — an
+    /// operator inspecting the cluster does not have to find the leader first,
+    /// and a node that is partitioned away reports what it believes rather
+    /// than hanging.
+    Membership {
+        /// Reply channel: `(voters, learners)`.
+        ack: oneshot::Sender<Result<(Vec<RaftId>, Vec<RaftId>), ArachneError>>,
+    },
     /// Move leadership to another voter (propsol §5.3; Q3 public API).
     ///
     /// `target: None` means "any other voter", which is what the automatic
@@ -1273,6 +1283,16 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                         }));
                     }
                 }
+            }
+            Command::Membership { ack } => {
+                let result = self
+                    .node
+                    .applied_conf_state()
+                    .map(|conf| (conf.voters, conf.learners))
+                    .map_err(|e| {
+                        ArachneError::Unrecoverable(format!("reading the membership failed: {e}"))
+                    });
+                let _ = ack.send(result);
             }
             Command::TransferLeader { target, ack } => {
                 if self.node.leader_id() != self.raft_id {

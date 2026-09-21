@@ -9,6 +9,9 @@
 //!   `/metrics`, and the KV read/write endpoints.
 //! * [`node`] — assembly of an Arachne node (WAL + state machine + `RaftNode`)
 //!   over the real tonic transport.
+//! * [`members`] — the membership ops subcommands (`add-learner`, `promote`,
+//!   `remove`, `transfer-leader`, `members`) that talk to a running node's
+//!   operator endpoints (propsol §5.3).
 //! * [`force_recovery`] — the operator-gated `force-recovery` subcommand
 //!   (propsol §6.1).
 //!
@@ -26,4 +29,5 @@ pub mod config;
 pub mod force_recovery;
 pub mod http;
 pub mod metrics;
+pub mod members;
 pub mod node;
