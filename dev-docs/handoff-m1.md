@@ -298,6 +298,12 @@ rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉�
 - **防复发**：PR 门禁新增一步 **Build standalone projects (fuzz, model-check)**，两者都用 `--locked` 构建——这类漂移以后在 PR 上就红，而不是等到夜间定时任务。验证：手动 `gh workflow run ci.yml` 触发全量，三个 job（Build & test / **Fuzz (wal_recovery)** / L2）**全绿**。
 - 本轮全量：workspace **377 passed / 0 failed**，三个门禁 PASS。
 
+### 1.15 下一块：M3 会话幂等收尾（propsol v0.2.15 R，设计已钉，待实现）
+
+本轮把设计做完了，代码留给下一轮（避免把里程碑级改动做成半成品）。**先记一个已存在的缺陷**：`KvStateMachine` 的会话表没有淘汰——每写一次多一条，长期运行无界增长；`session_ttl_ms`/`session_grace_period_ms`/`max_sessions` 从未被读（新门禁白名单里的三项）。去重与"快照带会话表"都是对的（M3 ⑥ ✓），缺的是失效/回答/满表三件事。
+
+设计要点（详见 rev R）：过期判定放 **leader 侧**（本机时钟）而不是把时间戳写进每条命令；淘汰必须走**复制的显式 GC 条目**（否则副本去重状态分叉）；三区间语义 ≤TTL 正常去重 / TTL..TTL+grace 回 `SessionExpired` 且**不提议** / 之后可由 GC 删除，由此给出 INV5 要的"重复窗口 ≤ ttl+grace"；`max_sessions` 只能在**提议前**检查（已提交条目不能拒绝）；**TTL 必须走 `Clock` seam**（测试注入 `ManualClock`），代价是 `RuntimeConfig` 新增 clock 字段、约 10 处字面量构造跟着改。落地分 R1（时钟+本地表+两错误）/R2（GC 命令与提议循环）/R3（INV5 S07/S10/S14 + 删白名单三项）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
