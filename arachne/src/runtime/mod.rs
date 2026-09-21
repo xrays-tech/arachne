@@ -59,6 +59,11 @@ use arachne_seam::storage::{
 };
 use raft::eraftpb::ConfChangeType;
 
+/// How many times a streamed snapshot transfer is retried before giving up
+/// (propsol rev T). Each retry re-asks for the same snapshot; a newer snapshot
+/// from the leader replaces it.
+const SNAPSHOT_FETCH_ATTEMPTS: u32 = 8;
+
 /// Approximate per-entry durable overhead (record header, type byte, and the
 /// index/term fields) used to size the snapshot trigger.
 const ENTRY_FRAMING_BYTES: u64 = 24;
@@ -1781,7 +1786,6 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         let Some(node_id) = self.raft_to_node.get(&held.from).cloned() else {
             // The sender is not in this node's peer map: nothing to fetch from,
             // so report failure (raft retries) instead of stalling.
-            self.node.report_snapshot(held.from, false).await;
             return;
         };
         let dest = std::env::temp_dir().join(format!(
@@ -1793,10 +1797,36 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         let (from, index, term) = (held.from, held.index, held.term);
         let task_dest = dest.clone();
         tokio::spawn(async move {
-            let result = transport
-                .fetch_snapshot(node_id, index, term, &task_dest)
-                .await
-                .map_err(|e| e.to_string());
+            // **Retry here, not at the leader.** A follower cannot tell the
+            // leader that its transfer failed: `MsgSnapStatus` is a *local*
+            // message in raft-rs (`is_local_msg`, raw_node.rs:57), so
+            // `RawNode::step` rejects it with `StepLocalMsg`, and the only
+            // `snapshot_failure()` call site is the leader-local
+            // `report_snapshot` path. A failed transfer must therefore be
+            // recovered on this side: keep asking for the snapshot the leader
+            // named until it arrives. The ordinary AppendResponse that follows a
+            // successful install is what clears the leader's `Snapshot` state —
+            // the same in-band path that already works for a first-time success.
+            let mut result = Err("no attempt made".to_string());
+            for attempt in 0..SNAPSHOT_FETCH_ATTEMPTS {
+                if attempt > 0 {
+                    // Back off a little: a peer that was busy, or a file that
+                    // was momentarily unavailable, must not become a hot loop.
+                    tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt).min(8)))
+                        .await;
+                }
+                result = match transport
+                    .fetch_snapshot(node_id.clone(), index, term, &task_dest)
+                    .await
+                {
+                    Ok(Some(written)) => Ok(Some(written)),
+                    Ok(None) => Err("the peer could not serve that snapshot".to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                if result.is_ok() {
+                    break;
+                }
+            }
             // A full queue means the actor is gone; nothing to report to.
             let _ = done_tx
                 .send(SnapshotFetchDone {
@@ -1838,7 +1868,6 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                 "from" => fetch.held.from,
                 "index" => fetch.held.index,
             );
-            self.node.report_snapshot(fetch.held.from, false).await;
             let _ = std::fs::remove_file(&done.dest);
             return;
         };
@@ -1854,8 +1883,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                     "error" => %e,
                     "index" => fetch.held.index,
                 );
-                self.node.report_snapshot(fetch.held.from, false).await;
-                let _ = std::fs::remove_file(&done.dest);
+                    let _ = std::fs::remove_file(&done.dest);
                 return;
             }
         };
@@ -1875,13 +1903,11 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         if let Err(e) = self.node.step_held_snapshot(&fetch.held, data) {
             // A codec/raft failure: this node cannot make progress from here.
             self.fail_all_pending(&format!("stepping a fetched snapshot failed: {e}"));
-            self.node.report_snapshot(fetch.held.from, false).await;
             let _ = std::fs::remove_file(&done.dest);
             return;
         }
         // raft keeps the follower in `Snapshot` state (and sends it nothing
         // else) until it hears how the transfer ended.
-        self.node.report_snapshot(fetch.held.from, true).await;
         let _ = std::fs::remove_file(&done.dest);
         self.metrics.inc_snapshots_installed();
     }

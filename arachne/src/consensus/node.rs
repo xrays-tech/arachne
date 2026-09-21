@@ -1099,23 +1099,6 @@ where
         self.raw.step(raft_msg).map_err(NodeError::Raft)
     }
 
-    /// Tell raft how a streamed snapshot transfer ended (rev T).
-    ///
-    /// Until this arrives the leader keeps the follower in `Snapshot` state and
-    /// sends it nothing else; `false` makes raft treat the follower as
-    /// unreachable and retry, which is how a failed transfer recovers.
-    pub async fn report_snapshot(&mut self, to: RaftId, ok: bool) {
-        let mut msg = Message::default();
-        msg.set_msg_type(raft::eraftpb::MessageType::MsgSnapStatus);
-        msg.set_from(self.raw.raft.id);
-        msg.set_to(to);
-        // The receiver drops a message whose term is below its own, so the
-        // status must carry this node's current term.
-        msg.set_term(self.raw.raft.term);
-        msg.set_reject(!ok);
-        self.deliver(&msg).await;
-    }
-
     /// The membership configuration the cluster has agreed on, learners
     /// included (propsol §5.5.4; rev S S4).
     ///

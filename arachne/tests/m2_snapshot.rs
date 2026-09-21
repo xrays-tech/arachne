@@ -537,6 +537,16 @@ async fn lagging_follower_catches_up_through_a_snapshot() {
     catch_up_scenario(false).await;
 }
 
+/// rev T T3 (and §9's "snapshot transfer interrupted → recovers"): the first
+/// transfer fails outright. A snapshot transfer is not atomic, and a follower
+/// cannot ask the leader to re-send (raft treats the status message as local),
+/// so the retry has to happen on the follower's side — which is what this
+/// pins down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_snapshot_transfer_is_retried_and_recovers() {
+    catch_up_scenario_inner(false, true, 1).await;
+}
+
 /// The same scenario through the **streamed snapshot** path (rev T, T2b): the
 /// leader sends metadata only, the follower fetches the bytes over its
 /// transport, installs them, steps the message into raft, and reports back.
