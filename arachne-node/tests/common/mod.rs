@@ -19,14 +19,42 @@ pub const STEP_MS: u64 = 50;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Claim a free loopback port (bind → read → release). The node process then
-/// binds that port; the (tiny) race window on loopback is acceptable for a
-/// single-test harness.
+/// The next port candidate for this process.
+///
+/// `bind(:0)`-then-release looks like the obvious way to find a free port, but
+/// it hands *the same free port* to two tests running in parallel, and anything
+/// else on the machine can take it before the node binds. That is what made the
+/// process-level tests fail under CI load while the node was still starting
+/// (handoff §1.31).
+///
+/// Instead every test process draws from its own band (derived from its pid) with
+/// a monotonic counter, so two tests in the same process can never be given the
+/// same candidate.
+static PORT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_port_candidate() -> u16 {
+    // 200 bands of 200 ports, starting at 40000.
+    const BANDS: u64 = 200;
+    const PER_BAND: u64 = 200;
+    let band = (std::process::id() as u64) % BANDS;
+    let n = PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % PER_BAND;
+    (40_000 + band * PER_BAND + n) as u16
+}
+
+/// Claim a loopback port for a test node.
+///
+/// Candidates come from this process's own band, and each is probed by binding
+/// it (then releasing it) so a port that is genuinely busy is skipped. The
+/// release-then-rebind window still exists, but it can no longer hand the same
+/// port to two tests of the same process — which was the failure mode.
 pub fn alloc_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a probe listener");
-    let port = listener.local_addr().expect("probe local addr").port();
-    drop(listener);
-    port
+    for _ in 0..200 {
+        let candidate = next_port_candidate();
+        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            return candidate;
+        }
+    }
+    panic!("no free port in this process's band");
 }
 
 /// Parse an HTTP/1.1 response: the numeric status from the first line and the
