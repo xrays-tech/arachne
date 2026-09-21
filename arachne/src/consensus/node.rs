@@ -867,6 +867,21 @@ where
         Ok(())
     }
 
+    /// The membership configuration the cluster has agreed on, learners
+    /// included (propsol §5.5.4; rev S S4).
+    ///
+    /// This is what a snapshot must carry: a locally created snapshot that
+    /// recorded only the bootstrap voters would lose every learner (and any
+    /// membership change) the moment it was used to rebuild a node.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Raft`] if the storage cannot report its state.
+    pub fn applied_conf_state(&self) -> Result<SeamConfState, NodeError<T>> {
+        let state = self.raw.store().initial_state().map_err(NodeError::Raft)?;
+        Ok(RaftStorage::<S>::to_seam_conf_state(&state.conf_state))
+    }
+
     /// The term of the entry at `index`, answered from the durable snapshot
     /// once the entry itself has been compacted away.
     pub fn term_at(&mut self, index: LogIndex) -> Result<Term, NodeError<T>> {

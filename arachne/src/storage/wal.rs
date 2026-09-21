@@ -1604,6 +1604,15 @@ impl Storage for WalStorage {
             return Ok(());
         }
 
+        // The snapshot's member table takes over when it is newer than the
+        // durable membership file: `initial_state` must report the snapshot's
+        // configuration afterwards (invariant I7), and callers read that live
+        // (the promotion gate reads `is_learner` from it).
+        if snapshot.meta.index > self.conf_change_index {
+            self.conf_state = snapshot.meta.conf_state.clone();
+            self.conf_change_index = snapshot.meta.index;
+        }
+
         let name = snapshot_file_name(snapshot.meta.index, snapshot.meta.term);
         let final_path = self.data_dir.join(&name);
         let tmp_path = self.data_dir.join(format!("{name}.tmp"));
@@ -1655,6 +1664,15 @@ impl Storage for WalStorage {
         if snapshot.meta.index == self.compacted_to && self.entries.is_empty() {
             return Ok(());
         }
+        // The snapshot's member table takes over when it is newer than the
+        // durable membership file: `initial_state` must report the snapshot's
+        // configuration afterwards (invariant I7), and callers read that live
+        // (the promotion gate reads `is_learner` from it).
+        if snapshot.meta.index > self.conf_change_index {
+            self.conf_state = snapshot.meta.conf_state.clone();
+            self.conf_change_index = snapshot.meta.index;
+        }
+
 
         // Persist (fsync, rename, META pointer) before touching the log: a
         // crash in between must leave the store readable, and a repeated
@@ -3725,6 +3743,63 @@ mod tests {
             Err(other) => panic!("expected Corruption, got {other:?}"),
             Ok(_) => panic!("a corrupt membership file must fail the start"),
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_newer_than_the_membership_file_takes_over() {
+        // rev S S4: after installing a snapshot, `initial_state` must report the
+        // configuration the snapshot carries — the runtime reads it live (the
+        // promotion gate asks `is_learner`), so a stale in-memory copy would let
+        // a node disagree with the snapshot it just installed.
+        let dir = temp_dir();
+        let mut store = WalStorage::open(&dir, test_opts()).expect("open");
+        let old = ConfState {
+            voters: vec![1, 2, 3],
+            learners: vec![],
+        };
+        store.save_conf_state(4, &old).expect("save membership");
+        assert_eq!(store.conf_change_index(), 4);
+
+        let snapshot = Snapshot {
+            meta: SnapshotMeta {
+                index: 9,
+                term: 1,
+                conf_state: ConfState {
+                    voters: vec![1, 2],
+                    learners: vec![3],
+                },
+            },
+            data: b"state@9".to_vec(),
+        };
+        store.install_snapshot(&snapshot).expect("install");
+
+        let state = store.initial_state().expect("state");
+        assert_eq!(state.conf_state, snapshot.meta.conf_state);
+        assert_eq!(store.conf_change_index(), 9);
+
+        // The reverse: an *older* snapshot must not drag the membership back.
+        drop(store);
+        let mut store2 = WalStorage::open(&dir, test_opts()).expect("reopen");
+        let stale = Snapshot {
+            meta: SnapshotMeta {
+                index: 5,
+                term: 1,
+                conf_state: ConfState {
+                    voters: vec![1, 2, 3],
+                    learners: vec![],
+                },
+            },
+            data: b"state@5".to_vec(),
+        };
+        assert!(
+            store2.save_snapshot(&stale).is_ok(),
+            "an older snapshot is refused or ignored, not adopted"
+        );
+        assert_eq!(
+            store2.initial_state().expect("state").conf_state,
+            snapshot.meta.conf_state
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

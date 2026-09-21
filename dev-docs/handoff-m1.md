@@ -393,6 +393,16 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - 验证：workspace **392 passed / 0 failed**、`--features fault-injection` **405 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS（含 profile-knobs 对新旋钮的检查）。
 - **下一步**：**S4** 快照写 live ConfState + 安装路径回灌（`create_snapshot` 现在写的是 bootstrap 静态集合）；**S5** M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程写不中断）+ INV-4 断电 + `arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
 
+### 1.24 M3 ConfChange S4 落地：快照携带 live 成员表（+ 一次 CI 抖动修复）
+
+- **缺陷**：`create_snapshot` 的调用方（runtime）传的是**启动时的静态 voter 列表 + `learners: Vec::new()`**。后果：本地快照会丢掉**所有 learner 与所有成员变更**——而快照正是"以后拿它重建节点"的东西，于是恢复出来的集群成员会静默退回初始配置。
+- **修复三处**：①改用新方法 `RaftNode::applied_conf_state()`（读已应用成员配置，与 `initial_state` 同源），并把那个静态列表连同推导一起删掉（留着就是第二份会分叉的真相）；②`WalStorage::save_snapshot`/`install_snapshot` 在 `snapshot.index > conf_change_index` 时用快照成员表接管**内存视图**——这不只是重启问题：`is_learner`/`voter_ids` 都读它，安装快照后内存里若还是旧配置，追赶中的 learner 会被追平门误判；③快照格式不变（成员表 v0.2.10 起就有），压缩丢弃水位之下的成员记录、由快照接棒，无需新格式。
+- **测试**：wal 单测（安装 index 9 的快照 → `initial_state` 报快照成员、`conf_change_index=9`；反向对照：更旧的快照不得把成员拖回去）；端到端 `a_local_snapshot_carries_the_live_membership`（小阈值触发本地快照 → 停机后重开 WAL 断言 `snapshot().meta.conf_state.learners == [2]`，**修复前必然失败**）。
+- **CI 抖动修复（顺手，独立问题）**：S3 的 CI run **失败了**——`sessions::session_bands_dedup_then_expire_then_forget` 在第 4 步拿到 `Timeout`。根因是负载：该步是单次 propose 且无重试，而 CI 的 fault-injection 步骤在 2 核 runner 上并行跑（新增的 6 个 membership 测试各自还会 spawn 多线程 runtime），300ms 的写 deadline 被挤爆。修法与既有先例一致（`m2_wal_faults` 的有界重试）：**只对 `Timeout` 做有界重试**，且重试的是**同一个 session**——若第一次其实落盘了，状态机去重仍保证断言成立（这正是幂等机制存在的意义）。同时把 3 节点测试的 tokio worker 线程从 4 降到 2，并给 `resolve_transfers` 加"无在途转让就直接返回"的早退（它每 cycle 都跑，别白读 leader/hint）。
+  **教训（工具层面）**：`gh run watch ... | tail` 的退出码来自 `tail`，`--exit-status` 会被管道吞掉——**必须用 `gh run view --json conclusion` 复核**，否则"绿"是假的（本轮就是这样发现 S3 其实红了）。
+- 验证：workspace **393 passed / 0 failed**、`--features fault-injection` **407 passed / 0 failed（连跑两次）**、l2 **3 passed / 0 failed**、四门禁全 PASS。
+- **剩余**：**S5** = M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程 quorum 存续/写不中断）+ INV-4（learner 追平瞬间断电）+ `arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

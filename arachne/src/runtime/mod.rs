@@ -55,8 +55,7 @@ use crate::{
     Clock, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx,
 };
 use arachne_seam::storage::{
-    ConfState as SeamConfState, EntryType as SeamEntryType, Snapshot as SeamSnapshot,
-    Storage as _,
+    EntryType as SeamEntryType, Snapshot as SeamSnapshot, Storage as _,
 };
 use raft::eraftpb::ConfChangeType;
 
@@ -526,10 +525,6 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     live_sessions: u64,
     /// When to propose the next session-GC entry.
     next_session_gc: Timestamp,
-    /// The voting membership this node was started with. It travels into every
-    /// local snapshot so that a node restored from one knows the configuration
-    /// (propsol §5.5.4); ConfChange is M3.
-    voters: Vec<RaftId>,
     /// Log growth that triggers a local snapshot and compaction
     /// (`snapshot_threshold`, propsol §7). 0 disables the trigger.
     snapshot_threshold_bytes: u64,
@@ -623,11 +618,6 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         let (tx, commands) = mpsc::channel(1024);
         let handle = Handle::new_local(config.self_node_id.clone(), tx, &config.profile);
 
-        let mut voters: Vec<RaftId> = config.peers.keys().copied().collect();
-        voters.push(config.self_raft_id);
-        voters.sort_unstable();
-        voters.dedup();
-
         let period = Duration::from_millis(config.profile.heartbeat_interval_ms.max(1));
         let durability = node.durability_notifier();
         let stop = Arc::new(tokio::sync::Notify::new());
@@ -673,7 +663,6 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             max_sessions: config.profile.max_sessions,
             live_sessions: 0,
             next_session_gc: 0,
-            voters,
             snapshot_threshold_bytes: config.profile.snapshot_threshold_bytes,
             last_wal_sample: Instant::now(),
             applied_bytes_at_snapshot: 0,
@@ -1182,9 +1171,17 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 return false;
             }
         };
-        let conf_state = SeamConfState {
-            voters: self.voters.clone(),
-            learners: Vec::new(),
+        // The live configuration, learners included (rev S S4). The static
+        // voter list this used to pass would drop every learner, and every
+        // membership change, from the snapshot that is supposed to rebuild a
+        // node.
+        let conf_state = match self.node.applied_conf_state() {
+            Ok(conf_state) => conf_state,
+            Err(e) => {
+                self.fail_all_pending(&format!("cannot read the applied membership: {e}"));
+                self.metrics.set_is_leader(false);
+                return false;
+            }
         };
         // Q4: creation blocks apply (in the apply task). It is measured every
         // time so the >1s budget alarm has data (propsol §8.2).
@@ -1499,6 +1496,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// leader has stepped down but has not yet learned the new one) is not a
     /// verdict: it waits for the deadline.
     fn resolve_transfers(&mut self) {
+        // Nothing in flight: return before reading the leader and building a
+        // hint, because this runs on every drive cycle.
+        if self.pending_transfer.is_empty() {
+            return;
+        }
         let now = Instant::now();
         let leader = self.node.leader_id();
         // Read the hint before draining: `self.hint()` needs `&self`, which the

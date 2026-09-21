@@ -157,10 +157,31 @@ async fn session_bands_dedup_then_expire_then_forget() {
     //    proposal is accepted again — and the state machine, which still holds
     //    the outcome (GC lands in R2), keeps the effect once.
     clock.advance(GRACE_MS + TTL_MS);
-    handle
-        .propose_raw(write(b"v4"), CLIENT, SEQ)
-        .await
-        .expect("past the grace window the proposal is accepted again");
+    // Bounded retry on `Timeout` only, for the same reason `m2_wal_faults`
+    // retries: the write deadline is a latency bound, and this test is about
+    // session bands, not latency — a loaded CI runner must not turn a correct
+    // acceptance into a failure. Retrying the *same session* is exactly what
+    // the idempotency machinery exists for: if the first attempt did land, the
+    // state machine dedups it and the value assertions below still hold.
+    let mut accepted = false;
+    let mut last = None;
+    for _ in 0..50 {
+        match handle.propose_raw(write(b"v4"), CLIENT, SEQ).await {
+            Ok(()) => {
+                accepted = true;
+                break;
+            }
+            Err(ArachneError::Timeout) => {
+                last = Some(ArachneError::Timeout);
+                tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("past the grace window the proposal must be accepted, got {e}"),
+        }
+    }
+    assert!(
+        accepted,
+        "past the grace window the proposal is accepted again: {last:?}"
+    );
     assert_eq!(
         handle.get_stale(b"k").await.expect("read"),
         Some(b"v1".to_vec()),

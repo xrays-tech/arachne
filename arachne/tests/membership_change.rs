@@ -73,7 +73,13 @@ fn wal_options_for(i: u64) -> WalOptions {
 
 /// Start a single-voter cluster on `dir`, returning the running parts.
 fn start(dir: &PathBuf) -> (Arc<Metrics>, arachne::client::Handle, RuntimeThread) {
-    let profile = profile();
+    start_with_profile(dir, profile())
+}
+
+fn start_with_profile(
+    dir: &PathBuf,
+    profile: ProfileConfig,
+) -> (Arc<Metrics>, arachne::client::Handle, RuntimeThread) {
     let wal = WalStorage::open(dir, wal_options()).expect("open wal");
     let factory = InMemoryTransportFactory::new();
     let (tx, rx) = factory.create(NodeId::from("n1"));
@@ -426,7 +432,9 @@ async fn until_put(handle: &arachne::client::Handle, key: &[u8], value: &[u8]) {
     panic!("the write never went through");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Two worker threads, not four: these tests already run several actor threads
+// of their own, and CI runs this file's tests in parallel on a small runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leadership_moves_and_a_leader_can_be_removed() {
     let profile = profile();
     let factory = InMemoryTransportFactory::new();
@@ -552,5 +560,70 @@ async fn a_learner_that_never_answered_cannot_be_promoted() {
     let (_, voters, learners) = recovered_conf_state(&dir);
     assert_eq!(voters, vec![1], "nothing was promoted");
     assert_eq!(learners, vec![2], "the learner is still a learner");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_snapshot_carries_the_live_membership() {
+    // rev S S4. A locally created snapshot is what rebuilds a node later, so it
+    // must record the configuration the cluster agreed on — learners included.
+    // Before this, it recorded the static bootstrap voters (and no learners at
+    // all), so restoring from it would silently forget every membership change.
+    let dir = temp_dir("snapshot-membership");
+    let profile = ProfileConfig {
+        // Small enough that a couple of writes trigger a local snapshot.
+        snapshot_threshold_bytes: 256,
+        ..profile()
+    };
+    let (metrics, handle, thread) = start_with_profile(&dir, profile);
+    until_leader(&metrics).await;
+
+    handle
+        .add_learner(2)
+        .await
+        .expect("the learner must be added before the snapshot");
+
+    // Cross the snapshot threshold.
+    let payload = vec![b'x'; 128];
+    for i in 0..8u8 {
+        handle
+            .put(b"k", &payload)
+            .await
+            .unwrap_or_else(|e| panic!("write {i} failed: {e}"));
+    }
+
+    // Wait for the snapshot file to appear.
+    let mut found = false;
+    for _ in 0..400 {
+        if std::fs::read_dir(&dir)
+            .expect("read data dir")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("snapshot-") && name.ends_with(".snap")
+            })
+        {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    assert!(found, "the snapshot trigger must fire");
+
+    drop(handle);
+    thread.shutdown();
+
+    // The snapshot on disk carries the membership, not the bootstrap set.
+    let wal = WalStorage::open(&dir, wal_options()).expect("reopen wal");
+    let snapshot = wal
+        .snapshot()
+        .expect("read snapshot")
+        .expect("a snapshot exists");
+    assert_eq!(
+        snapshot.meta.conf_state.learners,
+        vec![2],
+        "the snapshot must carry the learner"
+    );
+    assert_eq!(snapshot.meta.conf_state.voters, vec![1]);
     let _ = std::fs::remove_dir_all(&dir);
 }

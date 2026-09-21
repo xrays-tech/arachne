@@ -307,7 +307,11 @@ M3 的最后一块（验收 ①②③⑥）。先记录**两个已存在的缺�
   - 不是 learner（已有 voter 或未知）→ `InvalidArgument`，从而"新节点一律先以 Learner 加入"不可被绕过；
   - **实测修正**："在线"用 `matched > 0` 而非 `recent_active`——raft-rs 新增节点时刻意把 `recent_active` 置 true（CheckQuorum 安全），基于它会让不存在的节点通过门（见上表）。
   验证：单测覆盖边界（`0/128/129` 条目 + 未答过 + 阈值 0）；端到端（`membership_change.rs`）对不存在的 learner `promote` → `LearnerNotCaughtUp` 且 `behind > 0`、对未知节点 `promote` → `InvalidArgument`、之后写仍正常、停机后 durable 成员仍是 voters=[1]/learners=[2]（**反向对照**：什么都没被提升）。**正向路径**（真实第 4 个节点追平后 promote 成功）随 S5 的 learner 加入一起做——那需要"新节点以 learner 身份启动"的配置面。
-- **S4**：快照写 live ConfState + 安装路径回灌；压缩可丢水位之下的 `0x04`。验证：成员变更 → 触发快照 → 压缩 → 重启（WAL 里已无 `0x04`）→ 成员仍正确，即"由快照接棒"。
+- **S4 ✓**：快照写 **live** ConfState + 安装/保存路径把新于 `membership` 文件的成员表**回灌**到内存视图。三处改动：
+  1. **`create_snapshot` 的调用方**（runtime）此前传的是"启动时的静态 voter 列表 + `learners: Vec::new()`"——即快照会**丢掉所有 learner 与所有成员变更**；改为 `RaftNode::applied_conf_state()`（读已应用成员配置）。静态列表连同它的推导一起删除（否则就是第二份会分叉的真相）。
+  2. `WalStorage::save_snapshot`/`install_snapshot`：当 `snapshot.index > conf_change_index` 时用快照成员表接管内存视图。**这是运行时正确性问题而不只是重启问题**：`is_learner`/`voter_ids` 都读它，安装快照后若内存里还是旧配置，追赶中的 learner 会被追平门误判。
+  3. 快照格式**不变**（成员表 v0.2.10 起就有），所以"压缩丢弃水位之下的成员记录、由快照接棒"无需新格式，回滚也不受影响。
+  验证：wal 单测（安装 index 9 的快照 → `initial_state` 报快照成员、`conf_change_index=9`；**反向对照**：更旧的快照不得把成员拖回去）；端到端 `a_local_snapshot_carries_the_live_membership`（小阈值触发本地快照 → 停机后重开 WAL 断言 `snapshot().meta.conf_state.learners == [2]`，**修复前该断言必失败**）。
 - **S5**：端到端 M3 ①②：3 voter + 新节点以 **Learner** 加入（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，**仅作无持久状态时的兜底**，与既有 `voters.is_empty() && learners.is_empty()` 判定一致）→ 施压写入 → promote → remove 一个成员，全程**quorum 存续、写不中断**；`remove_member(leader)` 自动先转让成功（M3 ②）；`fault-injection` 崩在 promote 前后（INV-4 "Learner 追平瞬间断电"）→ 重启后成员状态与日志前缀自洽。运维面（`arachne-node` 子命令与 metrics）在 S5 末接线。
 
 **实现修正（E-rev，S1 期间）**：初稿把持久化 ConfState 定为"WAL 新增记录类型 `ConfState(0x04)`"，理由是复用段内的 CRC/撕裂/恢复规则。真正动手时才发现这条路线与 §5.5.3 的**提交窗口撕裂规则**冲突：末段撕裂只在 `estimated > commit + 1` 时自动截断，而撕裂记录的类型不可信，于是**稳态（`commit == last_index`）下一次写入中途崩溃 = fail-start**。任何"在已提交条目之后追加的非 Entry 记录"都继承这个性质，因此记录类型方案被否决，改为独立的原子替换文件 `membership`（同时避免了扩记录类型集合，回滚更简单）。教训与 P2 同源：**尾部撕裂只能靠"不产生新的尾部写入位置"来回避，不能靠类型嗅探**。
