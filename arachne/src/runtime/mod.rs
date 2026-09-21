@@ -178,6 +178,10 @@ const READ_QUEUE_DEPTH: usize = MAX_PENDING_READS;
 /// write work, so a read flood cannot starve apply.
 const READ_BURST: usize = 64;
 
+/// How many sessions one GC entry may name (propsol v0.2.15 R2). The list has to
+/// fit in a log entry, so the leader sweeps in bounded batches.
+const SESSION_GC_BATCH: usize = 1_000;
+
 /// The snapshot duration budget (propsol §8.2 Q4): creating a snapshot blocks
 /// apply, so a longer one is a capacity signal worth warning about.
 const SNAPSHOT_DURATION_BUDGET_MS: u64 = 1_000;
@@ -235,6 +239,9 @@ struct ApplyProgress {
     applied_bytes_total: u64,
     /// Sticky fail-stop reason: once set, the node stops.
     failed: Option<String>,
+    /// Sessions currently in the state machine's table (propsol §8
+    /// `session_count`); the leader uses it to enforce `max_sessions`.
+    sessions: u64,
 }
 
 /// Owns the state machine and applies committed work off the actor's loop.
@@ -356,11 +363,13 @@ impl ApplyTask {
             applied_index: self.sm.applied_index(),
             applied_bytes_total: self.applied_bytes_total,
             failed: self.failed.clone(),
+            sessions: self.sm.session_count() as u64,
         };
         self.progress.send_if_modified(|current| {
             if current.applied_index == next.applied_index
                 && current.applied_bytes_total == next.applied_bytes_total
                 && current.failed == next.failed
+                && current.sessions == next.sessions
             {
                 false
             } else {
@@ -449,6 +458,12 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     session_ttl_ms: u64,
     /// `session_grace_period_ms` from the profile.
     session_grace_ms: u64,
+    /// `max_sessions` from the profile.
+    max_sessions: u64,
+    /// Sessions in the state machine's table, as published by the apply task.
+    live_sessions: u64,
+    /// When to propose the next session-GC entry.
+    next_session_gc: Timestamp,
     /// The voting membership this node was started with. It travels into every
     /// local snapshot so that a node restored from one knows the configuration
     /// (propsol §5.5.4); ConfChange is M3.
@@ -510,6 +525,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             applied_index,
             applied_bytes_total: 0,
             failed: None,
+            sessions: 0,
         });
         let apply_task = ApplyTask {
             sm,
@@ -588,6 +604,9 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             next_session_sweep: 0,
             session_ttl_ms: config.profile.session_ttl_ms,
             session_grace_ms: config.profile.session_grace_period_ms,
+            max_sessions: config.profile.max_sessions,
+            live_sessions: 0,
+            next_session_gc: 0,
             voters,
             snapshot_threshold_bytes: config.profile.snapshot_threshold_bytes,
             last_wal_sample: Instant::now(),
@@ -714,6 +733,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
 
         self.resolve_reads();
         self.reply_pendings();
+        self.maybe_collect_sessions();
         if !self.maybe_snapshot() {
             return false;
         }
@@ -738,6 +758,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         let progress = self.progress.borrow().clone();
         self.applied_index = progress.applied_index;
         self.applied_bytes_total = progress.applied_bytes_total;
+        self.live_sessions = progress.sessions;
         if let Some(reason) = progress.failed {
             self.fail_all_pending(&reason);
             self.metrics.set_is_leader(false);
@@ -844,6 +865,46 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 true
             }
             Err(mpsc::error::TrySendError::Closed(())) => false,
+        }
+    }
+
+    /// Propose a session-GC entry for sessions past `ttl + grace`
+    /// (propsol v0.2.15 R2).
+    ///
+    /// Only the leader proposes, and only the sessions it has not seen for the
+    /// whole window: the state machine prunes exactly the listed ones, so every
+    /// replica ends up with the same table. Nothing is proposed unless something
+    /// expired, so an idle cluster stays silent.
+    fn maybe_collect_sessions(&mut self) {
+        let Some(clock) = self.session_clock.clone() else {
+            return;
+        };
+        if self.session_ttl_ms == 0 || self.node.leader_id() != self.raft_id {
+            return;
+        }
+        let now = clock.now_millis();
+        if now < self.next_session_gc {
+            return;
+        }
+        self.next_session_gc = now.saturating_add(self.session_ttl_ms.max(1));
+        let window = self.session_ttl_ms.saturating_add(self.session_grace_ms);
+        let expired: Vec<(u64, u64)> = self
+            .sessions
+            .iter()
+            .filter(|(_, last)| now.saturating_sub(**last) > window)
+            .map(|(session, _)| *session)
+            .take(SESSION_GC_BATCH)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let cmd = KvStateMachine::encode_session_gc(&expired);
+        if self.node.propose(&cmd).is_ok() {
+            // On its way to every replica: forget them here so the next round
+            // does not propose the same list again.
+            for session in &expired {
+                self.sessions.remove(session);
+            }
         }
     }
 
@@ -997,8 +1058,22 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 // Session bands (propsol v0.2.15 R1): a retry past the TTL but
                 // inside the grace window is answered "result unknown" instead
                 // of being proposed again.
-                if self.session_band(client_id, seq_no) == SessionBand::Grace {
+                let band = self.session_band(client_id, seq_no);
+                if band == SessionBand::Grace {
                     let _ = ack.send(Err(ArachneError::SessionExpired));
+                    return;
+                }
+                // `max_sessions` (propsol v0.2.15 R2): only a *new* session can be
+                // turned away, and only before proposing — a committed entry
+                // cannot be refused by the state machine without breaking
+                // replica agreement, and refusing to record it would turn a
+                // retry into a fresh command. GC is what makes the cap
+                // recoverable, which is why the two land together.
+                if band == SessionBand::Fresh
+                    && self.max_sessions > 0
+                    && self.live_sessions >= self.max_sessions
+                {
+                    let _ = ack.send(Err(ArachneError::SessionTableFull));
                     return;
                 }
                 match self.node.propose(&cmd) {
@@ -1262,6 +1337,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             .set_is_leader(self.node.leader_id() == self.raft_id);
         self.metrics.set_dropped_sends(self.node.dropped_send_count());
         self.metrics.set_read_index_pending(self.pending_reads.len() as u64);
+        self.metrics.set_session_count(self.live_sessions);
     }
 
     /// This node's cluster identity.

@@ -171,3 +171,109 @@ async fn session_bands_dedup_then_expire_then_forget() {
     thread.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R2: GC prunes exactly what the leader listed, and that is what makes
+/// `max_sessions` recoverable — the reason the cap and GC had to land together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_gc_prunes_and_relieves_the_session_cap() {
+    const CAP: u64 = 4;
+    let dir = temp_dir();
+    let mut profile = profile();
+    profile.max_sessions = CAP;
+    let wal = WalStorage::open(
+        &dir,
+        WalOptions {
+            cluster_id: "sessions-gc".into(),
+            node_id: "n1".into(),
+            config: WalConfig {
+                fsync_policy: FsyncPolicy::Always,
+                segment_bytes: 1 << 20,
+            },
+            created_at_millis: 0,
+            fsync_observer: None,
+        },
+    )
+    .expect("open wal");
+    let factory = InMemoryTransportFactory::new();
+    let (tx, rx) = factory.create(NodeId::from("n1"));
+    let metrics = Arc::new(Metrics::new());
+    let config = RuntimeConfig {
+        self_raft_id: 1,
+        self_node_id: NodeId::from("n1"),
+        peers: HashMap::new(),
+        addresses: HashMap::new(),
+        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        profile,
+        metrics: Arc::clone(&metrics),
+    };
+    let clock = Arc::new(ManualClock::new(2_000_000));
+    let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger()).expect("runtime");
+    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne::Clock>);
+    let thread: RuntimeThread = runtime.spawn_dedicated().expect("spawn");
+    until_leader(&metrics).await;
+
+    // Fill the table to the cap with distinct sessions.
+    for client in 1..=CAP {
+        handle
+            .propose_raw(
+                KvStateMachine::encode_put(client, 1, format!("k{client}").as_bytes(), b"v"),
+                client,
+                1,
+            )
+            .await
+            .expect("the table is below the cap");
+    }
+    for _ in 0..200 {
+        if metrics.session_count() >= CAP {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(metrics.session_count(), CAP, "the table reached the cap");
+
+    // A *new* session is turned away before it is proposed.
+    match handle
+        .propose_raw(
+            KvStateMachine::encode_put(CAP + 1, 1, b"overflow", b"v"),
+            CAP + 1,
+            1,
+        )
+        .await
+    {
+        Err(ArachneError::SessionTableFull) => {}
+        other => panic!("expected SessionTableFull at the cap, got {other:?}"),
+    }
+
+    // Past `ttl + grace` the leader collects what expired, and the cap lifts.
+    clock.advance(TTL_MS + GRACE_MS + 10);
+    for _ in 0..400 {
+        if metrics.session_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        metrics.session_count(),
+        0,
+        "GC must prune the expired sessions on every replica"
+    );
+    handle
+        .propose_raw(
+            KvStateMachine::encode_put(CAP + 2, 1, b"after-gc", b"v"),
+            CAP + 2,
+            1,
+        )
+        .await
+        .expect("a new session fits again once GC has pruned");
+
+    // GC prunes sessions, not data.
+    assert_eq!(
+        handle.get_stale(b"k1").await.expect("read"),
+        Some(b"v".to_vec()),
+        "garbage-collecting a session must not touch the key/value state"
+    );
+
+    drop(handle);
+    thread.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

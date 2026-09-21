@@ -314,6 +314,16 @@ rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉�
 - 门禁：`session_ttl_ms`/`session_grace_period_ms` 已从 `check-profile-knobs.sh` 白名单移除（现在真被读），白名单只剩 `max_sessions`（R2，必须与 GC 同批）与 `snapshot_transfer_rate_bps`（流式传输）。CI 的 fault-injection 步骤加了 `--test sessions`。
 - 本轮全量：workspace **377 passed**、fault-injection **214 passed**、l2 全绿、四道门禁 PASS。
 
+### 1.17 M3 会话 R2 落地：GC 命令 + `max_sessions`（必须同批）
+
+- **SM 侧**：新增 `OP_SESSION_GC`（`[op:1][count:u32][(client_id,seq_no)×count]`）——**显式列表**而非 cutoff 时间戳，因为副本必须删掉完全相同的集合，而时间戳不可重放。`apply` 只删列出的会话、不碰 KV；`command_session` 对 GC 返回 `None`（不归属提案、不延长会话）；畸形 GC 整条拒绝、不部分应用。新增 `session_count()`/`encode_session_gc`。
+- **runtime 侧**：`ApplyProgress` 增 `sessions`（apply 任务发布 `sm.session_count()`）→ actor 存 `live_sessions`；leader 每 `ttl` 检查、把超过 `ttl+grace` 未活动的会话按 **1000/条**上限提议为 GC，且**只在确有过期项时**才提议（空闲不产生日志）；提议成功后从本地表删除，避免重复提议。
+- **`max_sessions` 与 GC 同批**（这是刻意的顺序）：只有 **Fresh（新）会话**会在提议前被拒 `SessionTableFull`，且依据**复制的**表大小；已有会话的重试永不被容量拒绝。若先上 cap 而没有 GC，填满后新会话会被**永久**拒绝 ✗。换主后本地表为空，极端情况（表满+换主）可能误拒一次合法重试，可重试恢复——已记录。
+- 指标新增 `arachne_session_count`（propsol §8 一直要求这个 metric）。
+- 测试：GC 单测（只删列出的、KV 不变、畸形整条拒绝）+ 端到端 `session_gc_prunes_and_relieves_the_session_cap`（4 会话填满 → 第 5 个 `SessionTableFull` → 时钟越 `ttl+grace` → GC 后计数归 0 → 新会话被接受 → KV 未被触碰）。**反向对照**：`session_ttl_ms = 0` → 两个会话测试全失败。
+- 门禁联动：`check-profile-knobs.sh` 白名单**只剩 `snapshot_transfer_rate_bps`**（TTL/grace/max_sessions 三项都已真读）。
+- **如实记录一次观察到的 flake**：某次 `cargo test --workspace` 输出被工具截断，可见尾部出现 2 个失败；随后**连续 3 次全量 378 passed / 0 failed**，未能定位那 2 个（可信度受限：输出被截断）。R2 对非 feature 路径零开销（无 clock 时 `maybe_collect_sessions` 立即返回），因此与被测路径无关；下次若再现，应先关掉并行构建负载再跑，以排除机器争用。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

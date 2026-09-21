@@ -45,6 +45,8 @@ pub struct Metrics {
     /// Local snapshots that exceeded their duration budget (propsol §8.2 Q4:
     /// `> 1s` warns — snapshot creation blocks apply).
     snapshot_slow_total: AtomicU64,
+    /// Sessions in the state machine's table (propsol §8 `session_count`).
+    session_count: AtomicU64,
 }
 
 impl Metrics {
@@ -149,6 +151,16 @@ impl Metrics {
     /// Count a local snapshot that blew its duration budget (§8.2).
     pub fn inc_snapshot_slow(&self) {
         self.snapshot_slow_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the number of sessions in the state machine's table.
+    pub fn set_session_count(&self, value: u64) {
+        self.session_count.store(value, Ordering::Relaxed);
+    }
+
+    /// Sessions in the state machine's table.
+    pub fn session_count(&self) -> u64 {
+        self.session_count.load(Ordering::Relaxed)
     }
 
     /// Local snapshots that exceeded their duration budget.
@@ -314,6 +326,12 @@ impl Metrics {
             "Proposals rejected with Busy because the apply backlog was too deep.",
             self.proposal_busy_total.load(Ordering::Relaxed),
         );
+        gauge(
+            &mut out,
+            "arachne_session_count",
+            "Sessions in the state machine's table.",
+            self.session_count.load(Ordering::Relaxed),
+        );
         counter(
             &mut out,
             "arachne_snapshot_slow_total",
@@ -397,6 +415,7 @@ mod tests {
             "arachne_apply_backlog_bytes",
             "arachne_proposal_busy_total",
             "arachne_snapshot_slow_total",
+            "arachne_session_count",
         ] {
             assert!(text.contains(name), "missing {name}");
         }

@@ -252,7 +252,14 @@ M3 缺的最后一块（M3 验收 ④⑤、INV5 S07/S10/S14）。先记录一个
 | 快照 | 会话 outcome 表照旧进快照（已有 ✓ M3 ⑥）；`last_used` 不进 | 把 `last_used` 写进快照 | 快照必须可重放，时钟值不可重放。 |
 | 验证（M3 ④⑤、INV5 S07/S10/S14） | `ManualClock` 驱动：①TTL 内重试 → oracle 判"同 seq 恰好一次"（已有）；②越过 TTL 未过 grace → `SessionExpired` **且 replicated index 未增长**（证明没有提议）；③越过 `ttl+grace` → GC 之后同 seq 可被当新会话执行，断言**重复生效窗口 ≤ ttl+grace**；④填满 `max_sessions` → 新会话得 `SessionTableFull`，GC 后恢复；⑤快照安装后去重完好（已有 + 补一条跨安装的重试断言） | 只做单元测试 | 这些都要求"日志里到底有没有条目"和"时钟推进"两个观测点，只有端到端 + 模拟时钟能同时给到。 |
 
-**落地顺序（R1 已落地）**：**R1 ✓** 会话 TTL/grace 三区间 + leader 本地表 + `SessionExpired`——时钟经 `Runtime::with_session_clock`（builder，**不加** `RuntimeConfig` 字段以免动 ~10 处构造；不设置即"永不过期"= 旧行为），`session_ttl_ms`/`session_grace_period_ms` 由此被真正读取（两项已从 `check-profile-knobs.sh` 白名单移除）；本地表按 `ttl+grace` 窗口定期清扫，因此有界。端到端 `arachne/tests/sessions.rs`（feature 门控，配 `ManualClock` + `Handle::propose_raw` 才能复现"同 session 重试"）：TTL 内重试用**不同值**提议 → 断言原值存活（恰好一次，而非最后写入胜）；越 TTL 未过 grace → `SessionExpired` **且 `applied_index`/`commit_index` 不动**（证明没进日志）；越过 grace → 重新接受，而 SM 仍去重故效果仍为一次。**反向对照**：把 `session_ttl_ms` 设 0 → 该断言失败（测试非空洞）。**R2** GC 命令（`KvStateMachine` 新命令类型 + 提议循环 + 表大小进进度）+ `max_sessions` 上限检查（与 GC 同批落地，否则填满后新会话会被永久拒绝）；**R3** INV5 S07/S10/S14 与 ConfChange 相关场景。
+**落地顺序（R1 已落地）**：**R1 ✓** 会话 TTL/grace 三区间 + leader 本地表 + `SessionExpired`——时钟经 `Runtime::with_session_clock`（builder，**不加** `RuntimeConfig` 字段以免动 ~10 处构造；不设置即"永不过期"= 旧行为），`session_ttl_ms`/`session_grace_period_ms` 由此被真正读取（两项已从 `check-profile-knobs.sh` 白名单移除）；本地表按 `ttl+grace` 窗口定期清扫，因此有界。端到端 `arachne/tests/sessions.rs`（feature 门控，配 `ManualClock` + `Handle::propose_raw` 才能复现"同 session 重试"）：TTL 内重试用**不同值**提议 → 断言原值存活（恰好一次，而非最后写入胜）；越 TTL 未过 grace → `SessionExpired` **且 `applied_index`/`commit_index` 不动**（证明没进日志）；越过 grace → 重新接受，而 SM 仍去重故效果仍为一次。**反向对照**：把 `session_ttl_ms` 设 0 → 该断言失败（测试非空洞）。**R2 ✓** GC 命令 + `max_sessions` 上限（同批落地，否则填满后新会话被永久拒绝）：
+- SM 新增 `OP_SESSION_GC` 命令：`[op:1][count:u32][(client_id,seq_no)×count]`，**显式列表**（副本必须删同一集合，时间戳无法重放）；`apply` 只删列出的会话、不动 KV；`command_session` 对它返回 `None`（因此它既不归属提案也不延长会话）；新增 `session_count()` 与 `encode_session_gc`。
+- runtime：`ApplyProgress` 增 `sessions`（由 apply 任务发布 `sm.session_count()`），actor 存 `live_sessions`；leader 每 `ttl` 检查一次，把 `now - last_used > ttl+grace` 的会话按上限 1000/条提议为 GC；**只在有新东西过期时才提议**（空闲集群保持静默），提议成功后从本地表删除以免重复提议。
+- `max_sessions`：**只有 Fresh（新）会话**会在提议前被拒（`SessionTableFull`），且用**复制的**表大小判断；已有会话的重试永不被容量拒绝。换主后本地表为空 → 在极端情况下（表满 + 换主）可能误拒一个合法的重试，可重试恢复，已记录。
+- 指标新增 `arachne_session_count`（propsol §8 本来就要求 `session_count`）。
+- 验证：单测（GC 只删列出的、KV 不变、畸形 GC 被拒且不部分应用）；端到端 `session_gc_prunes_and_relieves_the_session_cap`：4 会话填满 → 第 5 个新会话得 `SessionTableFull` → 时钟越过 `ttl+grace` → GC 后 `session_count` 归 0 → 新会话重新被接受 → 且 KV 数据未被 GC 触碰。**反向对照**：`session_ttl_ms = 0` 时两个会话测试都失败（非空洞）。
+- `check-profile-knobs.sh` 白名单**只剩 `snapshot_transfer_rate_bps`**（三项会话旋钮全部真被读）。
+- **R3**：INV5 S07/S10/S14 与 ConfChange 相关场景。
 
 ## 1. 目标与非目标
 

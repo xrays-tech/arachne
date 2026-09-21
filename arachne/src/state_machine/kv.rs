@@ -38,6 +38,12 @@ pub enum KvError {
 /// Command opcodes (part of the wire format; fixed).
 const OP_PUT: u8 = 0;
 const OP_DELETE: u8 = 1;
+/// Session garbage collection (propsol v0.2.15 R2): prune the listed sessions.
+///
+/// The list is **explicit** rather than a cutoff timestamp: every replica must
+/// remove exactly the same sessions, and a timestamp would have to come from the
+/// leader's clock and could not be replayed.
+const OP_SESSION_GC: u8 = 2;
 
 /// The kind of command, parsed from its opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +179,57 @@ impl KvStateMachine {
         Some((client_id, seq_no))
     }
 
+    /// Encode a session-GC command (propsol v0.2.15 R2).
+    ///
+    /// Layout: `[op:1][count:u32][(client_id:u64, seq_no:u64) × count]`. It
+    /// carries no session header of its own, so
+    /// [`command_session`](KvStateMachine::command_session) reports `None` for it
+    /// and it never extends a session.
+    pub fn encode_session_gc(sessions: &[(u64, u64)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(5 + sessions.len() * 16);
+        buf.push(OP_SESSION_GC);
+        buf.extend_from_slice(&(sessions.len() as u32).to_le_bytes());
+        for (client_id, seq_no) in sessions {
+            buf.extend_from_slice(&client_id.to_le_bytes());
+            buf.extend_from_slice(&seq_no.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Decode a session-GC command, rejecting a malformed one rather than
+    /// pruning a prefix of it.
+    fn parse_session_gc(cmd: &[u8]) -> Result<Vec<SessionKey>, KvError> {
+        if cmd.first() != Some(&OP_SESSION_GC) || cmd.len() < 5 {
+            return Err(KvError::MalformedCommand);
+        }
+        let count = u32::from_le_bytes(
+            cmd.get(1..5)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        ) as usize;
+        let body = cmd.get(5..).ok_or(KvError::MalformedCommand)?;
+        if body.len() != count * 16 {
+            return Err(KvError::MalformedCommand);
+        }
+        let mut sessions = Vec::with_capacity(count);
+        for pair in body.chunks_exact(16) {
+            let client_id = u64::from_le_bytes(
+                pair[0..8].try_into().map_err(|_| KvError::MalformedCommand)?,
+            );
+            let seq_no = u64::from_le_bytes(
+                pair[8..16].try_into().map_err(|_| KvError::MalformedCommand)?,
+            );
+            sessions.push(SessionKey { client_id, seq_no });
+        }
+        Ok(sessions)
+    }
+
+    /// How many sessions the table holds (propsol §8 `session_count`).
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     /// Whether the session `(client_id, seq_no)` has been applied, i.e. its
     /// result is cached in the session table.
     ///
@@ -206,6 +263,15 @@ impl StateMachine for KvStateMachine {
         // A no-op entry (empty payload) is how a leader records its term; it
         // advances the index but changes no state.
         if command.is_empty() {
+            self.applied = index;
+            return Ok(ApplyOutcome::None);
+        }
+
+        if command.first() == Some(&OP_SESSION_GC) {
+            let sessions = Self::parse_session_gc(command)?;
+            for session in sessions {
+                self.sessions.remove(&session);
+            }
             self.applied = index;
             return Ok(ApplyOutcome::None);
         }
@@ -378,6 +444,33 @@ mod tests {
 
     /// The same `(client_id, seq_no)` applies exactly once: a replay at a later
     /// index returns the cached result without re-mutating state.
+    #[test]
+    fn session_gc_prunes_exactly_the_listed_sessions() {
+        let mut sm = KvStateMachine::new();
+        // Two sessions, distinguished by seq_no.
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"a", b"1"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_put(2, 1, b"b", b"2"))
+            .unwrap();
+        assert_eq!(sm.session_count(), 2);
+        assert!(sm.applied_session(1, 1) && sm.applied_session(2, 1));
+
+        // A GC entry removes only what it lists, and does not disturb the data.
+        let gc = KvStateMachine::encode_session_gc(&[(1, 1), (9, 9)]);
+        sm.apply(3, &gc).unwrap();
+        assert_eq!(sm.session_count(), 1);
+        assert!(!sm.applied_session(1, 1));
+        assert!(sm.applied_session(2, 1), "unlisted sessions survive");
+        assert_eq!(sm.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(sm.session_count(), 1);
+
+        // A GC entry is not a session command, so it never extends one.
+        assert_eq!(KvStateMachine::command_session(&gc), None);
+        // Malformed GC entries are rejected rather than partially applied.
+        assert!(sm.apply(4, &[OP_SESSION_GC]).is_err());
+        assert!(sm.apply(4, &KvStateMachine::encode_session_gc(&[(1, 1)])[..10]).is_err());
+    }
+
     #[test]
     fn command_session_extracts_the_idempotency_key() {
         let put = KvStateMachine::encode_put(7, 3, b"k", b"v");
