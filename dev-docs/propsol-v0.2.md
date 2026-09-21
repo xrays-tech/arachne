@@ -312,9 +312,11 @@ M3 的最后一块（验收 ①②③⑥）。先记录**两个已存在的缺�
   2. `WalStorage::save_snapshot`/`install_snapshot`：当 `snapshot.index > conf_change_index` 时用快照成员表接管内存视图。**这是运行时正确性问题而不只是重启问题**：`is_learner`/`voter_ids` 都读它，安装快照后若内存里还是旧配置，追赶中的 learner 会被追平门误判。
   3. 快照格式**不变**（成员表 v0.2.10 起就有），所以"压缩丢弃水位之下的成员记录、由快照接棒"无需新格式，回滚也不受影响。
   验证：wal 单测（安装 index 9 的快照 → `initial_state` 报快照成员、`conf_change_index=9`；**反向对照**：更旧的快照不得把成员拖回去）；端到端 `a_local_snapshot_carries_the_live_membership`（小阈值触发本地快照 → 停机后重开 WAL 断言 `snapshot().meta.conf_state.learners == [2]`，**修复前该断言必失败**）。
-- **S5**：端到端 M3 ①②：3 voter + 新节点以 **Learner** 加入（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，**仅作无持久状态时的兜底**，与既有 `voters.is_empty() && learners.is_empty()` 判定一致）→ 施压写入 → promote → remove 一个成员，全程**quorum 存续、写不中断**；`remove_member(leader)` 自动先转让成功（M3 ②）；`fault-injection` 崩在 promote 前后（INV-4 "Learner 追平瞬间断电"）→ 重启后成员状态与日志前缀自洽。运维面（`arachne-node` 子命令与 metrics）在 S5 末接线。
+- **S5（进行中：加入/追平/promote/remove 端到端 ✓，INV-4 与 node 运维面待做）**：端到端 M3 ①②：3 voter + 新节点以 **Learner** 加入（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，**仅作无持久状态时的兜底**，与既有 `voters.is_empty() && learners.is_empty()` 判定一致）→ 施压写入 → promote → remove 一个成员，全程**quorum 存续、写不中断**；`remove_member(leader)` 自动先转让成功（M3 ②）；`fault-injection` 崩在 promote 前后（INV-4 "Learner 追平瞬间断电"）→ 重启后成员状态与日志前缀自洽。运维面（`arachne-node` 子命令与 metrics）在 S5 末接线。
 
 **实现修正（E-rev，S1 期间）**：初稿把持久化 ConfState 定为"WAL 新增记录类型 `ConfState(0x04)`"，理由是复用段内的 CRC/撕裂/恢复规则。真正动手时才发现这条路线与 §5.5.3 的**提交窗口撕裂规则**冲突：末段撕裂只在 `estimated > commit + 1` 时自动截断，而撕裂记录的类型不可信，于是**稳态（`commit == last_index`）下一次写入中途崩溃 = fail-start**。任何"在已提交条目之后追加的非 Entry 记录"都继承这个性质，因此记录类型方案被否决，改为独立的原子替换文件 `membership`（同时避免了扩记录类型集合，回滚更简单）。教训与 P2 同源：**尾部撕裂只能靠"不产生新的尾部写入位置"来回避，不能靠类型嗅探**。
+
+**S5 实现补充**：`RaftNodeConfig` 增 `bootstrap_voters: Option<Vec<RaftId>>` 与 `join_as_learner: bool`，把"**传输可达的节点**"与"**启动时的投票配置**"分开。二者此前混在一起（bootstrap voter 集由 `peers` 推导）：而一个加入者必须在**成为 voter 之前**就能被现有节点发消息（否则永远追不上），于是现有节点的 `peers` 必须包含它——若不拆开，现有节点就会把加入者当成 voter 来 bootstrap，得到一个全集群从未同意过的配置（`add_learner` 之后它还留在 voter 集里，`promote` 又会以"不是 learner"失败）。拆分后：加入者 `bootstrap_voters = 既有 voter 集` + `join_as_learner = true`（本地声明，仅在没有持久配置时生效），既有节点 `bootstrap_voters = 既有 voter 集`（`peers` 里带加入者只为可达性）。`RaftNodeConfig` 因此不再 `Copy`（含 `Vec`）。
 
 **本 rev 未决**：byte 口径的 `promote_lag_threshold`（等 index→offset 映射）；joint consensus（非目标）；自动 demote（§5.2 明示由运维决定）。
 

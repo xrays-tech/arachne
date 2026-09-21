@@ -77,7 +77,7 @@ pub enum NodeError<T: Transport> {
 /// A deployment derives them from a [`ProfileConfig`] (via
 /// [`RaftNodeConfig::from_profile`]) or uses [`Default`] (the original
 /// hardcoded values, kept so existing callers and tests are unchanged).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RaftNodeConfig {
     /// Number of ticks for an election timeout.
     pub election_tick: u64,
@@ -87,6 +87,28 @@ pub struct RaftNodeConfig {
     pub max_size_per_msg: u64,
     /// Max messages in flight to a single follower (raft built-in flow control).
     pub max_inflight_msgs: u64,
+    /// The voter set this node should start with, when it must differ from the
+    /// transport peers it was configured with (rev S S5).
+    ///
+    /// `None` means "the configured peers plus this node", which is the right
+    /// answer for a cluster that is being created. It is the **wrong** answer
+    /// for a node joining a cluster that already exists: to send raft messages
+    /// to the new member, every existing node must know its address and id, but
+    /// knowing where a node is must not make it a voter. Without this field
+    /// those two facts are conflated, and the existing members would bootstrap
+    /// a configuration the rest of the cluster never agreed to.
+    pub bootstrap_voters: Option<Vec<RaftId>>,
+    /// Start this node as a **learner** of the peers it was given, rather than
+    /// as a voter (propsol §5.3 hard constraint 2, rev S S5).
+    ///
+    /// A joining node has no durable membership yet, so its bootstrap
+    /// configuration is a declaration: the configured peers are the voters and
+    /// this node is a learner. That is the only way raft will let it receive
+    /// the log without also letting it campaign — and it is exactly the
+    /// configuration the leader's `add_learner` will then make official. Once
+    /// a persisted configuration exists, it wins over this declaration
+    /// (`RaftStorage::initial_state`).
+    pub join_as_learner: bool,
 }
 
 impl Default for RaftNodeConfig {
@@ -97,6 +119,8 @@ impl Default for RaftNodeConfig {
             heartbeat_tick: 1,
             max_size_per_msg: 1_048_576,
             max_inflight_msgs: 256,
+            bootstrap_voters: None,
+            join_as_learner: false,
         }
     }
 }
@@ -118,6 +142,12 @@ impl RaftNodeConfig {
             election_tick: (profile.election_timeout_ms / heartbeat).max(1),
             max_size_per_msg: profile.max_inflight_bytes,
             max_inflight_msgs: profile.max_inflight_msgs,
+            // Joining as a learner is a per-node role, not a profile limit;
+            // `ProfileConfig` deliberately does not carry it (it would also
+            // break the profile-knob gate's "every knob is a limit" reading).
+            // An operator sets these two directly on the node config.
+            bootstrap_voters: None,
+            join_as_learner: false,
         }
     }
 }
@@ -364,16 +394,30 @@ where
 
         // Bootstrap membership: the declared peers plus this node. Without a
         // voter set containing this node, raft has no quorum and can never
-        // elect a leader (propsol §5.7 `initial_cluster`). M3 ConfChange will
-        // replace this with persisted, changeable membership.
-        let mut voters: Vec<RaftId> = peers.keys().copied().collect();
-        voters.push(self_raft_id);
+        // elect a leader (propsol §5.7 `initial_cluster`). A persisted
+        // configuration always wins over this declaration; it is only the
+        // starting point of a fresh store.
+        let mut voters: Vec<RaftId> = match &config.bootstrap_voters {
+            Some(voters) => voters.clone(),
+            None => peers.keys().copied().collect(),
+        };
+        let mut learners: Vec<RaftId> = Vec::new();
+        if config.join_as_learner {
+            // A joiner is not a voter yet: it starts as a learner of the
+            // configured voters (rev S). Adding itself to the voter set would
+            // make it campaign for an election it cannot win and must not enter.
+            learners.push(self_raft_id);
+        } else if config.bootstrap_voters.is_none() {
+            // Fresh cluster: this node is one of the voters. (With an explicit
+            // voter set it is already listed — or, for a joiner, deliberately
+            // not.)
+            voters.push(self_raft_id);
+        }
         voters.sort_unstable();
         voters.dedup();
-        let bootstrap = SeamConfState {
-            voters,
-            learners: Vec::new(),
-        };
+        learners.sort_unstable();
+        learners.dedup();
+        let bootstrap = SeamConfState { voters, learners };
 
         // The pipeline's wakeup: the storage calls this when an offloaded flush
         // completes, so the actor notices durability without waiting for a tick.

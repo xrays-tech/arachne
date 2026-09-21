@@ -346,8 +346,17 @@ struct ClusterNode {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-async fn spawn_cluster_node(
+/// Spawn one node of an `n`-node cluster.
+///
+/// `bootstrap_voters` is the configuration the node should *start* with; it is
+/// separate from the transport peers (`1..=n` minus self) because an existing
+/// node has to be able to send raft messages to a joiner long before that
+/// joiner is a voter (rev S S5).
+async fn spawn_cluster_node_with(
     i: u64,
+    n: u64,
+    bootstrap_voters: Vec<u64>,
+    join_as_learner: bool,
     factory: &InMemoryTransportFactory,
     addresses: &HashMap<NodeId, SocketAddr>,
     profile: &ProfileConfig,
@@ -371,13 +380,16 @@ async fn spawn_cluster_node(
 
     let (tx, rx) = factory.create(nid(i));
     let metrics = Arc::new(Metrics::new());
-    let peers = (1..=N).filter(|j| *j != i).map(|j| (j, nid(j))).collect();
+    let peers = (1..=n).filter(|j| *j != i).map(|j| (j, nid(j))).collect();
+    let mut raft = arachne::consensus::RaftNodeConfig::from_profile(profile);
+    raft.bootstrap_voters = Some(bootstrap_voters);
+    raft.join_as_learner = join_as_learner;
     let config = RuntimeConfig {
         self_raft_id: i,
         self_node_id: nid(i),
         peers,
         addresses: addresses.clone(),
-        raft: arachne::consensus::RaftNodeConfig::from_profile(profile),
+        raft,
         profile: profile.clone(),
         metrics: Arc::clone(&metrics),
     };
@@ -417,6 +429,19 @@ async fn wait_for_leader(nodes: &[ClusterNode]) -> u64 {
     panic!("the cluster must elect one leader");
 }
 
+/// Wait until every listed node reports `leader` — a liveness property, not an
+/// instant: a node that just handed leadership away clears its own view of the
+/// leader until the new leader's first message reaches it.
+async fn wait_until_all_agree_on(nodes: &[ClusterNode], leader: u64) {
+    for _ in 0..800 {
+        if nodes.iter().all(|n| n.metrics.leader_id() == leader) {
+            return;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    panic!("the cluster must converge on leader {leader}");
+}
+
 async fn until_put(handle: &arachne::client::Handle, key: &[u8], value: &[u8]) {
     for _ in 0..800 {
         match handle.put(key, value).await {
@@ -434,6 +459,15 @@ async fn until_put(handle: &arachne::client::Handle, key: &[u8], value: &[u8]) {
 
 // Two worker threads, not four: these tests already run several actor threads
 // of their own, and CI runs this file's tests in parallel on a small runner.
+async fn spawn_cluster_node(
+    i: u64,
+    factory: &InMemoryTransportFactory,
+    addresses: &HashMap<NodeId, SocketAddr>,
+    profile: &ProfileConfig,
+) -> ClusterNode {
+    spawn_cluster_node_with(i, N, (1..=N).collect(), false, factory, addresses, profile).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leadership_moves_and_a_leader_can_be_removed() {
     let profile = profile();
@@ -461,11 +495,7 @@ async fn leadership_moves_and_a_leader_can_be_removed() {
         nodes[(target - 1) as usize].metrics.is_leader(),
         "the target must be leading once the transfer resolves"
     );
-    assert_eq!(
-        nodes[(leader - 1) as usize].metrics.leader_id(),
-        target,
-        "the old leader must see the new one"
-    );
+    wait_until_all_agree_on(&nodes, target).await;
 
     // 2. Removing the current leader is the two-step sequence: transfer, then
     //    propose the removal (propsol §5.3 hard constraint 3).
@@ -626,4 +656,108 @@ async fn a_local_snapshot_carries_the_live_membership() {
     );
     assert_eq!(snapshot.meta.conf_state.voters, vec![1]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wait for a condition that polls the nodes' published state.
+async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+    for _ in 0..800 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_node_joins_as_a_learner_is_promoted_and_a_member_is_removed() {
+    // M3 acceptance ①: the whole node-replacement flow — add_learner → catch up
+    // → promote → remove — must keep quorum alive and service uninterrupted.
+    const TOTAL: u64 = 4;
+    let profile = profile();
+    let factory = InMemoryTransportFactory::new();
+    let addresses: HashMap<NodeId, SocketAddr> = (1..=TOTAL)
+        .map(|i| (nid(i), SocketAddr::from(([127, 0, 0, 1], 7300 + i as u16))))
+        .collect();
+    let voters: Vec<u64> = (1..=3).collect();
+
+    // Three voters, plus a fourth node that starts as a *learner*: it is
+    // reachable (its address is configured everywhere) but not in the voting
+    // configuration, which is what `join_as_learner` declares.
+    let mut nodes: Vec<ClusterNode> = Vec::new();
+    for i in 1..=3 {
+        nodes.push(
+            spawn_cluster_node_with(i, TOTAL, voters.clone(), false, &factory, &addresses, &profile)
+                .await,
+        );
+    }
+    nodes.push(
+        spawn_cluster_node_with(4, TOTAL, voters.clone(), true, &factory, &addresses, &profile).await,
+    );
+    link_peers(&nodes);
+
+    // The voting cluster elects a leader; the joiner is not part of it yet.
+    let leader = wait_for_leader(&nodes[..3]).await;
+    let leader_handle = nodes[(leader - 1) as usize].handle.clone();
+    until_put(&leader_handle, b"before", b"join").await;
+
+    // 1. Add it as a learner. It does not vote, so quorum is unchanged.
+    leader_handle
+        .add_learner(4)
+        .await
+        .expect("the learner must be added");
+
+    // 2. It receives the log and catches up while the cluster keeps serving.
+    for i in 0..20u64 {
+        until_put(&leader_handle, b"load", format!("v{i}").as_bytes()).await;
+    }
+    let target = nodes[(leader - 1) as usize].metrics.commit_index();
+    wait_until(
+        || nodes[3].metrics.applied_index() >= target,
+        "the learner to catch up",
+    )
+    .await;
+
+    // 3. Promote it: it has answered and is no longer behind, which is exactly
+    //    what the promotion gate requires.
+    leader_handle
+        .promote_learner(4)
+        .await
+        .expect("a caught-up learner must be promotable");
+
+    // 4. Service continues with four voters.
+    until_put(&leader_handle, b"after", b"promote").await;
+
+    // 5. Remove the current leader: the transfer-then-remove sequence must work
+    //    and leave the cluster serving.
+    let current = wait_for_leader(&nodes).await;
+    nodes[(current - 1) as usize]
+        .handle
+        .remove_member(current)
+        .await
+        .expect("removing a leader must hand over first and then succeed");
+    let survivor = (1..=TOTAL).find(|i| *i != current).expect("a survivor exists");
+    until_put(&nodes[(survivor - 1) as usize].handle, b"after", b"removal").await;
+
+    // 6. Durable post-mortem: three voters, no learners, removed node gone.
+    for n in nodes.iter_mut() {
+        if let Some(task) = n.task.take() {
+            task.abort();
+        }
+    }
+    let dir = nodes[(survivor - 1) as usize].dir.clone();
+    let (_, voters_now, learners_now) = recovered_conf_state_for(&dir, survivor);
+    assert_eq!(voters_now.len(), 3, "three voters remain: {voters_now:?}");
+    assert!(
+        !voters_now.contains(&current),
+        "the removed node is gone: {voters_now:?}"
+    );
+    assert!(
+        learners_now.is_empty(),
+        "node 4 was promoted, so no learners remain: {learners_now:?}"
+    );
+
+    for n in &nodes {
+        let _ = std::fs::remove_dir_all(&n.dir);
+    }
 }

@@ -403,6 +403,17 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - 验证：workspace **393 passed / 0 failed**、`--features fault-injection` **407 passed / 0 failed（连跑两次）**、l2 **3 passed / 0 failed**、四门禁全 PASS。
 - **剩余**：**S5** = M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程 quorum 存续/写不中断）+ INV-4（learner 追平瞬间断电）+ `arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
 
+### 1.25 M3 ConfChange S5（前半）：加入→追平→promote→remove 端到端打通（M3 ①）
+
+- **拆开"传输可达"与"启动投票配置"**（S5 的实现前提，`RaftNodeConfig`）：此前 bootstrap voter 集由 `peers` 推导，而加入者必须在**成为 voter 之前**就能收到消息（否则永远追不上），所以现有节点的 `peers` 必须包含它——混在一起就会让现有节点把加入者当作 voter 来 bootstrap，得到一个全集群从未同意过的配置（后果：`add_learner` 后它仍在 voter 集里，`promote` 反而以"不是 learner"失败）。
+  新增 `RaftNodeConfig.bootstrap_voters: Option<Vec<RaftId>>`（`None` = 旧的"peers + self"推导，保持既有行为）与 `join_as_learner: bool`：加入者用 `bootstrap_voters = 既有 voter 集` + `join_as_learner = true`（**本地声明，仅在没有持久配置时生效**——有持久配置时 `RaftStorage::initial_state` 仍然让持久副本胜出）；既有节点用 `bootstrap_voters = 既有 voter 集`，`peers` 里带加入者只为可达性。`RaftNodeConfig` 因此不再 `Copy`（含 `Vec`）。
+- **端到端（M3 ①）** `a_new_node_joins_as_a_learner_is_promoted_and_a_member_is_removed`（feature 门控，连跑 3 次全绿）：
+  1. 3 voter 选主并确认可写；2. 第 4 个节点以 learner 启动（可达、不投票）→ `add_learner(4)`；3. 边写边等它的 `applied_index` 追平 leader 的 `commit_index`（写不中断）；4. `promote_learner(4)` 成功（此时它已答过且不落后，正好满足追平门）；5. 服务继续（4 voter）；6. `remove_member(当前 leader)` —— 覆盖"先转让再移除"的复合动作；7. 停机后重开存活节点的 WAL：**voters=3、learners 空、被移除者不在其中**。
+- 顺带把转让后那条断言从"瞬时相等"改成**收敛断言**（`wait_until_all_agree_on`）：leader 交接瞬间旧 leader 会清空自己的 `lead`（`metrics.leader_id()` 短暂为 0），原来那句 `assert_eq!` 是采样了一个瞬时态 ✗（本轮就复现了一次）。
+- 验证：workspace 393/0、fault-injection 408/0、l2 3/0、四门禁全 PASS；S4 的 CI run（35610429679）**success**（含 fault-injection 步骤，抖动修复在 CI 上生效）。
+- **一个未复现的抖动（记录在案）**：本轮的第一次 workspace 全量跑出现 `passed=263 failed=1`（cargo 在首个失败二进制后停止，所以总数偏低），但**失败测试名没有被捕获**（汇总脚本只统计 `test result` 行），随后连跑两次均 393/0。与 §1.17 记录的那个未定位抖动同类：CI 是权威门禁且会打印失败用例名，若再现按 CI 日志定位。
+- **S5 剩余**：INV-4（learner 追平瞬间断电 → 重启后成员状态与日志前缀自洽）；`arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
