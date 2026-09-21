@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -38,6 +38,8 @@ pub enum TransportError {
     Disconnected(NodeId),
     /// The internal switch lock was poisoned by a previously panicked thread.
     SwitchPoisoned,
+    /// Assembling a streamed snapshot failed (propsol rev T).
+    SnapshotWrite,
 }
 
 impl std::fmt::Display for TransportError {
@@ -46,6 +48,7 @@ impl std::fmt::Display for TransportError {
             TransportError::UnknownPeer(id) => write!(f, "unknown peer: {id}"),
             TransportError::Disconnected(id) => write!(f, "peer is disconnected: {id}"),
             TransportError::SwitchPoisoned => write!(f, "transport switch lock is poisoned"),
+            TransportError::SnapshotWrite => write!(f, "writing a streamed snapshot failed"),
         }
     }
 }
@@ -80,17 +83,72 @@ type Switch = Arc<Mutex<HashMap<NodeId, UnboundedSender<Queued>>>>;
 /// Create one factory, then call [`create`](TransportFactory::create) once per
 /// node. All nodes created from the same factory are connected to each other
 /// and can exchange messages.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InMemoryTransportFactory {
     switch: Switch,
+    /// Whether the transports this factory mints advertise snapshot streaming
+    /// (propsol rev T). Off by default: an in-process transport delivers the
+    /// snapshot inside the raft message, which is what the pre-rev-T code path
+    /// expects, so a test that wants the streamed path asks for it.
+    stream_snapshots: Arc<AtomicBool>,
+    /// Per-peer snapshot bytes, keyed by the peer's node id: what this factory's
+    /// transports can fetch when streaming is on. The closure answers
+    /// `(index, term)`.
+    snapshot_sources: SnapshotSources,
 }
+
+impl std::fmt::Debug for InMemoryTransportFactory {
+    /// Hand-written: the snapshot sources are closures, which have no `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryTransportFactory")
+            .field(
+                "stream_snapshots",
+                &self.stream_snapshots.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// `peer -> (index, term) -> bytes`, shared by every transport of a factory.
+pub type SnapshotSources = Arc<
+    Mutex<HashMap<NodeId, Arc<dyn Fn(u64, u64) -> Option<Vec<u8>> + Send + Sync>>>,
+>;
 
 impl InMemoryTransportFactory {
     /// Create an empty switch with no nodes yet.
     pub fn new() -> Self {
         Self {
             switch: Arc::new(Mutex::new(HashMap::new())),
+            stream_snapshots: Arc::new(AtomicBool::new(false)),
+            snapshot_sources: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Make the transports this factory mints advertise snapshot streaming.
+    ///
+    /// A test that turns this on must also register a source for every peer it
+    /// expects bytes from ([`Self::set_snapshot_source`]), exactly as the real
+    /// transport needs a [`SnapshotProvider`] on the serving node.
+    pub fn with_snapshot_streaming(self) -> Self {
+        self.stream_snapshots.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Register the snapshot bytes this factory serves on behalf of `peer`.
+    ///
+    /// The closure is the test's stand-in for the serving node's snapshot
+    /// provider; returning `None` means "this peer has no such snapshot", which
+    /// is how a failed transfer is simulated.
+    pub fn set_snapshot_source(
+        &self,
+        peer: NodeId,
+        source: Arc<dyn Fn(u64, u64) -> Option<Vec<u8>> + Send + Sync>,
+    ) {
+        let mut guard = self
+            .snapshot_sources
+            .lock()
+            .expect("snapshot-source lock must not be poisoned in tests");
+        guard.insert(peer, source);
     }
 }
 
@@ -112,6 +170,8 @@ impl TransportFactory for InMemoryTransportFactory {
             InMemoryTx {
                 switch: Arc::clone(&self.switch),
                 self_id: me.clone(),
+                stream_snapshots: Arc::clone(&self.stream_snapshots),
+                snapshot_sources: Arc::clone(&self.snapshot_sources),
             },
             InMemoryRx { receiver: rx },
         )
@@ -119,14 +179,71 @@ impl TransportFactory for InMemoryTransportFactory {
 }
 
 /// The outbound half for one node.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct InMemoryTx {
     switch: Switch,
     self_id: NodeId,
+    /// See [`InMemoryTransportFactory::with_snapshot_streaming`].
+    stream_snapshots: Arc<AtomicBool>,
+    /// See [`InMemoryTransportFactory::set_snapshot_source`].
+    snapshot_sources: SnapshotSources,
+}
+
+impl std::fmt::Debug for InMemoryTx {
+    /// Hand-written: the snapshot sources are closures, which have no `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryTx")
+            .field("self_id", &self.self_id)
+            .field(
+                "stream_snapshots",
+                &self.stream_snapshots.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Transport for InMemoryTx {
     type Error = TransportError;
+
+    fn supports_snapshot_streaming(&self) -> bool {
+        self.stream_snapshots.load(Ordering::Relaxed)
+    }
+
+    /// Serve the snapshot from the peer's registered source, writing it to
+    /// `dest` (propsol rev T).
+    ///
+    /// In-process, so "streaming" is just a file write: the point of the test
+    /// scaffolding is to exercise the *runtime's* streamed-snapshot path
+    /// (intercept → fetch → install → report) without a network.
+    async fn fetch_snapshot(
+        &self,
+        from: NodeId,
+        index: u64,
+        term: u64,
+        dest: &std::path::Path,
+    ) -> Result<Option<u64>, Self::Error> {
+        if !self.supports_snapshot_streaming() {
+            return Ok(None);
+        }
+        let source = {
+            let guard = self
+                .snapshot_sources
+                .lock()
+                .map_err(|_| TransportError::SwitchPoisoned)?;
+            guard.get(&from).cloned()
+        };
+        let Some(source) = source else {
+            // The peer serves no snapshots: report the transfer as failed
+            // rather than as an empty snapshot.
+            return Ok(None);
+        };
+        let Some(bytes) = source(index, term) else {
+            return Ok(None);
+        };
+        let written = bytes.len() as u64;
+        std::fs::write(dest, &bytes).map_err(|_| TransportError::SnapshotWrite)?;
+        Ok(Some(written))
+    }
 
     fn send(&self, to: NodeId, msg: TransportMessage) -> impl Future<Output = Result<(), Self::Error>> + Send {
         // Delivery is synchronous and cheap, so we perform it eagerly and return
@@ -261,6 +378,64 @@ mod tests {
             "the default must say 'unsupported', never 'empty snapshot'"
         );
         assert!(!dest.exists(), "an unsupported fetch must not create a file");
+    }
+
+    #[test]
+    fn the_streaming_scaffolding_serves_registered_snapshot_bytes() {
+        // rev T: this is what a test needs to exercise the runtime's streamed
+        // snapshot path in-process (intercept → fetch → install → report)
+        // without a network. The bytes are served by the peer's registered
+        // source, exactly as the real transport serves them from the serving
+        // node's snapshot provider.
+        let factory = InMemoryTransportFactory::new().with_snapshot_streaming();
+        let (tx, _rx) = factory.create(NodeId::from("follower"));
+        assert!(
+            tx.supports_snapshot_streaming(),
+            "the factory was asked to advertise streaming"
+        );
+
+        let payload = b"snapshot bytes".to_vec();
+        let served = std::sync::Arc::new(payload.clone());
+        factory.set_snapshot_source(
+            NodeId::from("leader"),
+            std::sync::Arc::new(move |index, term| {
+                if index == 9 && term == 4 {
+                    Some(served.as_ref().clone())
+                } else {
+                    None
+                }
+            }),
+        );
+
+        let dest = std::env::temp_dir().join("arachne-testsupport-snapshot-fetch.snap");
+        let _ = std::fs::remove_file(&dest);
+        let written = block_on(tx.fetch_snapshot(NodeId::from("leader"), 9, 4, &dest))
+            .expect("the fetch must not fail")
+            .expect("a registered source serves the snapshot");
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(
+            std::fs::read(&dest).expect("read the fetched file"),
+            payload,
+            "the file must be exactly what the source served"
+        );
+        let _ = std::fs::remove_file(&dest);
+
+        // A snapshot the peer does not have is `None` — a failed transfer the
+        // runtime reports to raft — never an empty snapshot to install.
+        let dest = std::env::temp_dir().join("arachne-testsupport-snapshot-missing.snap");
+        let _ = std::fs::remove_file(&dest);
+        assert_eq!(
+            block_on(tx.fetch_snapshot(NodeId::from("leader"), 1, 1, &dest)),
+            Ok(None)
+        );
+        assert!(!dest.exists(), "a failed fetch must not leave a file behind");
+
+        // A peer with no registered source behaves the same way.
+        assert_eq!(
+            block_on(tx.fetch_snapshot(NodeId::from("stranger"), 9, 4, &dest)),
+            Ok(None)
+        );
+        assert!(!dest.exists());
     }
 
     #[test]
