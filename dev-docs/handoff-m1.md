@@ -333,7 +333,20 @@ R1（TTL/grace 三区间）+ R2（GC + `max_sessions`）+ R3（场景）到此�
 - **S14 时钟前跳**（`s14_a_forward_clock_jump_is_survivable`）：前跳一小时（ManualClock 单调，只能前跳）→ 会话全部过期、GC 清空 → 数据完好、新会话照常可用（一致性不受时钟跳变影响）。
 - 三个场景共用一个 `single_node(tag, max_sessions)` helper（带 `ManualClock` 的单节点 runtime）；连跑 3 次全绿（5 passed：R1 的 band 测试 + R2 的 GC/cap 测试 + 这三个）。
 
-**M3 剩余**：ConfChange（add_learner→追平→promote→remove、`remove_member(leader)` 自动 transfer、`ConfChangePending`、ConfState 持久化、M3 ①②③⑥）。会话一侧（④⑤）已完结。
+**M3 剩余**：ConfChange（add_learner→追平→promote→remove、`remove_member(leader)` 自动 transfer、`ConfChangePending`、ConfState 持久化、M3 ①②③⑥）。会话一侧（④⑤）已完结。设计已于 §1.19 钉死（propsol v0.2.16 rev S），实现按 S1–S5 走。
+
+### 1.19 M3 ConfChange 设计钉死（propsol v0.2.16 rev S）+ 两个既有缺陷
+
+本轮只做设计（代码留 S1–S5），照 rev R 的做法先把决策钉死、让实现变成机械动作。**两个已存在的缺陷先记录在案**：
+
+- **ConfChange 条目会被当作 KV 命令**：`node.rs:374` 注释写 "is dropped for now"，但实际是统一进 apply 通道喂给 `KvStateMachine`——ConfChange 条目的 `data` 是 protobuf 而非 KV 编码 → 解码失败 → **fail-stop**。今天不可达（没有任何 API 能提议 ConfChange），加 API 后**第一个成员变更提案就打死集群**，所以 S1 的第一件事就是按 `entry_type` 分流。
+- **段内没有持久化 ConfState**：`raft_storage.rs` 的 `initial_state` 只能退回 `bootstrap_conf_state` → 成员变更**重启即丢**（退回 `initial_cluster`），§5.6 承诺的"成员变更后配置文件不必跟着改"因此不成立。"靠快照顺带记成员"也不成立：快照只在越过 `snapshot_threshold` 时产生，小集群可能长期没有快照。
+
+关键决策（理由与被否备选见 rev S 决策表）：WAL 新增**瞬态**记录 `ConfState(0x04)`（payload `[u64 conf_change_index][成员表]`，成员表与快照逐字节同构），apply 时写、下次压缩时丢弃（由快照成员表接棒）→ 所以**记录类型集合虽然扩了，回滚仍只需一个快照周期**（沿用 §5.6 既有规则），混合版本窗口照旧禁 ConfChange（R9）；**回放跳过 `index ≤ conf_change_index` 的 ConfChange 条目**——本系统状态机本来就是"快照 + 回放其后全部条目"重建的，回放 ConfChange 是**正常路径**而非边缘情况，幂等性由构造保证而不是假设上游 `apply_conf_change` 幂等；单飞门由我们在 runtime 侧实现（`ConfChangePending` 是对外契约，且**普通写不受影响**），raft 自身的 `pending_conf_index` 只作第二道防线（S2 实测其行为）；Learner 追平门改用**条目滞后** `promote_lag_entries`（默认 128）+ 在线，而非 §5.3 原文的 `lag_bytes` 字节口径（WAL 无 index→offset 映射，已在 §5.3 就地标注修订）；`remove_member(leader)` 先转让成功再提案，失败即失败、无旁路；`transfer_leader` 的成功判定 = **领导权真的转移**（不是消息发出）；`create_snapshot` 写 **live** ConfState 并让安装路径回灌。
+
+新增不变量：**I5** 至多一个未 apply 的 ConfChange；**I6** `ConfState(0x04)` 不早于其条目持久化 ⇒ 恢复出的成员配置永远是真实已应用历史的**前缀**，成员偏少只会让 quorum 更难、成员偏多只会要更多选票，两个方向都只损失可用性、不破坏安全性；**I7** 成员恢复优先级 `0x04` > 快照成员表 > `initial_cluster`。
+
+落地顺序：**S1** 记录类型 + 条目路由 + 回放幂等（含"不写记录则退回 bootstrap"的反向对照）→ **S2** 公开 API（`add_learner`/`promote_learner`/`remove_member`/`transfer_leader`）+ 单飞门 → **S3** 追平门 + 旋钮（过 `check-profile-knobs.sh`）→ **S4** 快照 live ConfState + 压缩丢记录 → **S5** M3 ①② 端到端（learner 加入→施压→promote→remove，全程写不中断；`remove_member(leader)` 自动转让；INV-4 断电）+ `arachne-node` 运维面子命令。**下一步从 S1 开始。**
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。

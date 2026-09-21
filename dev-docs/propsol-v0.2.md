@@ -261,6 +261,43 @@ M3 缺的最后一块（M3 验收 ④⑤、INV5 S07/S10/S14）。先记录一个
 - `check-profile-knobs.sh` 白名单**只剩 `snapshot_transfer_rate_bps`**（三项会话旋钮全部真被读）。
 - **R3 ✓**：INV5 三个场景全部落地（`arachne/tests/sessions.rs`，`ManualClock` + `Handle::propose_raw`）：**S07** 24 并发同 session 重试（不同值）→ 全部接受、落定值此后不再移动（断言与竞态顺序无关）；**S10** 窗口内重试 `SessionExpired` 且 `applied_index` 不变 → 越 `ttl+grace` 后 GC 清空、同 seq 才作为新命令生效（把"重复生效窗口 ≤ ttl+grace"实测出来）；**S14** 时钟前跳一小时 → 会话全过期、数据完好、新会话可用。会话一侧（M3 ④⑤ + INV5）到此完结；M3 只剩 ConfChange（①②③⑥）。
 
+### S. v0.2.16：ConfChange 落地设计——成员变更、Learner 追赶、持久化 ConfState（E-rev，待实现）
+
+M3 的最后一块（验收 ①②③⑥）。先记录**两个已存在的缺陷**——它们正是"加 API 之前必须先补设计"的原因，而不是收尾细节：
+
+1. **ConfChange 条目今天会被当作 KV 命令喂给状态机**。`RaftNode` 的注释（`node.rs:374`）写着 "is dropped for now"，但实际的提交条目**统一进 apply 通道**：ConfChange 条目的 `data` 是 ConfChange protobuf、不是 KV 命令编码 → `KvStateMachine` 解码失败 → 走 fail-stop。今天不可达（没有任何 API 能提议 ConfChange；`raft_storage.rs` 只做了 `EntryConfChange(V2)` 的类型映射），但一旦按 M3 加 API，**第一个成员变更提案就会打死整个集群**。所以"按类型路由 ConfChange 条目"是 S1 的前置条件。
+2. **持久化 ConfState 没有落点**。§5.5.3 / §5.6 已承诺"非首启以持久化 ConfState 为准"，快照格式（§5.5.4）也已带 voters/learners 成员表——但**段内没有任何成员记录**，`RaftStorage::initial_state` 只能退回 `bootstrap_conf_state`（`raft_storage.rs:231`）。后果：**成员变更在重启后一律丢失**，集群退回 `initial_cluster`（§5.6 的"配置文件不必跟着改"因此不成立）。"靠快照顺带记成员"也不成立：快照只在越过 `snapshot_threshold` 时产生，小集群可能长期没有快照。
+
+| 决策点 | 选择 | 否决的备选 | 理由 |
+|---|---|---|---|
+| 持久化 ConfState 落点 | **WAL 新增记录类型 `ConfState(0x04)`**，在 ConfChange 条目被 apply 时追加 | ①写进 META 文件；②只靠快照成员表 | ①META 是**身份文件**（§5.5.1 自己钉的："与段无关"），成员变更与段内日志有严格的顺序要求，META 的原子改名路径既没有段内顺序、也不与条目 fsync 同周期。②见缺陷 2：快照可能长期不存在，且"上次快照到本次变更之间"的窗口无法覆盖。落进段内可**直接复用**既有的 CRC、撕裂尾部、`commit ≤ last_index` 恢复规则，无需第二套崩溃安全路径。 |
+| 记录 payload | `[u64 conf_change_index][u32 voters_len][voters u64…][u32 learners_len][learners u64…]`——成员表**与快照成员表逐字节同构**（复用编解码）；`conf_change_index` = 产生它的那条 ConfChange 条目的 log index | 不记 index | 见下一行：`conf_change_index` 让"回放时是否已应用过"成为一个**可判定**的问题，幂等性由构造保证而非依赖上游。 |
+| 重复 apply（重启回放） | 回放时**跳过 `index ≤ conf_state.conf_change_index` 的 ConfChange 条目** | 假设 raft-rs `apply_conf_change` 天然幂等 | 本系统的状态机本来就是"KV 快照 + 回放快照之后的全部条目"重建的，**回放 ConfChange 条目是正常路径**而非边缘情况。不假设上游幂等（`AddNode` 重复调用可能重置 progress）；用 index 判定，可测（S1 含"同一 ConfChange 回放两次，ConfState 与 progress 不变"）。 |
+| ConfChange 条目路由 | 按 `entry_type` 分流：`EntryNormal` → KV SM（现有路径不变）；`EntryConfChange/EntryConfChangeV2` → **完全不进 KV SM**，直接 `raw_node.apply_conf_change()` → 落 `ConfState(0x04)` → 应答等待者 → 推进 applied | 把 ConfChange 编码成一条 KV 命令、由 SM 持有 raft 句柄 | SM 必须保持纯函数式可重放、不能持有 raft；且一旦走 SM，畸形命令会 fail-stop 整个集群（缺陷 1）。 |
+| joint consensus | 只做**单步** ConfChange；空 `ConfChangeV2`（离开 joint 态）仍按类型路由给 `apply_conf_change` | 支持 joint | §5.3 已锁定单步；从不进入 joint 态，但仍须处理该条目类型以免落入"未知类型"分支。 |
+| 单飞门（`ConfChangePending`） | runtime 侧 `conf_change_pending: Option<ConfChangeOp>` 为权威 API 契约：未清空时新成员变更提案返回 `ConfChangePending`（**普通写不受影响**） | 只依赖 raft-rs 的 `pending_conf_index` | §5.3 硬约束 1 是**对外错误码**，必须由我们决定何时算"未决"。raft-rs 自身的 pending-conf-index 行为作为第二道防线，S2 用测试**实测**（不假设），若上游放行则由我们的门兜住。清空时机 = 该条目 **applied**（不是 committed）。 |
+| Learner 追平门 | 用**条目滞后**判定：`last_index - matched ≤ promote_lag_entries`（默认 128）**且** progress `recent_active`（在线），不满足返回 `LearnerNotCaughtUp` | 按 §5.3 原文的 `lag_bytes` 字节口径 | WAL 没有 index→offset 映射，精确字节滞后需要新增索引结构；`matched` 是 raft 自己暴露的量，形状等价。**这是对 §5.3 用词的有意偏离**（已同步改注该节），byte 口径留待运维需要时再加映射。 |
+| `remove_member(leader)` | 先 `transfer_leader`，**转让成功才** propose 移除；转让失败则移除失败并返回原错误，不提供旁路 | 直接提案移除 leader | §5.3 硬约束 3 原文；转让失败（无多数派）时移除本就不可行，这是非目标（不自动接管）的体现。 |
+| `transfer_leader` 的就绪判定 | 成功 = **领导权真的转移**（本节点不再 leader / 目标成为 leader）；超时 = `election_timeout` 量级；目标未知 → 错误 | 发出转让消息即算成功 | raft-rs 的 `transfer_leader` 只是发消息；`remove_member(leader)` 若在此处误判成功就会在没有多数派的情况下继续提案。 |
+| 快照携带 live ConfState | `create_snapshot` 写入**raft 当前 ConfState**（voters/learners），`install_snapshot` 路径同样把成员表回灌进本地持久状态 | 继续写 bootstrap 静态集合 | 快照格式**已有**成员表（§5.5.4，v0.2.10 起），所以"快照能承载成员"是既定事实，缺的只是填真值。填真值后，压缩可以顺带丢弃水位之下的 `ConfState(0x04)`（由快照接棒）。 |
+| 混合版本 / 回滚 | `0x04` 是**新增类型**：老二进制遇到它会 fail-start（不认识）→ 沿用 §5.6 既有规则"**窗口内禁 ConfChange**"（R9）；回滚需等**一次快照周期**（压缩丢弃 `0x04`，快照成员表老二进制已能读） | 不动格式、在旧类型里塞 payload | 记录类型集合按 §5.5.1 在 protocol major 内冻结，**类型集合不能扩**；但 `0x04` 是**瞬态记录**（apply 后到下次压缩之间才存在），所以"等一个快照周期即可回滚"成立——这与 §5.6 原文对跨 minor 回滚的要求一致。快照格式不变（成员表 v0.2.10 就有），老二进制可从快照恢复成员。 |
+
+**新增不变量**
+
+- **I5**：同一时刻**至多一个未 apply 的 ConfChange**（§5.3 硬约束 1 的运行时形态）。
+- **I6**：`ConfState(0x04)` 的持久化时刻**不早于**其 ConfChange 条目的持久化（apply ⇐ durable）。因此任何时刻"恢复出的成员配置"都是真实已应用配置历史的**前缀**。方向性论证：成员**少**于真实值 → quorum 更难形成，不会造成双提交（只是可用性下降）；成员**多**于真实值 → 需要更多选票，不会丢掉已提交的条目。两个方向都只损失可用性、不破坏安全性。
+- **I7**：恢复取"**最新且 index ≤ 持久化 applied 的** `ConfState(0x04)`"；该记录已被压缩时取快照成员表；两者皆无则退回 `initial_cluster`（首启语义不变）。
+
+**落地顺序（S1–S5，每步独立可验证）**
+
+- **S1（缺陷 1+2 一起修）**：seam/WAL 增 `ConfState(0x04)` 记录类型（含 `conf_change_index`）、写入与回放、`install_snapshot` 路径的成员回灌；apply 通道**按类型路由**，ConfChange 条目改走 `apply_conf_change`。验证：手工构造一条 ConfChange 条目（`fault-injection`/测试专用入口）→ 提交 → **重启** → 成员保持（反向对照：不写 `0x04` 时退回 bootstrap，断言失败）；同一 ConfChange **回放两次** → ConfState 与 progress 不变、不报错。
+- **S2**：公开 API `Handle::add_learner` / `promote_learner` / `remove_member` / `transfer_leader`（§5.6 已定名；Q3 已决议 `transfer_leader` 公开）+ `Command::ConfChange` 变体 + 单飞门 → `ConfChangePending`。验证：连发两个成员变更 → 第二个得 `ConfChangePending`（M3 ③），**且普通写在期间照常成功**（§5.3 明说"普通写不受影响"）；实测 raft 层对第二个 ConfChange 的行为并记录。
+- **S3**：Learner 追平门 + `promote_lag_entries` 旋钮（真被读，新增读取即须通过 `check-profile-knobs.sh` 门禁）+ `follower_lag` 观测。验证：未追平 promote → `LearnerNotCaughtUp`；追平后成功；反向对照（阈值设 0 → 后者失败）。
+- **S4**：快照写 live ConfState + 安装路径回灌；压缩可丢水位之下的 `0x04`。验证：成员变更 → 触发快照 → 压缩 → 重启（WAL 里已无 `0x04`）→ 成员仍正确，即"由快照接棒"。
+- **S5**：端到端 M3 ①②：3 voter + 新节点以 **Learner** 加入（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，**仅作无持久状态时的兜底**，与既有 `voters.is_empty() && learners.is_empty()` 判定一致）→ 施压写入 → promote → remove 一个成员，全程**quorum 存续、写不中断**；`remove_member(leader)` 自动先转让成功（M3 ②）；`fault-injection` 崩在 promote 前后（INV-4 "Learner 追平瞬间断电"）→ 重启后成员状态与日志前缀自洽。运维面（`arachne-node` 子命令与 metrics）在 S5 末接线。
+
+**本 rev 未决**：byte 口径的 `promote_lag_threshold`（等 index→offset 映射）；joint consensus（非目标）；自动 demote（§5.2 明示由运维决定）。
+
 ## 1. 目标与非目标
 
 **目标**
@@ -482,7 +519,7 @@ enum ArachneError {
 - **单步 ConfChange**（每次只增/删/转一个节点），规避 joint consensus 复杂度；raft-rs 原生支持。
 - **硬约束**：
   1. 同一时刻至多一个未提交 ConfChange；存在时新成员变更提案返回 `ConfChangePending`（普通写不受影响）。
-  2. 新节点一律先以 **Learner** 加入（不参与 quorum），追平（`lag_bytes < promote_lag_threshold` 且在线）后由运维显式 `promote_learner` 转 Voter。
+  2. 新节点一律先以 **Learner** 加入（不参与 quorum），追平（**rev S 修订：`last_index - matched ≤ promote_lag_entries`**，即条目滞后而非原 `lag_bytes` 字节口径，理由见 rev S；且 progress 在线）后由运维显式 `promote_learner` 转 Voter。
   3. **移除 leader**：`remove_member(current_leader)` 默认内部先 `transfer_leader` 成功后再 propose 移除；转让失败（无多数派）则移除失败并返回原错误。不提供"直接移除 leader"的旁路。
   4. 加入节点在握手期校验 `cluster_id` + mTLS 证书身份（CN ↔ node_id 映射）；异集群节点拒绝并返回 `ClusterIdMismatch`，防数据混写。
 - **rejoin**：依赖持久化 `node_id` + PreVote，不重走"加入"流程。
@@ -508,7 +545,7 @@ Lease Read 留 v2，显式记录其前提：配置化的时钟偏移上限 + 安
 #### 5.5.1 WAL 格式
 
 - 分段文件：`wal-%020d.log`（**段名 = 该段首条记录的 log index**），默认 `segment_bytes`（128 MB）超限时滚动新建段；**重开时续写最高编号的既有段**（仅当无任何段时才建 `wal-1.log`），避免每次重启新建空段、破坏"段名=首 index"不变式。
-- 记录布局：`[u32 len][u32 crc32c][u8 type][payload]`；`type ∈ {Entry, HardState, Meta}`。
+- 记录布局：`[u32 len][u32 crc32c][u8 type][payload]`；`type ∈ {Entry, HardState, Meta, ConfState(0x04)}`。`ConfState(0x04)` 是 **rev S（v0.2.16）新增**的成员配置记录：payload `[u64 conf_change_index][成员表]`，只在 ConfChange apply 后到下次压缩之间存在（压缩丢弃水位之下的记录，由快照成员表接棒），因此**不影响回滚**（见 §5.6 与 rev S）。
 - **新建段文件后须 fsync 数据目录**（持久化目录项），否则已 fsync 的条目在掉电后可能随目录项一并丢失（I2 漏洞）。
 - `META` 文件（data_dir 下，独立于段）：`cluster_id, node_id, format_version, created_at`；写入 = 写临时文件 → fsync → rename → **fsync 目录**。
 - 记录类型集合在 **protocol major 版本内冻结**（§5.6），保证同 major 内可回滚。
@@ -819,4 +856,4 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 
 ---
 
-*v0.2.15 规划中（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）、逻辑增长触发快照、follower 安装快照的整体替换语义**；**v0.2.11 apply 独立任务、反压口径与 actor 专用线程（E-rev）：actor↔apply 两通道 + `watch` 进度、Q7 的 `proposal_queue_bytes` 真正接线为「已提交未 apply」的字节背压（触顶回 `Busy`）、快照请求同序入队、进度确认后才 `advance_apply`、延迟预算用空载/洪峰比值口径**；**v0.2.12 不批 fsync 而批持久化周期（E-rev）：明确 `BatchMs` 为何不可实现（单写者无并发等待者 + 周期内两次 flush 结构性）、改为命令/入站成批处理后每次 `drive_cycle`（`CYCLE_BURST`）、seam 增 `TransportRx::try_recv`，实测洪峰写 p99 106–157ms→38–53ms、弱读 85–99ms→0.17ms**；**v0.2.13 异步持久化流水线（E-rev，分阶段进行）：用 raft-rs 自带 `Ready::number`/`advance_append_async`/`on_persist_ready` 骨架，写留在 actor、刷移到 worker（dup fd，`fsync` 刷 inode），消息/advance/commit 全部推迟到 flush 完成之后；P1 已落地（`flush_handle`）**；**v0.2.14 `wal_trailing_keep` 接线（E-rev）：窗口压住压缩水位（而非保留水位之下不可达的字节），默认 0 保持旧行为，node binary 按 profile 设置，端到端含反向对照**；**v0.2.14 收尾：Q4 快照预算告警落地（`> 1s` warn + `snapshot_slow_total`），CI 增加单飞项目构建门禁（fuzz/model-check，`--locked`）**；**v0.2.14 收尾之二：rev P 的「可用性而非延迟」论断已证实——feature `fault-injection` 下新增测试专用 flush 延迟（`set_flush_delay_ms`，同时作用于同步与流水线两条 flush 路径），A/B 实测慢盘（400ms）下写落盘期间弱读最坏值：同步 360ms vs pipeline 127µs；CI 同 feature 步骤运行该测试，Gate C 增加第二哨兵**；**v0.2.14 收尾之三：新增门禁 `scripts/check-profile-knobs.sh`——`ProfileConfig` 每个旋钮必须被生产代码读取，已知缺口（M3 会话三项 + 快照限速）带理由白名单，白名单项一旦被使用即失败**；**v0.2.15 会话幂等收尾设计（E-rev）：记录会话表无界增长缺陷，钉死 leader 侧 TTL/grace 判定 + 复制的显式 GC 条目 + `max_sessions` 提议前检查 + TTL 走 `Clock` seam 以便模拟时钟验证，分 R1/R2/R3 落地**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
+*v0.2.16 规划中（v0.1 → v0.2 设计精化；v0.2.1 锁定参数级决议；v0.2.2 修订测试基建选型并产出 `test-plan-v0.1.md`；v0.2.3 锁定测试方案四项决策 D-T1/D-T2/D-L4/D-S1；v0.2.4 锁定工件与工作区决策 D-ART——`arachne-node` 运维 bin 为生产交付物；v0.2.5 锁定 D-ART 四项子决策：crate 命名、默认 feature 拉 tonic、TOML 配置、`test-observability` 门禁；v0.2.6 D-ART-rev1：抽出 `arachne-seam` 叶 crate，消除 `transport-tonic → arachne` 包循环；**v0.2.7 §5.5.3 恢复算法安全收紧（E-rev）：坏记录不再嗅探类型字节、仅末段结构性撕裂可截断、`commit ≤ last_index` 断言 + 新段目录 fsync**；**v0.2.8 §5.1/§7 约束注解与预设自相矛盾修正（E-rev）：`rpc_timeout < election_timeout`、`election_timeout ≥ 5× heartbeat`**；**v0.2.9 INV2 的测试专用崩溃注入点（E-rev）：feature `fault-injection` 默认关、发布构建排除，仅在 `RaftNode::step` 的 persist/deliver 边界提供一次性崩溃 hook**；**v0.2.10 快照落盘契约、META 快照指针与压缩边界（E-rev）：独立 `snapshot-<index>-<term>.snap` 文件 + 全负载 CRC、目录扫描取最新合法快照（保留最新两份）、META payload 尾部追加快照指针（版本不变）、段粒度压缩（字节级 trailing 窗口留待接线）、逻辑增长触发快照、follower 安装快照的整体替换语义**；**v0.2.11 apply 独立任务、反压口径与 actor 专用线程（E-rev）：actor↔apply 两通道 + `watch` 进度、Q7 的 `proposal_queue_bytes` 真正接线为「已提交未 apply」的字节背压（触顶回 `Busy`）、快照请求同序入队、进度确认后才 `advance_apply`、延迟预算用空载/洪峰比值口径**；**v0.2.12 不批 fsync 而批持久化周期（E-rev）：明确 `BatchMs` 为何不可实现（单写者无并发等待者 + 周期内两次 flush 结构性）、改为命令/入站成批处理后每次 `drive_cycle`（`CYCLE_BURST`）、seam 增 `TransportRx::try_recv`，实测洪峰写 p99 106–157ms→38–53ms、弱读 85–99ms→0.17ms**；**v0.2.13 异步持久化流水线（E-rev，分阶段进行）：用 raft-rs 自带 `Ready::number`/`advance_append_async`/`on_persist_ready` 骨架，写留在 actor、刷移到 worker（dup fd，`fsync` 刷 inode），消息/advance/commit 全部推迟到 flush 完成之后；P1 已落地（`flush_handle`）**；**v0.2.14 `wal_trailing_keep` 接线（E-rev）：窗口压住压缩水位（而非保留水位之下不可达的字节），默认 0 保持旧行为，node binary 按 profile 设置，端到端含反向对照**；**v0.2.14 收尾：Q4 快照预算告警落地（`> 1s` warn + `snapshot_slow_total`），CI 增加单飞项目构建门禁（fuzz/model-check，`--locked`）**；**v0.2.14 收尾之二：rev P 的「可用性而非延迟」论断已证实——feature `fault-injection` 下新增测试专用 flush 延迟（`set_flush_delay_ms`，同时作用于同步与流水线两条 flush 路径），A/B 实测慢盘（400ms）下写落盘期间弱读最坏值：同步 360ms vs pipeline 127µs；CI 同 feature 步骤运行该测试，Gate C 增加第二哨兵**；**v0.2.14 收尾之三：新增门禁 `scripts/check-profile-knobs.sh`——`ProfileConfig` 每个旋钮必须被生产代码读取，已知缺口（M3 会话三项 + 快照限速）带理由白名单，白名单项一旦被使用即失败**；**v0.2.15 会话幂等收尾设计（E-rev）：记录会话表无界增长缺陷，钉死 leader 侧 TTL/grace 判定 + 复制的显式 GC 条目 + `max_sessions` 提议前检查 + TTL 走 `Clock` seam 以便模拟时钟验证，分 R1/R2/R3 落地**；**v0.2.16 ConfChange 落地设计（E-rev）：记录两个**既有缺陷**——ConfChange 条目今天会被当作 KV 命令喂给状态机（解码失败 → fail-stop，一旦加 API 第一个成员变更就打死集群）、段内没有持久化 ConfState（成员变更重启即丢，退回 `initial_cluster`）；钉死 WAL 新增**瞬态**记录 `ConfState(0x04)`（带 `conf_change_index`，回放跳过已应用条目以保证幂等）、apply 通道**按条目类型分流**、单飞门 `ConfChangePending` 为对外契约、Learner 追平门改用**条目滞后**（对 §5.3 用词的有意修订）、`remove_member(leader)` 先转让成功再提案、快照写 live 成员表以便压缩接棒（格式不变，故回滚只需一个快照周期），分 S1–S5 落地**）。下一步：按 test-plan §12 的 M0 交付测试基建骨架、六工件工作区（D-ART-rev1 增 `arachne-seam` 叶 crate）与接缝 spike 清单（§13），再进入 raft-rs 集成原型（属实现工作，另立任务）。*
