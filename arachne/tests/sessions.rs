@@ -277,3 +277,233 @@ async fn session_gc_prunes_and_relieves_the_session_cap() {
     thread.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// INV5 scenarios: S07 (retry storm), S10 (GC vs retry race), S14 (clock jump)
+// ---------------------------------------------------------------------------
+
+/// A single-node runtime with a manual clock, for the scenario tests below.
+async fn single_node(
+    tag: &str,
+    max_sessions: u64,
+) -> (
+    arachne::client::Handle,
+    Arc<Metrics>,
+    Arc<ManualClock>,
+    RuntimeThread,
+    PathBuf,
+) {
+    let dir = std::env::temp_dir().join(format!(
+        "arachne-sessions-{tag}-{}-{}",
+        std::process::id(),
+        DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let mut profile = profile();
+    profile.max_sessions = max_sessions;
+    let wal = WalStorage::open(
+        &dir,
+        WalOptions {
+            cluster_id: "sessions-scenario".into(),
+            node_id: "n1".into(),
+            config: WalConfig {
+                fsync_policy: FsyncPolicy::Always,
+                segment_bytes: 1 << 20,
+            },
+            created_at_millis: 0,
+            fsync_observer: None,
+        },
+    )
+    .expect("open wal");
+    let factory = InMemoryTransportFactory::new();
+    let (tx, rx) = factory.create(NodeId::from("n1"));
+    let metrics = Arc::new(Metrics::new());
+    let config = RuntimeConfig {
+        self_raft_id: 1,
+        self_node_id: NodeId::from("n1"),
+        peers: HashMap::new(),
+        addresses: HashMap::new(),
+        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        profile,
+        metrics: Arc::clone(&metrics),
+    };
+    let clock = Arc::new(ManualClock::new(5_000_000));
+    let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger()).expect("runtime");
+    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne::Clock>);
+    let thread = runtime.spawn_dedicated().expect("spawn");
+    until_leader(&metrics).await;
+    (handle, metrics, clock, thread, dir)
+}
+
+/// S07: a storm of concurrent retries of one session must settle on exactly one
+/// effect — and stay there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s07_a_retry_storm_has_exactly_one_effect() {
+    let (handle, _metrics, _clock, thread, dir) = single_node("s07", 0).await;
+    const STORM: usize = 24;
+
+    // Every attempt carries the *same* session and a different value.
+    let mut attempts = Vec::new();
+    for i in 0..STORM {
+        let handle = handle.clone();
+        attempts.push(tokio::spawn(async move {
+            handle
+                .propose_raw(
+                    KvStateMachine::encode_put(CLIENT, SEQ, b"storm", format!("v{i}").as_bytes()),
+                    CLIENT,
+                    SEQ,
+                )
+                .await
+        }));
+    }
+    let mut ok = 0usize;
+    for attempt in attempts {
+        if matches!(attempt.await.expect("task"), Ok(())) {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, STORM, "every attempt inside the TTL is accepted and deduped");
+
+    // Whichever attempt landed first, the state is one of them and it is stable:
+    // further retries must not move it.
+    let settled = handle
+        .get_stale(b"storm")
+        .await
+        .expect("read")
+        .expect("one of the attempts applied");
+    assert!(
+        settled.starts_with(b"v"),
+        "the value must come from the storm, got {settled:?}"
+    );
+    for _ in 0..10 {
+        handle
+            .propose_raw(
+                KvStateMachine::encode_put(CLIENT, SEQ, b"storm", b"late"),
+                CLIENT,
+                SEQ,
+            )
+            .await
+            .expect("a retry is accepted");
+    }
+    assert_eq!(
+        handle.get_stale(b"storm").await.expect("read"),
+        Some(settled),
+        "a retry storm must have exactly one effect"
+    );
+
+    drop(handle);
+    thread.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S10: the race between GC and a retry. Before the window closes a retry is
+/// refused and changes nothing; only after `ttl + grace` can a duplicate take
+/// effect — which is exactly the bound INV5 asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s10_a_duplicate_can_only_take_effect_after_the_grace_window() {
+    let (handle, metrics, clock, thread, dir) = single_node("s10", 0).await;
+
+    handle
+        .propose_raw(
+            KvStateMachine::encode_put(CLIENT, SEQ, b"k", b"first"),
+            CLIENT,
+            SEQ,
+        )
+        .await
+        .expect("the first write commits");
+
+    // Just inside the grace window: refused, and nothing reaches the log.
+    clock.advance(TTL_MS + GRACE_MS / 2);
+    let applied_before = metrics.applied_index();
+    match handle
+        .propose_raw(
+            KvStateMachine::encode_put(CLIENT, SEQ, b"k", b"second"),
+            CLIENT,
+            SEQ,
+        )
+        .await
+    {
+        Err(ArachneError::SessionExpired) => {}
+        other => panic!("inside the grace window a retry must not re-execute, got {other:?}"),
+    }
+    assert_eq!(
+        handle.get_stale(b"k").await.expect("read"),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(metrics.applied_index(), applied_before);
+
+    // Past the window: GC prunes the session, and the duplicate is a new command
+    // — the effect happens again, which is the documented cost of retrying past
+    // `ttl + grace`, not a violation.
+    clock.advance(GRACE_MS);
+    for _ in 0..400 {
+        if metrics.session_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(metrics.session_count(), 0, "GC pruned the expired session");
+    handle
+        .propose_raw(
+            KvStateMachine::encode_put(CLIENT, SEQ, b"k", b"second"),
+            CLIENT,
+            SEQ,
+        )
+        .await
+        .expect("past ttl+grace the command is accepted as a new session");
+    assert_eq!(
+        handle.get_stale(b"k").await.expect("read"),
+        Some(b"second".to_vec()),
+        "and only now can a duplicate take effect"
+    );
+
+    drop(handle);
+    thread.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S14: a large forward clock jump must not break anything — the session is
+/// simply long expired, and the node keeps serving new sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s14_a_forward_clock_jump_is_survivable() {
+    let (handle, metrics, clock, thread, dir) = single_node("s14", 0).await;
+
+    handle
+        .propose_raw(
+            KvStateMachine::encode_put(CLIENT, SEQ, b"k", b"before"),
+            CLIENT,
+            SEQ,
+        )
+        .await
+        .expect("the first write commits");
+
+    // A jump far past ttl + grace (the manual clock is monotonic, so this is a
+    // forward jump — the only kind the seam can produce).
+    clock.advance(60 * 60 * 1_000);
+    for _ in 0..400 {
+        if metrics.session_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(metrics.session_count(), 0, "the jump expired everything");
+
+    // The node is unharmed: the data is intact and a fresh session works.
+    assert_eq!(
+        handle.get_stale(b"k").await.expect("read"),
+        Some(b"before".to_vec()),
+        "a clock jump must not touch the data"
+    );
+    handle
+        .propose_raw(
+            KvStateMachine::encode_put(CLIENT + 1, 1, b"after", b"v"),
+            CLIENT + 1,
+            1,
+        )
+        .await
+        .expect("a fresh session is accepted after the jump");
+
+    drop(handle);
+    thread.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

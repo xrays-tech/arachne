@@ -324,6 +324,17 @@ rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉�
 - 门禁联动：`check-profile-knobs.sh` 白名单**只剩 `snapshot_transfer_rate_bps`**（TTL/grace/max_sessions 三项都已真读）。
 - **如实记录一次观察到的 flake**：某次 `cargo test --workspace` 输出被工具截断，可见尾部出现 2 个失败；随后**连续 3 次全量 378 passed / 0 failed**，未能定位那 2 个（可信度受限：输出被截断）。R2 对非 feature 路径零开销（无 clock 时 `maybe_collect_sessions` 立即返回），因此与被测路径无关；下次若再现，应先关掉并行构建负载再跑，以排除机器争用。
 
+### 1.18 M3 会话 R3 落地：INV5 三个场景（S07/S10/S14）——会话幂等收尾完成
+
+R1（TTL/grace 三区间）+ R2（GC + `max_sessions`）+ R3（场景）到此把 **M3 验收 ④⑤ 与 INV5 的 S07/S10/S14 全部覆盖**。
+
+- **S07 重试风暴**（`s07_a_retry_storm_has_exactly_one_effect`）：24 个并发 `propose_raw` 打**同一个 session**、各带**不同值**；全部被接受（TTL 内，SM 去重），随后断言"落定值稳定"——再补 10 次重试（值 `late`）后 KV **不再移动**。竞态下"谁赢"不确定，所以断言刻意与顺序无关：值来自这次风暴、且此后不变。
+- **S10 GC 与重试竞态**（`s10_a_duplicate_can_only_take_effect_after_the_grace_window`）：窗口内（`ttl + grace/2`）重试 → `SessionExpired` **且 `applied_index` 不变**（没进日志）、KV 保持 `first`；越过 `ttl+grace` → GC 把会话清掉（`session_count` 归 0）→ 同 seq 被当**新命令**执行，KV 变 `second`。这把 INV5 的界**实测出来**："重复生效窗口 ≤ ttl + grace"，而不是只写在文档里。
+- **S14 时钟前跳**（`s14_a_forward_clock_jump_is_survivable`）：前跳一小时（ManualClock 单调，只能前跳）→ 会话全部过期、GC 清空 → 数据完好、新会话照常可用（一致性不受时钟跳变影响）。
+- 三个场景共用一个 `single_node(tag, max_sessions)` helper（带 `ManualClock` 的单节点 runtime）；连跑 3 次全绿（5 passed：R1 的 band 测试 + R2 的 GC/cap 测试 + 这三个）。
+
+**M3 剩余**：ConfChange（add_learner→追平→promote→remove、`remove_member(leader)` 自动 transfer、`ConfChangePending`、ConfState 持久化、M3 ①②③⑥）。会话一侧（④⑤）已完结。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

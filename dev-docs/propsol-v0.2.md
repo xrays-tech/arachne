@@ -259,7 +259,7 @@ M3 缺的最后一块（M3 验收 ④⑤、INV5 S07/S10/S14）。先记录一个
 - 指标新增 `arachne_session_count`（propsol §8 本来就要求 `session_count`）。
 - 验证：单测（GC 只删列出的、KV 不变、畸形 GC 被拒且不部分应用）；端到端 `session_gc_prunes_and_relieves_the_session_cap`：4 会话填满 → 第 5 个新会话得 `SessionTableFull` → 时钟越过 `ttl+grace` → GC 后 `session_count` 归 0 → 新会话重新被接受 → 且 KV 数据未被 GC 触碰。**反向对照**：`session_ttl_ms = 0` 时两个会话测试都失败（非空洞）。
 - `check-profile-knobs.sh` 白名单**只剩 `snapshot_transfer_rate_bps`**（三项会话旋钮全部真被读）。
-- **R3**：INV5 S07/S10/S14 与 ConfChange 相关场景。
+- **R3 ✓**：INV5 三个场景全部落地（`arachne/tests/sessions.rs`，`ManualClock` + `Handle::propose_raw`）：**S07** 24 并发同 session 重试（不同值）→ 全部接受、落定值此后不再移动（断言与竞态顺序无关）；**S10** 窗口内重试 `SessionExpired` 且 `applied_index` 不变 → 越 `ttl+grace` 后 GC 清空、同 seq 才作为新命令生效（把"重复生效窗口 ≤ ttl+grace"实测出来）；**S14** 时钟前跳一小时 → 会话全过期、数据完好、新会话可用。会话一侧（M3 ④⑤ + INV5）到此完结；M3 只剩 ConfChange（①②③⑥）。
 
 ## 1. 目标与非目标
 
