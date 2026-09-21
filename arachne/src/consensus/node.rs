@@ -192,6 +192,19 @@ pub struct StepOutcome {
     pub read_states: Vec<(Vec<u8>, LogIndex)>,
 }
 
+/// The promotion rule of propsol §5.3, hard constraint 2: a learner may become
+/// a voter once it has **answered at least once** and is within `threshold`
+/// entries of the leader.
+///
+/// Kept as a free function so the boundary is testable without a cluster: the
+/// two conditions fail for different reasons and both matter — a reachable
+/// learner that is far behind would put an incomplete log into the quorum, and
+/// a learner that has never answered has nothing to promote regardless of how
+/// short the log is.
+pub fn learner_caught_up(behind: u64, has_acked: bool, threshold: u64) -> bool {
+    has_acked && behind <= threshold
+}
+
 /// Decode a ConfChange entry's identity without applying it:
 /// `(change type, target node)`.
 ///
@@ -704,6 +717,48 @@ where
         Ok(state.conf_state.get_voters().to_vec())
     }
 
+    /// How far `node_id` is behind this node's log, and whether it has
+    /// answered recently: `(behind_entries, active)` (propsol §5.3, rev S).
+    ///
+    /// `None` when raft tracks no progress for that node at all — a learner
+    /// that was never added, or one whose membership has not been applied yet.
+    ///
+    /// `has_acked` is `matched > 0`: the learner has acknowledged at least one
+    /// append, so it exists and is reachable. This is the *在线* half of the
+    /// promotion rule — a node that has never answered is not promotable no
+    /// matter how short the log is.
+    ///
+    /// # Why not `recent_active`
+    ///
+    /// It is tempting to read raft's `recent_active` here, but raft-rs sets it
+    /// to `true` **when a node is first added** (`ProgressTracker::apply_conf`,
+    /// deliberately, so a pending `CheckQuorum` cannot step the leader down
+    /// before the new node has had a chance to talk to it). It therefore says
+    /// nothing about whether the learner has ever answered, and a promotion
+    /// gate built on it would let a nonexistent node become a voter.
+    pub fn learner_progress(&self, node_id: RaftId) -> Option<(u64, bool)> {
+        // `last_index` comes from the durable store: entries that are not
+        // durable yet are not committed either, so they cannot widen the gap a
+        // promotion decision should care about.
+        let last_index = self.raw.store().last_index().ok()?;
+        let status = self.raw.status();
+        let progress = status.progress?.get(node_id)?;
+        Some((
+            last_index.saturating_sub(progress.matched),
+            progress.matched > 0,
+        ))
+    }
+
+    /// Whether `node_id` is a learner in the applied configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Raft`] if the storage cannot report its state.
+    pub fn is_learner(&self, node_id: RaftId) -> Result<bool, NodeError<T>> {
+        let state = self.raw.store().initial_state().map_err(NodeError::Raft)?;
+        Ok(state.conf_state.get_learners().contains(&node_id))
+    }
+
     /// Issue a quorum-confirmed ReadIndex read (propsol §5.4).
     ///
     /// `ctx` is an opaque, caller-chosen token that raft echoes back in the
@@ -1018,6 +1073,27 @@ mod tests {
         }
         assert_eq!(node.leader_id(), 1, "single node must elect itself leader");
         (node, sm)
+    }
+
+    #[test]
+    fn promotion_requires_an_online_caught_up_learner() {
+        // Caught up and answering.
+        assert!(learner_caught_up(0, true, 128));
+        assert!(
+            learner_caught_up(128, true, 128),
+            "the threshold is inclusive"
+        );
+        // Online but too far behind: promoting it would put an incomplete log
+        // into the quorum.
+        assert!(!learner_caught_up(129, true, 128));
+        // Never answered: not promotable however short the log is. (This is the
+        // case `recent_active` gets wrong: raft marks a newly added node as
+        // recently active, so a node that never existed would pass.)
+        assert!(!learner_caught_up(0, false, 128));
+        assert!(!learner_caught_up(0, false, u64::MAX));
+        // A zero threshold still allows an exactly-caught-up learner.
+        assert!(learner_caught_up(0, true, 0));
+        assert!(!learner_caught_up(1, true, 0));
     }
 
     #[test]

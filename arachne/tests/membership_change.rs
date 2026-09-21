@@ -507,3 +507,50 @@ async fn leadership_moves_and_a_leader_can_be_removed() {
         let _ = std::fs::remove_dir_all(&n.dir);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_learner_that_never_answered_cannot_be_promoted() {
+    // propsol §5.3 hard constraint 2: promote only a learner that is online and
+    // caught up. A learner that does not exist can never satisfy either half,
+    // which makes the gate observable without standing up a fourth node (the
+    // positive path lands with the real joiner in S5).
+    let dir = temp_dir("promote-gate");
+    let (metrics, handle, thread) = start(&dir);
+    until_leader(&metrics).await;
+
+    handle
+        .add_learner(2)
+        .await
+        .expect("a learner can always be added");
+
+    match handle.promote_learner(2).await {
+        Err(ArachneError::LearnerNotCaughtUp { behind, threshold }) => {
+            assert_eq!(threshold, profile().promote_lag_entries);
+            assert!(
+                behind > 0,
+                "a learner that never answered is behind by the whole log"
+            );
+        }
+        other => panic!("expected LearnerNotCaughtUp, got {other:?}"),
+    }
+
+    // The other half of the discipline: promoting something that is not a
+    // learner at all is refused, so a brand-new voter cannot skip the learner
+    // phase.
+    match handle.promote_learner(9).await {
+        Err(ArachneError::InvalidArgument(message)) => {
+            assert!(message.contains("not a learner"), "unexpected message: {message}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+
+    // The cluster is untouched: writes still work, and the durable membership
+    // still has node 2 as a learner only.
+    handle.put(b"k", b"v").await.expect("writes still work");
+    drop(handle);
+    thread.shutdown();
+    let (_, voters, learners) = recovered_conf_state(&dir);
+    assert_eq!(voters, vec![1], "nothing was promoted");
+    assert_eq!(learners, vec![2], "the learner is still a learner");
+    let _ = std::fs::remove_dir_all(&dir);
+}

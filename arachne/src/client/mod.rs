@@ -97,6 +97,17 @@ pub enum ArachneError {
     /// which was not authorized. (M3.)
     #[error("leader removal requires transfer")]
     LeaderRemovalRequiresTransfer,
+    /// A learner cannot be promoted yet: it is behind by more entries than
+    /// `promote_lag_entries` allows, or it has never answered the leader
+    /// (propsol §5.3 hard constraint 2, rev S). Promoting it anyway would put a
+    /// voter with an incomplete log into the quorum. (M3.)
+    #[error("learner not caught up (behind {behind} entries, threshold {threshold})")]
+    LearnerNotCaughtUp {
+        /// How many entries behind the leader the learner is.
+        behind: u64,
+        /// The configured `promote_lag_entries` bound.
+        threshold: u64,
+    },
     /// A peer reported a `cluster_id` mismatch during the transport handshake.
     #[error("cluster id mismatch")]
     ClusterIdMismatch,

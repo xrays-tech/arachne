@@ -382,6 +382,17 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - 验证：workspace **391 passed / 0 failed**、`--features fault-injection` **403 passed / 0 failed**（+2）、l2 **3 passed / 0 failed**、四门禁全 PASS。
 - **下一步 S3**：`promote_learner` 的追平门（`lag_bytes` → 条目口径 `promote_lag_entries`，默认 128 + progress 在线）+ 新错误变体 + 旋钮过 `check-profile-knobs.sh`；S4 快照写 live ConfState；S5 M3 ①② 端到端 + INV-4 + `arachne-node` 运维子命令。
 
+### 1.23 M3 ConfChange S3 落地：Learner 追平门（+ 一处实测修正）
+
+- **门在提议之前**（actor 命令入口，`AddNode` 分支）：先 `is_learner` 判定它是否在**已应用配置**里，再 `learner_progress` 取 `(条目滞后, 是否答过)`，交纯函数 `learner_caught_up(behind, has_acked, threshold)` 判定。
+  - 是 learner 但没追平 → 新错误 `LearnerNotCaughtUp { behind, threshold }`（带诊断字段，运维能看到差多少）；不是 learner（已是 voter 或未知）→ `InvalidArgument`，于是"新节点一律先以 Learner 加入"这条硬约束不可被绕过。
+  - 放在提议前是刻意的：提议后再检查会与"条目已提交"竞态，把一个日志不完整的 voter 放进 quorum。
+- **实测修正（本轮最有价值的一条）**："在线"**不能用 raft 的 `recent_active`**。`ProgressTracker::apply_conf` 在**新增节点时故意把 `recent_active` 置 true**（注释写明是为了防止 `CheckQuorum` 在节点还没来得及通信前就把 leader 拉下台，`third_party/raft/src/tracker.rs:379`）。第一版门就是用它写的，测试直接给出 `expected LearnerNotCaughtUp, got Ok(())`；用临时 probe 打出 `progress=Some((2, true))` 才定位到——一个**根本不存在的 learner** 在 raft 眼里是"最近活跃"的。改为 `matched > 0`（答过至少一次）后语义才对，且这条注释被写进 `learner_progress` 的文档，避免以后有人"顺手改回去"。
+- `promote_lag_entries` 新旋钮（默认 128，两个预设都有）：`ProfileConfig` 的字段被 production 真读（`RuntimeConfig` → actor 字段 → 门），因此过 `check-profile-knobs.sh` ✓；§5.3 原文的 `lag_bytes` 字节口径在实现里落成条目口径，已在 §5.3 就地标注修订、rev S 给出理由（WAL 无 index→offset 映射）。
+- **测试**：单测覆盖判定边界（`behind` 0/128/129、未答过、阈值 0 非空洞）；端到端 `a_learner_that_never_answered_cannot_be_promoted`：不存在的 learner → `LearnerNotCaughtUp` 且 `behind > 0`；未知节点 → `InvalidArgument`；随后写仍成功；停机后重开 WAL 断言 **voters=[1]、learners=[2]**（反向对照：什么都没被提升）。
+- 验证：workspace **392 passed / 0 failed**、`--features fault-injection` **405 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS（含 profile-knobs 对新旋钮的检查）。
+- **下一步**：**S4** 快照写 live ConfState + 安装路径回灌（`create_snapshot` 现在写的是 bootstrap 静态集合）；**S5** M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程写不中断）+ INV-4 断电 + `arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

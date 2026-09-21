@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::client::{ArachneError, Handle};
 use crate::consensus::{
     CommittedEntry, NodeError, RaftNode, RaftNodeConfig, conf_change_identity,
+    learner_caught_up,
 };
 use crate::metrics::Metrics;
 use crate::profile::ProfileConfig;
@@ -474,6 +475,8 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     sent_bytes_total: u64,
     /// Byte bound on committed-but-unapplied work (Q7 `proposal_queue_bytes`).
     proposal_queue_bytes: u64,
+    /// How far a learner may lag and still be promotable (§5.3, rev S).
+    promote_lag_entries: u64,
     metrics: Arc<Metrics>,
     /// Where the Q4 snapshot-budget warning goes.
     logger: Logger,
@@ -642,6 +645,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             applied_bytes_total: 0,
             sent_bytes_total: 0,
             proposal_queue_bytes: config.profile.proposal_queue_bytes,
+            promote_lag_entries: config.profile.promote_lag_entries,
             metrics: config.metrics,
             logger: logger.clone(),
             raft_id: config.self_raft_id,
@@ -1322,6 +1326,39 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 if change_type == ConfChangeType::RemoveNode && node_id == self.raft_id {
                     let _ = ack.send(Err(ArachneError::LeaderRemovalRequiresTransfer));
                     return;
+                }
+                // Hard constraint 2: a learner is promoted only once it is
+                // online and caught up. Doing this before the proposal keeps a
+                // voter with an incomplete log out of the quorum — and unlike a
+                // post-hoc check it cannot be raced by the entry committing.
+                if change_type == ConfChangeType::AddNode {
+                    match self.node.is_learner(node_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = ack.send(Err(ArachneError::InvalidArgument(format!(
+                                "node {node_id} is not a learner in the applied \
+                                 configuration; add it first with add_learner"
+                            ))));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = ack.send(Err(ArachneError::Unrecoverable(format!(
+                                "reading the membership failed: {e}"
+                            ))));
+                            return;
+                        }
+                    }
+                    let (behind, has_acked) = self
+                        .node
+                        .learner_progress(node_id)
+                        .unwrap_or((u64::MAX, false));
+                    if !learner_caught_up(behind, has_acked, self.promote_lag_entries) {
+                        let _ = ack.send(Err(ArachneError::LearnerNotCaughtUp {
+                            behind,
+                            threshold: self.promote_lag_entries,
+                        }));
+                        return;
+                    }
                 }
                 // Hard constraint 1: at most one outstanding membership change.
                 // Ordinary writes are a different command and are unaffected.

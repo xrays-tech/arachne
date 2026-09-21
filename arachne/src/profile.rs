@@ -91,6 +91,14 @@ pub struct ProfileConfig {
     pub max_key_bytes: u64,
     /// Snapshot transfer rate limit in bytes/second.
     pub snapshot_transfer_rate_bps: u64,
+    /// How many log entries a learner may lag behind the leader and still be
+    /// promotable (propsol §5.3 hard constraint 2, rev S).
+    ///
+    /// The spec words this as a byte lag (`lag_bytes < promote_lag_threshold`);
+    /// the WAL keeps no index-to-offset map, so the entry count raft itself
+    /// exposes (`last_index - matched`) is used instead — the same shape, and
+    /// the quantity an operator can check against `applied_index`.
+    pub promote_lag_entries: u64,
     /// Fsync policy for WAL entry records (HardState is always fsynced, I1).
     pub fsync_policy: FsyncPolicy,
 }
@@ -118,6 +126,7 @@ impl ProfileConfig {
             max_value_bytes: MB, // 1 MiB
             max_key_bytes: 4 * KB, // 4 KiB
             snapshot_transfer_rate_bps: 32 * MB,
+            promote_lag_entries: 128,
             fsync_policy: FsyncPolicy::Always,
         }
     }
@@ -144,6 +153,7 @@ impl ProfileConfig {
             max_value_bytes: MB, // 1 MiB
             max_key_bytes: 4 * KB, // 4 KiB
             snapshot_transfer_rate_bps: 8 * MB,
+            promote_lag_entries: 128,
             fsync_policy: FsyncPolicy::Always,
         }
     }
