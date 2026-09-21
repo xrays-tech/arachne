@@ -252,7 +252,7 @@ M3 缺的最后一块（M3 验收 ④⑤、INV5 S07/S10/S14）。先记录一个
 | 快照 | 会话 outcome 表照旧进快照（已有 ✓ M3 ⑥）；`last_used` 不进 | 把 `last_used` 写进快照 | 快照必须可重放，时钟值不可重放。 |
 | 验证（M3 ④⑤、INV5 S07/S10/S14） | `ManualClock` 驱动：①TTL 内重试 → oracle 判"同 seq 恰好一次"（已有）；②越过 TTL 未过 grace → `SessionExpired` **且 replicated index 未增长**（证明没有提议）；③越过 `ttl+grace` → GC 之后同 seq 可被当新会话执行，断言**重复生效窗口 ≤ ttl+grace**；④填满 `max_sessions` → 新会话得 `SessionTableFull`，GC 后恢复；⑤快照安装后去重完好（已有 + 补一条跨安装的重试断言） | 只做单元测试 | 这些都要求"日志里到底有没有条目"和"时钟推进"两个观测点，只有端到端 + 模拟时钟能同时给到。 |
 
-**落地顺序**：R1 `RuntimeConfig.clock` + 会话本地表 + 三区间判定与两个错误（可独立验证：TTL/grace/满表）；R2 GC 命令（`KvStateMachine` 新命令类型 + 提议循环 + 表大小进进度）；R3 INV5 场景（S07/S10/S14）与文档，并删掉 `check-profile-knobs.sh` 白名单里对应的三项。
+**落地顺序（R1 已落地）**：**R1 ✓** 会话 TTL/grace 三区间 + leader 本地表 + `SessionExpired`——时钟经 `Runtime::with_session_clock`（builder，**不加** `RuntimeConfig` 字段以免动 ~10 处构造；不设置即"永不过期"= 旧行为），`session_ttl_ms`/`session_grace_period_ms` 由此被真正读取（两项已从 `check-profile-knobs.sh` 白名单移除）；本地表按 `ttl+grace` 窗口定期清扫，因此有界。端到端 `arachne/tests/sessions.rs`（feature 门控，配 `ManualClock` + `Handle::propose_raw` 才能复现"同 session 重试"）：TTL 内重试用**不同值**提议 → 断言原值存活（恰好一次，而非最后写入胜）；越 TTL 未过 grace → `SessionExpired` **且 `applied_index`/`commit_index` 不动**（证明没进日志）；越过 grace → 重新接受，而 SM 仍去重故效果仍为一次。**反向对照**：把 `session_ttl_ms` 设 0 → 该断言失败（测试非空洞）。**R2** GC 命令（`KvStateMachine` 新命令类型 + 提议循环 + 表大小进进度）+ `max_sessions` 上限检查（与 GC 同批落地，否则填满后新会话会被永久拒绝）；**R3** INV5 S07/S10/S14 与 ConfChange 相关场景。
 
 ## 1. 目标与非目标
 

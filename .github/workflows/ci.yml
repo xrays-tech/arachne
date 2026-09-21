@@ -80,6 +80,7 @@ jobs:
         run: |
           cargo test -p arachne --features fault-injection --test m2_durability
           cargo test -p arachne --features fault-injection --test slow_fsync
+          cargo test -p arachne --features fault-injection --test sessions
 
       - name: Build lean core (no default features)
         run: cargo build -p arachne --no-default-features

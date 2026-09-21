@@ -161,6 +161,11 @@ impl Metrics {
         self.wal_bytes.load(Ordering::Relaxed)
     }
 
+    /// The highest committed log index.
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index.load(Ordering::Relaxed)
+    }
+
     /// The highest applied log index.
     pub fn applied_index(&self) -> u64 {
         self.applied_index.load(Ordering::Relaxed)

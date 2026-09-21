@@ -304,6 +304,16 @@ rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉�
 
 设计要点（详见 rev R）：过期判定放 **leader 侧**（本机时钟）而不是把时间戳写进每条命令；淘汰必须走**复制的显式 GC 条目**（否则副本去重状态分叉）；三区间语义 ≤TTL 正常去重 / TTL..TTL+grace 回 `SessionExpired` 且**不提议** / 之后可由 GC 删除，由此给出 INV5 要的"重复窗口 ≤ ttl+grace"；`max_sessions` 只能在**提议前**检查（已提交条目不能拒绝）；**TTL 必须走 `Clock` seam**（测试注入 `ManualClock`），代价是 `RuntimeConfig` 新增 clock 字段、约 10 处字面量构造跟着改。落地分 R1（时钟+本地表+两错误）/R2（GC 命令与提议循环）/R3（INV5 S07/S10/S14 + 删白名单三项）。
 
+### 1.16 M3 会话 R1 落地：TTL/grace 三区间 + `SessionExpired`
+
+- **时钟不改配置结构**：`Runtime::with_session_clock(clock)`（builder）。加 `RuntimeConfig` 字段要跟着改约 10 处字面量构造，而 builder 让"不设置 = 永不过期 = 旧行为"，零破坏。
+- **leader 本地会话表**（`(client_id, seq_no) -> last_used`，不复制、不进快照）：换主后窗口从零重算 → 会话只会**活得更久**（保守方向，不会双重生效）。表按 `ttl+grace` 窗口定期清扫，所以有界（不像 SM 的表那样无界增长）。
+- **三区间**：≤TTL → 正常提议（SM 去重）；TTL..TTL+grace → **`SessionExpired` 且不提议**（这正是 INV5"重复窗口 ≤ ttl+grace"的界）；之后 → 当新会话，仍安全因为 SM 还留着 outcome（GC 在 R2 才删）。
+- `last_used` 只在条目**交给 apply 任务时**更新——提议失败（丢主）不能延长会话，否则会给"根本没发生"的操作回 `SessionExpired`。
+- 测试需要"同 session 重试"，而 `put/delete` 每次自增 seq，因此新增 **feature 门控的 `Handle::propose_raw`**（与既有 test-only 注入同一模式）。端到端验证四条：TTL 内重试用**不同值** → 原值存活（恰好一次）；越 TTL 未过 grace → `SessionExpired` **且 `applied_index`/`commit_index` 不变**（没进日志）；越过 grace → 重新接受且效果仍一次。**反向对照**：`session_ttl_ms = 0` 时该断言失败。
+- 门禁：`session_ttl_ms`/`session_grace_period_ms` 已从 `check-profile-knobs.sh` 白名单移除（现在真被读），白名单只剩 `max_sessions`（R2，必须与 GC 同批）与 `snapshot_transfer_rate_bps`（流式传输）。CI 的 fault-injection 步骤加了 `--test sessions`。
+- 本轮全量：workspace **377 passed**、fault-injection **214 passed**、l2 全绿、四道门禁 PASS。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

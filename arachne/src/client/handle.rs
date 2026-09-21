@@ -138,6 +138,23 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no).await
     }
 
+    /// **Test-only** (feature `fault-injection`): propose a raw state-machine
+    /// command under an explicit session.
+    ///
+    /// `put`/`delete` mint a fresh `seq_no` per call, so a *retry* — the one
+    /// case session idempotency is about — cannot be reproduced through them.
+    /// The session-TTL tests use this to send the same `(client_id, seq_no)`
+    /// twice, through the real actor.
+    #[cfg(feature = "fault-injection")]
+    pub async fn propose_raw(
+        &self,
+        cmd: Vec<u8>,
+        client_id: u64,
+        seq_no: u64,
+    ) -> Result<(), ArachneError> {
+        self.propose_with_redirect(cmd, client_id, seq_no).await
+    }
+
     /// Linearizable delete (propsol §2.1). See [`Handle::put`].
     pub async fn delete(&self, key: &[u8]) -> Result<(), ArachneError> {
         self.validate_key(key)?;

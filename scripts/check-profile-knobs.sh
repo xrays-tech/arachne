@@ -24,11 +24,10 @@ cd "${ROOT_DIR}"
 # Keep this list shrinking: the gate fails if an entry becomes used, so a landed
 # feature cannot leave a stale exemption behind.
 known_gaps=(
-  # M3 session idempotency (propsol §M3 ④⑤, INV5 S10/S14): the session table
-  # exists and dedups, but expiry/full semantics are not enforced yet.
-  "session_ttl_ms:M3 sessions"
-  "session_grace_period_ms:M3 sessions"
-  "max_sessions:M3 sessions"
+  # M3 session idempotency (propsol §M3 ④⑤, INV5 S10/S14). TTL and grace are
+  # read by the runtime since v0.2.15 R1; `max_sessions` still needs the GC that
+  # relieves it (R2), so it stays listed on purpose.
+  "max_sessions:M3 sessions R2"
   # Needs the snapshot transfer path (rate limiting is per stream).
   "snapshot_transfer_rate_bps:M3 snapshot streaming"
 )

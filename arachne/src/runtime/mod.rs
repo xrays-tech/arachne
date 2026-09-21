@@ -47,7 +47,10 @@ use crate::metrics::Metrics;
 use crate::profile::ProfileConfig;
 use crate::state_machine::KvStateMachine;
 use crate::storage::WalStorage;
-use crate::{LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx};
+use crate::types::Timestamp;
+use crate::{
+    Clock, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx,
+};
 use arachne_seam::storage::{
     ConfState as SeamConfState, Snapshot as SeamSnapshot, Storage as _,
 };
@@ -115,6 +118,17 @@ pub struct RuntimeConfig {
     pub profile: ProfileConfig,
     /// The shared metrics registry.
     pub metrics: Arc<Metrics>,
+}
+
+/// Where a proposal's session is in its life (propsol v0.2.15 R1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SessionBand {
+    /// Inside the TTL: propose; the state machine dedups.
+    Live,
+    /// Inside the grace window after it: answer `SessionExpired`, do not propose.
+    Grace,
+    /// Past both: a new session as far as this leader is concerned.
+    Fresh,
 }
 
 /// A proposal awaiting commit+apply.
@@ -420,6 +434,21 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     /// Monotonic source of ReadIndex tokens (8-byte big-endian `ctx`).
     next_read_token: u64,
     propose_timeout: Duration,
+    /// The clock session TTLs are measured on (propsol v0.2.15 R1). `None`
+    /// disables expiry entirely, which is what every embedder that does not set
+    /// one gets — i.e. the behaviour before sessions had a lifetime.
+    session_clock: Option<Arc<dyn Clock>>,
+    /// Leader-local `(client_id, seq_no) -> last used` (monotonic ms). Not
+    /// replicated and not in any snapshot: it only decides when this leader
+    /// stops accepting a retry, and a new leader simply starts the window over,
+    /// which keeps sessions alive *longer* — the safe direction.
+    sessions: HashMap<(u64, u64), Timestamp>,
+    /// When to sweep expired entries out of `sessions`.
+    next_session_sweep: Timestamp,
+    /// `session_ttl_ms` from the profile.
+    session_ttl_ms: u64,
+    /// `session_grace_period_ms` from the profile.
+    session_grace_ms: u64,
     /// The voting membership this node was started with. It travels into every
     /// local snapshot so that a node restored from one knows the configuration
     /// (propsol §5.5.4); ConfChange is M3.
@@ -554,6 +583,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             ),
             next_read_token: 0,
             propose_timeout: Duration::from_millis(config.profile.election_timeout_ms.max(1)),
+            session_clock: None,
+            sessions: HashMap::new(),
+            next_session_sweep: 0,
+            session_ttl_ms: config.profile.session_ttl_ms,
+            session_grace_ms: config.profile.session_grace_period_ms,
             voters,
             snapshot_threshold_bytes: config.profile.snapshot_threshold_bytes,
             last_wal_sample: Instant::now(),
@@ -687,6 +721,17 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         true
     }
 
+    /// Measure session TTLs on this clock (propsol v0.2.15 R1).
+    ///
+    /// Set as a builder rather than as a `RuntimeConfig` field so that adding it
+    /// does not touch every construction site; an embedder that never calls it
+    /// keeps the behaviour from before sessions had a lifetime — they never
+    /// expire.
+    pub fn with_session_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.session_clock = Some(clock);
+        self
+    }
+
     /// Apply the task's progress to the actor's view, and advance raft's
     /// applied index to match (propsol N). Returns `false` on a fail-stop.
     fn absorb_progress(&mut self) -> bool {
@@ -742,13 +787,19 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         for (index, data) in &entries {
             // Attribute before the data moves: the actor knows which session
             // each entry carries, so a reply needs only the applied index.
-            if let Some((client_id, seq_no)) = KvStateMachine::command_session(data)
-                && let Some(p) = self
+            if let Some((client_id, seq_no)) = KvStateMachine::command_session(data) {
+                if let Some(p) = self
                     .pending
                     .iter_mut()
                     .find(|p| p.index.is_none() && p.client_id == client_id && p.seq_no == seq_no)
-            {
-                p.index = Some(*index);
+                {
+                    p.index = Some(*index);
+                }
+                // Only once the entry is committed and on its way to the state
+                // machine: a proposal that never made it must not extend the
+                // session, or a retry would be answered `SessionExpired` for an
+                // operation that never happened.
+                self.note_session(client_id, seq_no);
             }
             self.sent_bytes_total += data.len() as u64 + ENTRY_FRAMING_BYTES;
         }
@@ -943,6 +994,13 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     let _ = ack.send(Err(ArachneError::Busy));
                     return;
                 }
+                // Session bands (propsol v0.2.15 R1): a retry past the TTL but
+                // inside the grace window is answered "result unknown" instead
+                // of being proposed again.
+                if self.session_band(client_id, seq_no) == SessionBand::Grace {
+                    let _ = ack.send(Err(ArachneError::SessionExpired));
+                    return;
+                }
                 match self.node.propose(&cmd) {
                     Ok(()) => self.pending.push(Pending {
                         client_id,
@@ -1117,6 +1175,59 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
             }
         }
+    }
+
+    /// Which part of a session's life a proposal falls in (propsol v0.2.15 R1).
+    ///
+    /// * `Live` — inside the TTL: propose it; the state machine dedups, so the
+    ///   effect is exactly once.
+    /// * `Grace` — after the TTL but inside the grace window: answer
+    ///   `SessionExpired` ("result unknown") and do **not** propose. This is
+    ///   what bounds a duplicate's effect to `ttl + grace`.
+    /// * `Fresh` — past both: treat it as a new session. Safe while the state
+    ///   machine still holds the outcome (until GC, R2, removes it), and the
+    ///   client was told not to retry this far out.
+    fn session_band(&self, client_id: u64, seq_no: u64) -> SessionBand {
+        let Some(clock) = &self.session_clock else {
+            return SessionBand::Live;
+        };
+        if self.session_ttl_ms == 0 {
+            return SessionBand::Live;
+        }
+        let Some(last) = self.sessions.get(&(client_id, seq_no)) else {
+            return SessionBand::Fresh;
+        };
+        let elapsed = clock.now_millis().saturating_sub(*last);
+        if elapsed <= self.session_ttl_ms {
+            SessionBand::Live
+        } else if elapsed <= self.session_ttl_ms.saturating_add(self.session_grace_ms) {
+            SessionBand::Grace
+        } else {
+            SessionBand::Fresh
+        }
+    }
+
+    /// Record that `(client_id, seq_no)` was used, sweeping expired entries out
+    /// of the local table on a timer so it stays bounded by the grace window
+    /// rather than by the write volume.
+    fn note_session(&mut self, client_id: u64, seq_no: u64) {
+        let Some(clock) = &self.session_clock else {
+            return;
+        };
+        if self.session_ttl_ms == 0 {
+            return;
+        }
+        let now = clock.now_millis();
+        let window = self
+            .session_ttl_ms
+            .saturating_add(self.session_grace_ms)
+            .max(1);
+        if now >= self.next_session_sweep {
+            self.next_session_sweep = now.saturating_add(window);
+            self.sessions
+                .retain(|_, last| now.saturating_sub(*last) <= window);
+        }
+        self.sessions.insert((client_id, seq_no), now);
     }
 
     /// Tag an inbound peer message with its raft id and hand it to raft.
