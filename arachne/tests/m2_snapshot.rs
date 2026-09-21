@@ -267,13 +267,55 @@ fn value(i: u64) -> Vec<u8> {
 
 /// The full catch-up scenario, run against either durability path.
 async fn catch_up_scenario(offloaded: bool) {
+    catch_up_scenario_with(offloaded, false).await
+}
+
+/// The same scenario, optionally through the **streamed snapshot** path
+/// (propsol rev T, T2b).
+///
+/// Streaming is chosen per transport: the in-memory transports advertise it
+/// only when asked ([`InMemoryTransportFactory::with_snapshot_streaming`]), and
+/// then every peer's snapshot bytes have to be served from somewhere — here
+/// from that peer's own data directory, exactly as the real transport serves
+/// them from the serving node's snapshot provider.
+async fn catch_up_scenario_with(offloaded: bool, streaming: bool) {
     let profile = test_profile();
-    let factory = InMemoryTransportFactory::new();
+    let factory = if streaming {
+        InMemoryTransportFactory::new().with_snapshot_streaming()
+    } else {
+        InMemoryTransportFactory::new()
+    };
     let addresses = addresses(N);
+    // How many times the streamed path actually ran. A test that only checked
+    // the end state could pass through the in-message route by accident.
+    let fetches = std::sync::Arc::new(AtomicU64::new(0));
 
     let mut nodes: Vec<Node> = Vec::new();
     for i in 1..=N {
         let dir = temp_dir(&format!("n{i}"));
+        if streaming {
+            // Serve this node's snapshots from its own data directory. The file
+            // name is part of the on-disk contract (propsol §5.5.4), so the
+            // source finds it without any storage handle.
+            let source_dir = dir.clone();
+            let counter = std::sync::Arc::clone(&fetches);
+            factory.set_snapshot_source(
+                node_id(i),
+                std::sync::Arc::new(move |index, term| {
+                    // The on-disk name zero-pads both numbers
+                    // (`snapshot-<020>-<020>.snap`), while the snapshot metadata
+                    // — which is all the request carries — holds them bare. Any
+                    // provider has to make that mapping; a real one uses
+                    // `snapshot_file_name`, which this test cannot reach.
+                    let path = source_dir.join(format!("snapshot-{index:020}-{term:020}.snap"));
+                    let bytes = std::fs::read(&path).ok();
+                    if bytes.is_some() {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    bytes
+                }),
+            );
+        }
         nodes.push(spawn_node(i, N, dir, &factory, &addresses, &profile, false).await);
     }
     // In-process redirects: every handle knows every peer (propsol §3.3).
@@ -426,6 +468,12 @@ async fn catch_up_scenario(offloaded: bool) {
         nodes[victim].metrics.snapshots_installed_total() > 0,
         "the follower must have installed a snapshot received from the leader"
     );
+    if streaming {
+        assert!(
+            fetches.load(Ordering::Relaxed) > 0,
+            "the snapshot must have travelled over the streaming path"
+        );
+    }
     assert!(
         !snapshot_files(&nodes[victim].dir).is_empty(),
         "the installed snapshot must be durable on the follower"
@@ -464,6 +512,14 @@ async fn catch_up_scenario(offloaded: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lagging_follower_catches_up_through_a_snapshot() {
     catch_up_scenario(false).await;
+}
+
+/// The same scenario through the **streamed snapshot** path (rev T, T2b): the
+/// leader sends metadata only, the follower fetches the bytes over its
+/// transport, installs them, steps the message into raft, and reports back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lagging_follower_catches_up_through_a_streamed_snapshot() {
+    catch_up_scenario_with(false, true).await;
 }
 
 /// The same scenario through the **asynchronous durability pipeline**
