@@ -288,6 +288,7 @@ rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉�
 
 ### 1.14 收尾：快照预算告警、CI 单飞项目腐化、fuzz 任务
 
+- **`slow_fsync` 的"可用性"论断被证实**（这是 rev P 里我明确标注"未验证"的那条）：给 WAL 加了一个 **feature `fault-injection` 下的测试专用 flush 延迟**（`set_flush_delay_ms`，同时作用于 actor 的同步 `fsync` 与 flusher 线程的 flush），新增 `arachne/tests/slow_fsync.rs` 做 A/B：单节点、400ms 模拟慢盘、写正在落盘时连打弱读——**同步路径最坏 360ms（读要等 actor 的 fsync），pipeline 127µs**，约 2800× 差距。这正是 pipeline 存在的理由（它不降 p99，但保证磁盘慢时 actor 不停摆）。CI 的 fault-injection 步骤已同时跑 `m2_durability` 与 `slow_fsync`；`check-release-features.sh` Gate C 增加第二个哨兵（`set_flush_delay_ms`）以免 release 混入该注入（第一版把检查插在了 feature 构建之后、grep 的是 feature rlib，等于白查——已修）。
 - **Q4 快照预算告警落地**（propsol §8.2）：`Runtime::poll_snapshot` 在测完时长后，`> 1s` 即 `slog::warn!`（带 duration/index/size/budget）+ `snapshot_slow_total` 计数器（新增指标，已在 `/metrics` 渲染）。此前只有 `snapshot_last_duration_ms` 这个 gauge，没有任何告警路径。测试：指标渲染/计数单测 + `m2_snapshot` 里"正常快照**不**触发告警"的负向断言（避免误报）。正路径要造 >1s 的快照得靠 L4 慢盘，未做，如实记录。
 - **发现并修掉一类系统性腐化：单飞（非 workspace）项目没人建**。追查失败的定时 CI 时发现：
   1. **fuzz 任务从未装 protoc 3.x**（另两个 job 都装了）→ `raft-proto` 的 build script 直接 panic（`Option::unwrap() on None`），**在构建阶段就死**，压根没跑到 fuzzer；所以定时任务一直红在 job 设置上。

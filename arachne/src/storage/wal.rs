@@ -273,6 +273,10 @@ pub struct WalStorage {
     /// watermark (propsol §7 `wal_trailing_keep`, Q6). 0 = compact everything the
     /// snapshot covers.
     trailing_keep_bytes: u64,
+    /// Test-only flush delay for the slow-disk scenario (feature
+    /// `fault-injection`).
+    #[cfg(feature = "fault-injection")]
+    flush_delay_ms: u64,
     /// Fsync/recovery counters.
     stats: StorageStats,
     /// Optional fsync observer (zero-overhead when `None`).
@@ -302,6 +306,9 @@ struct Offloaded {
     waker: Arc<Mutex<FlushWaker>>,
     next_id: u64,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Test-only slow-disk delay shared with the flusher thread.
+    #[cfg(feature = "fault-injection")]
+    delay: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct FlushJob {
@@ -475,6 +482,8 @@ impl WalStorage {
             fsync_policy: opts.config.fsync_policy,
             segment_bytes: opts.config.segment_bytes,
             trailing_keep_bytes: 0,
+            #[cfg(feature = "fault-injection")]
+            flush_delay_ms: 0,
             stats,
             fsync_observer: opts.fsync_observer,
             offloaded: None,
@@ -1013,6 +1022,32 @@ impl WalStorage {
         self.trailing_keep_bytes
     }
 
+    /// **Test-only** (feature `fault-injection`): make every real segment flush
+    /// take at least this long, modelling a slow disk.
+    ///
+    /// It delays both durability paths at their own flush point — the actor's
+    /// synchronous `fsync` and the flusher thread's — which is what lets a test
+    /// show that the actor keeps serving under the pipeline and stalls without
+    /// it (propsol §8.2 / the L4 `slow_fsync` scenario).
+    #[cfg(feature = "fault-injection")]
+    pub fn set_flush_delay_ms(&mut self, ms: u64) {
+        self.flush_delay_ms = ms;
+        #[cfg(feature = "fault-injection")]
+        if let Some(offloaded) = &self.offloaded {
+            offloaded
+                .delay
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Apply the test-only flush delay, if any.
+    #[cfg(feature = "fault-injection")]
+    fn slow_disk(&self) {
+        if self.flush_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.flush_delay_ms));
+        }
+    }
+
     /// Bytes held by the segments whose first index is at or above `from`.
     fn retained_bytes_from(&self, indices: &[u64], from: LogIndex) -> Result<u64, StorageError> {
         let mut total = 0u64;
@@ -1044,6 +1079,9 @@ impl WalStorage {
         let waker: Arc<Mutex<FlushWaker>> = Arc::new(Mutex::new(FlushWaker::default()));
         let thread_done = Arc::clone(&done);
         let thread_waker = Arc::clone(&waker);
+        // Shared with the flusher thread so `set_flush_delay_ms` can reach it.
+        #[cfg(feature = "fault-injection")]
+        let thread_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let thread = std::thread::Builder::new()
             .name(format!("arachne-wal-flush-{}", self.meta.node_id))
             .spawn(move || {
@@ -1072,6 +1110,8 @@ impl WalStorage {
             waker,
             next_id: 0,
             thread: Some(thread),
+            #[cfg(feature = "fault-injection")]
+            delay: Arc::clone(&thread_delay),
         });
         Ok(())
     }
@@ -1463,6 +1503,8 @@ impl Storage for WalStorage {
     fn sync_entries(&mut self) -> Result<(), StorageError> {
         match self.fsync_policy {
             FsyncPolicy::Always => {
+                #[cfg(feature = "fault-injection")]
+                self.slow_disk();
                 self.segment
                     .sync()
                     .map_err(StorageError::Io)?;
@@ -1476,6 +1518,8 @@ impl Storage for WalStorage {
                 // returns only after pending entries are fsynced. The `ms`
                 // parameter is advisory (P4 timer-driven pre-flush).
                 if self.pending_entry_fsync {
+                    #[cfg(feature = "fault-injection")]
+                    self.slow_disk();
                     self.segment
                         .sync()
                         .map_err(StorageError::Io)?;

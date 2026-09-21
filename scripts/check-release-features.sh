@@ -177,6 +177,15 @@ if grep -a -q -F "${hook_sentinel}" "${rlib}"; then
 fi
 echo "PASS (Gate C): default release rlib excludes the fault-injection hook"
 
+# The same feature carries the test-only slow-disk injection, so check it on the
+# same default artifact rather than assuming one sentinel covers the feature.
+slow_disk_sentinel="set_flush_delay_ms"
+if grep -a -q -F "${slow_disk_sentinel}" "${rlib}"; then
+  echo "FAIL (Gate C): the default release rlib contains the slow-disk injection (${rlib})"
+  exit 1
+fi
+echo "PASS (Gate C): default release rlib excludes the slow-disk injection"
+
 # Feature build: the hook must be present (proves the gate is not vacuous).
 rlib="$(build_core_rlib --features fault-injection)"
 if [ -z "${rlib}" ] || [ ! -f "${rlib}" ]; then
@@ -187,7 +196,6 @@ if ! grep -a -q -F "${hook_sentinel}" "${rlib}"; then
   echo "FAIL (Gate C): the feature build lacks the hook (the feature is a no-op?)"
   exit 1
 fi
-
 # Leave a clean (default-feature) artifact on disk.
 build_core_rlib >/dev/null
 
