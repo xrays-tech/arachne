@@ -372,6 +372,16 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - 验证：workspace **391 passed / 0 failed**、`--features fault-injection` **401 passed / 0 failed**（+2 即上面两项）、l2 **3 passed / 0 failed**、四门禁全 PASS。
 - **下一步 S2**：公开 API `Handle::add_learner`/`promote_learner`/`remove_member`/`transfer_leader` + **单飞门 `ConfChangePending`**（清空时机 = 条目 applied，普通写不受影响；raft 自身的 `pending_conf_index` 只作第二道防线、以测试实测其行为）；S3 追平门 + `promote_lag_entries`；S4 快照写 live ConfState；S5 M3 ①② 端到端 + INV-4 + node 运维面。
 
+### 1.22 M3 ConfChange S2 落地：公开成员 API + 单飞门 + 转让/移除 leader
+
+- **API**（§5.6 定名）：`Handle::add_learner` / `promote_learner` / `remove_member` / `transfer_leader`。写路径与成员变更**共用一条重定向循环**（新增内部 `Request` 枚举 `Propose`/`ConfChange`/`TransferLeader`，`send_propose` 泛化为 `send_request`）：两者契约一致——leader 受理、follower 回 `NotLeader{hint}`、同一 deadline 覆盖全程；不可达 peer 仍只算"跳过"，不算本节点 shutdown。
+- **`remove_member(leader)` 的复合动作在客户端**（这一点是 S2 实现时才完全想清楚的）：转让成功后原 leader 已无法提案，所以只能由 Handle 完成"先收到 `LeaderRemovalRequiresTransfer` → `hand_over_leadership`（`target: None` = 任意其他 voter，actor 选最小 id）→ 重发移除"；转让失败则移除失败且**不提案**（§5.3 硬约束 3）。actor 回到无状态：只回那个信号 + 拒绝"直接移除自己"。
+- **转让成功判定 = 领导权真的转移**：`pending_transfer` 等到 `leader_id() == target` 才应答；落在第三个节点 = 失败（`NotLeader{hint}`）；`leader_id() == 0`（已 step down 未学到新主）**不是**判定，继续等 deadline。`RawNode::transfer_leader` 只发消息，若按"消息已发"算成功，`remove_member` 就会在没有多数派时继续往下走。
+- **单飞门（M3 ③）与实测的 raft 行为**：门在 actor 命令入口（`!pending_conf.is_empty()` → `ConfChangePending`），普通写走另一条路径不受影响。**rev S 要求"实测而非假设"上游行为，结果值得记一笔**：`Raft::step` 对 `MsgPropose` 中的 ConfChange 会检查 `has_pending_conf()`（`pending_conf_index > applied`），命中时**把条目改写成空的 `EntryNormal` 并只打一条 info 日志**（`third_party/raft/src/raft.rs:2115`）——`propose_conf_change` 照样返回 `Ok`。也就是说上游不是报错拒绝而是**静默吞掉**：没有我们这道门，客户端会拿到"成功"而集群毫无变化。上游的 `has_pending_conf` 文档还自认可能有假阳性，所以**门必须由我们做，且它就是对外契约**。
+- **测试**（`membership_change.rs`，feature 门控，4 项，连跑 3 次全绿）：①路由/持久/重启（S1b）；②顺序（S1b）；③**单飞门**：用测试专用慢盘 `set_flush_delay_ms(120)` 把"已提案未 apply"的窗口撑开，并发两条 `add_learner` → 恰好一条 Ok、一条 `ConfChangePending`，同批 `put` 正常成功，闸门释放后第三条又被接受，停机后断言 durable learners 恰为 2；④**转让 + 移除 leader**（3 节点 runtime 集群）：显式转让到指定 voter 并断言目标真的当选、旧 leader 认得它 → `remove_member(当前 leader)` 成功 → 两票仍能写、被移除节点不再收到 commit、停机后重开存活节点 WAL 断言 voters=2 且不含被移除者。
+- 验证：workspace **391 passed / 0 failed**、`--features fault-injection` **403 passed / 0 failed**（+2）、l2 **3 passed / 0 failed**、四门禁全 PASS。
+- **下一步 S3**：`promote_learner` 的追平门（`lag_bytes` → 条目口径 `promote_lag_entries`，默认 128 + progress 在线）+ 新错误变体 + 旋钮过 `check-profile-knobs.sh`；S4 快照写 live ConfState；S5 M3 ①② 端到端 + INV-4 + `arachne-node` 运维子命令。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

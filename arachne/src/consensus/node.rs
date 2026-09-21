@@ -25,6 +25,9 @@ use std::sync::Arc;
 
 use protobuf::Message as _;
 use raft::eraftpb::{ConfChange, ConfChangeType, ConfChangeV2, Message};
+// For `RaftStorage`'s raft `Storage` impl (`initial_state` reads the applied
+// membership), which is otherwise not in scope for method resolution.
+use raft::storage::Storage as _;
 use raft::ReadOnlyOption;
 use raft::{Config as RaftConfig, RawNode};
 use slog::Logger;
@@ -670,6 +673,35 @@ where
             .save_conf_state(index, &seam_conf_state)
             .map_err(|e| NodeError::Storage(e.to_string()))?;
         Ok(true)
+    }
+
+    /// Ask raft to move leadership to `node_id` (propsol §5.3; Q3 makes this a
+    /// public API because shutdown and leader removal both depend on it).
+    ///
+    /// This only *starts* the transfer: raft sends the transfer message and the
+    /// target campaigns. Success is the leadership actually moving, which the
+    /// caller observes through [`RaftNode::leader_id`] — a returned `Ok` here
+    /// would prove nothing (rev S).
+    pub fn transfer_leader(&mut self, node_id: RaftId) {
+        self.raw.transfer_leader(node_id);
+    }
+
+    /// The voter set of the applied configuration (propsol §5.3).
+    ///
+    /// Read from the durable membership rather than from raft's in-flight
+    /// progress tracker: this is the configuration the cluster has *agreed* on,
+    /// which is what choosing a transferee requires.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Raft`] if the storage cannot report its state.
+    pub fn voter_ids(&self) -> Result<Vec<RaftId>, NodeError<T>> {
+        let state = self
+            .raw
+            .store()
+            .initial_state()
+            .map_err(NodeError::Raft)?;
+        Ok(state.conf_state.get_voters().to_vec())
     }
 
     /// Issue a quorum-confirmed ReadIndex read (propsol §5.4).

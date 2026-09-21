@@ -36,7 +36,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::client::ArachneError;
 use crate::runtime::Command;
 use crate::state_machine::KvStateMachine;
-use crate::{NodeId, ProfileConfig};
+use crate::{NodeId, ProfileConfig, RaftId};
+use raft::eraftpb::ConfChangeType;
 
 /// The maximum number of client-side redirects (propsol §3.3: "default 3").
 const MAX_REDIRECTS: u32 = 3;
@@ -155,33 +156,90 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no).await
     }
 
-    /// **Test-only** (feature `fault-injection`): propose a single-step
-    /// membership change on this handle's own node, without redirects.
+    /// Add `node_id` to the cluster as a **learner** (propsol §5.3).
     ///
-    /// The public `add_learner`/`promote_learner`/`remove_member` surface (with
-    /// its `ConfChangePending` single-flight gate) is S2; the routing tests need
-    /// to drive a ConfChange through the real actor before that exists. Like
+    /// A learner receives the log but does not vote, so adding one cannot
+    /// affect quorum. Promotion is a separate, explicit step: promote only once
+    /// the learner has caught up (S3 enforces the lag gate).
+    ///
+    /// At most one membership change may be outstanding; a second one is
+    /// rejected with [`ArachneError::ConfChangePending`]. Ordinary writes are
+    /// unaffected.
+    pub async fn add_learner(&self, node_id: RaftId) -> Result<(), ArachneError> {
+        self.conf_change(ConfChangeType::AddLearnerNode, node_id)
+            .await
+    }
+
+    /// Promote a learner to a voting member (propsol §5.3).
+    ///
+    /// See [`Handle::add_learner`] for the single-flight rule.
+    pub async fn promote_learner(&self, node_id: RaftId) -> Result<(), ArachneError> {
+        self.conf_change(ConfChangeType::AddNode, node_id).await
+    }
+
+    /// Remove a member (propsol §5.3).
+    ///
+    /// Removing the **current leader** is a two-step sequence and is performed
+    /// here automatically: leadership is handed to another voter first, and the
+    /// removal is then proposed by the new leader — after the transfer the node
+    /// being removed is no longer able to propose anything, so this composition
+    /// is necessarily client-side. If the transfer fails (no quorum, nobody to
+    /// hand over to) the removal fails with that error and **nothing is
+    /// proposed**: removing a leader without quorum is by design not possible.
+    pub async fn remove_member(&self, node_id: RaftId) -> Result<(), ArachneError> {
+        match self.conf_change(ConfChangeType::RemoveNode, node_id).await {
+            Err(ArachneError::LeaderRemovalRequiresTransfer) => {
+                self.hand_over_leadership().await?;
+                self.conf_change(ConfChangeType::RemoveNode, node_id).await
+            }
+            other => other,
+        }
+    }
+
+    /// Hand leadership to `node_id` (propsol §5.3; Q3 makes this public).
+    ///
+    /// Resolves once the leadership has **actually moved**, not when raft
+    /// accepts the request: a node that acknowledged a transfer it never
+    /// completed would be reporting progress it did not make.
+    pub async fn transfer_leader(&self, node_id: RaftId) -> Result<(), ArachneError> {
+        self.request_with_redirect(Request::TransferLeader {
+            target: Some(node_id),
+        })
+        .await
+    }
+
+    /// Hand leadership to any other voter (propsol §5.3 hard constraint 3).
+    async fn hand_over_leadership(&self) -> Result<(), ArachneError> {
+        self.request_with_redirect(Request::TransferLeader { target: None })
+            .await
+    }
+
+    /// Propose one membership change, following leader hints.
+    async fn conf_change(
+        &self,
+        change_type: ConfChangeType,
+        node_id: RaftId,
+    ) -> Result<(), ArachneError> {
+        self.request_with_redirect(Request::ConfChange {
+            change_type,
+            node_id,
+        })
+        .await
+    }
+
+    /// **Test-only** (feature `fault-injection`): propose a single-step
+    /// membership change, going through the real redirect loop.
+    ///
+    /// Kept so M3's routing and gate tests can drive changes at a level below
+    /// the public API (e.g. to fire one while another is in flight). Like
     /// [`Handle::propose_raw`] this is deliberately not part of the API.
     #[cfg(feature = "fault-injection")]
     pub async fn propose_conf_change_raw(
         &self,
-        change_type: raft::eraftpb::ConfChangeType,
-        node_id: crate::RaftId,
+        change_type: ConfChangeType,
+        node_id: RaftId,
     ) -> Result<(), ArachneError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.inner
-            .tx
-            .send(Command::ConfChange {
-                change_type,
-                node_id,
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| ArachneError::ShuttingDown)?;
-        let deadline = Instant::now() + self.inner.timeout;
-        // The ack carries its own result (the actor may reject the change), so
-        // flatten: a dropped sender still maps to `ShuttingDown`.
-        self.await_oneshot(ack_rx, deadline).await?
+        self.conf_change(change_type, node_id).await
     }
 
     /// Linearizable delete (propsol §2.1). See [`Handle::put`].
@@ -254,6 +312,21 @@ impl Handle {
         client_id: u64,
         seq_no: u64,
     ) -> Result<(), ArachneError> {
+        self.request_with_redirect(Request::Propose {
+            cmd,
+            client_id,
+            seq_no,
+        })
+        .await
+    }
+
+    /// Send `req` to the leader, following hints, under one deadline.
+    ///
+    /// Writes and membership changes differ only in which command they put on
+    /// the actor's channel, so they share this loop: a follower answers
+    /// `NotLeader{hint}` for both, and both must not treat an unreachable peer
+    /// as "this node is shutting down".
+    async fn request_with_redirect(&self, req: Request) -> Result<(), ArachneError> {
         let deadline = Instant::now() + self.inner.timeout;
         let order = self.target_order();
         let mut pos = 0usize;
@@ -261,10 +334,7 @@ impl Handle {
         let mut unreachable_peers = 0u32;
         loop {
             let target = order[pos].clone();
-            let result = match self
-                .send_propose(&target, &cmd, client_id, seq_no, deadline)
-                .await
-            {
+            let result = match self.send_request(&target, &req, deadline).await {
                 Ok(result) => result,
                 // A *peer* that no longer accepts requests is a node that went
                 // away, not this client's node shutting down: keep looking, and
@@ -393,29 +463,66 @@ impl Handle {
 
     // ---- transport to the runtime actor ------------------------------------
 
-    async fn send_propose(
+    /// Put one request on one target's actor channel.
+    ///
+    /// The outer error is a transport/deadline failure of *this* client; the
+    /// inner one is the target's verdict (which may be `NotLeader{hint}`, the
+    /// signal the redirect loop follows).
+    async fn send_request(
         &self,
         target: &NodeId,
-        cmd: &[u8],
-        client_id: u64,
-        seq_no: u64,
+        req: &Request,
         deadline: Instant,
     ) -> Result<Result<(), ArachneError>, ArachneError> {
         let Some(handle) = self.handle_for(target) else {
             return Err(ArachneError::QuorumUnavailable);
         };
         let (ack_tx, ack_rx) = oneshot::channel();
-        handle
-            .inner
-            .tx
-            .send(Command::Propose {
-                cmd: cmd.to_vec(),
+        match req {
+            Request::Propose {
+                cmd,
                 client_id,
                 seq_no,
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| ArachneError::ShuttingDown)?;
+            } => {
+                handle
+                    .inner
+                    .tx
+                    .send(Command::Propose {
+                        cmd: cmd.clone(),
+                        client_id: *client_id,
+                        seq_no: *seq_no,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| ArachneError::ShuttingDown)?;
+            }
+            Request::ConfChange {
+                change_type,
+                node_id,
+            } => {
+                handle
+                    .inner
+                    .tx
+                    .send(Command::ConfChange {
+                        change_type: *change_type,
+                        node_id: *node_id,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| ArachneError::ShuttingDown)?;
+            }
+            Request::TransferLeader { target: to } => {
+                handle
+                    .inner
+                    .tx
+                    .send(Command::TransferLeader {
+                        target: *to,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| ArachneError::ShuttingDown)?;
+            }
+        }
         self.await_oneshot(ack_rx, deadline).await
     }
 
@@ -483,6 +590,28 @@ impl Handle {
         }
         Ok(())
     }
+}
+
+/// A request the redirect loop can carry to whichever node is the leader.
+///
+/// Writes and membership changes share one loop because they share one
+/// contract: the leader accepts, a follower answers `NotLeader{hint}`, and the
+/// caller's deadline covers the whole chase (propsol §3.3).
+#[derive(Clone)]
+enum Request {
+    Propose {
+        cmd: Vec<u8>,
+        client_id: u64,
+        seq_no: u64,
+    },
+    ConfChange {
+        change_type: ConfChangeType,
+        node_id: RaftId,
+    },
+    /// `None` = any other voter (used by the automatic leader removal).
+    TransferLeader {
+        target: Option<RaftId>,
+    },
 }
 
 struct HandleInner {

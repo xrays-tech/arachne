@@ -84,6 +84,18 @@ pub enum Command {
         /// Reply channel.
         ack: oneshot::Sender<Result<(), ArachneError>>,
     },
+    /// Move leadership to another voter (propsol §5.3; Q3 public API).
+    ///
+    /// `target: None` means "any other voter", which is what the automatic
+    /// leader removal needs: the client asking for the removal does not know
+    /// (and should not have to know) who else is in the configuration.
+    /// Replies when the leadership has **actually moved**.
+    TransferLeader {
+        /// The intended new leader, or `None` for any other voter.
+        target: Option<RaftId>,
+        /// Reply channel.
+        ack: oneshot::Sender<Result<(), ArachneError>>,
+    },
     /// Propose a command and reply once it is committed and applied.
     Propose {
         /// The encoded state-machine command.
@@ -234,6 +246,16 @@ struct PendingConf {
     deadline: Instant,
     /// The log index carrying this change, once the actor has seen the entry.
     index: Option<LogIndex>,
+}
+
+/// A leadership transfer awaiting its outcome (propsol v0.2.16 rev S).
+///
+/// `RawNode::transfer_leader` only sends a message: the reply has to wait for
+/// the leadership to actually move, which the actor observes from raft.
+struct PendingTransfer {
+    target: RaftId,
+    ack: Option<oneshot::Sender<Result<(), ArachneError>>>,
+    deadline: Instant,
 }
 
 /// Requests the actor sends to the apply task, in order.
@@ -471,6 +493,8 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     committed_queue: VecDeque<CommittedEntry>,
     /// Membership changes awaiting commit + apply (rev S S1b).
     pending_conf: Vec<PendingConf>,
+    /// Leadership transfers awaiting their outcome (rev S S2).
+    pending_transfer: Vec<PendingTransfer>,
     /// Linearizable reads awaiting quorum confirmation / apply (propsol §5.4).
     pending_reads: Vec<PendingRead>,
     /// Wait timeout for a ReadIndex round / apply window (`2 × election_timeout`).
@@ -630,6 +654,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             pending: Vec::new(),
             committed_queue: VecDeque::new(),
             pending_conf: Vec::new(),
+            pending_transfer: Vec::new(),
             pending_reads: Vec::new(),
             read_index_timeout: Duration::from_millis(
                 config.profile.read_index_timeout_ms.max(1),
@@ -768,6 +793,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         }
 
+        self.resolve_transfers();
         self.resolve_reads();
         self.reply_pendings();
         self.maybe_collect_sessions();
@@ -1247,6 +1273,36 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }
                 }
             }
+            Command::TransferLeader { target, ack } => {
+                if self.node.leader_id() != self.raft_id {
+                    let _ = ack.send(Err(ArachneError::NotLeader {
+                        leader_hint: self.hint(),
+                    }));
+                    return;
+                }
+                // Another transfer is already in flight: report it rather than
+                // queueing a second campaign.
+                if !self.pending_transfer.is_empty() {
+                    let _ = ack.send(Err(ArachneError::ConfChangePending));
+                    return;
+                }
+                let target = match target {
+                    Some(target) => target,
+                    None => match self.choose_transferee() {
+                        Ok(target) => target,
+                        Err(e) => {
+                            let _ = ack.send(Err(e));
+                            return;
+                        }
+                    },
+                };
+                self.node.transfer_leader(target);
+                self.pending_transfer.push(PendingTransfer {
+                    target,
+                    ack: Some(ack),
+                    deadline: Instant::now() + self.propose_timeout,
+                });
+            }
             Command::ConfChange {
                 change_type,
                 node_id,
@@ -1258,9 +1314,21 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }));
                     return;
                 }
-                // A proposal that is accepted is answered when the change is
-                // applied (or by the timeout sweep); at most one is in flight
-                // until S2 adds the `ConfChangePending` gate on the public API.
+                // Hard constraint 3 (propsol §5.3): a leader is never removed
+                // directly. The transfer cannot be done *here* either — once
+                // leadership moves, this node can no longer propose — so the
+                // caller is told to drive the two-step sequence, and
+                // `Handle::remove_member` does exactly that.
+                if change_type == ConfChangeType::RemoveNode && node_id == self.raft_id {
+                    let _ = ack.send(Err(ArachneError::LeaderRemovalRequiresTransfer));
+                    return;
+                }
+                // Hard constraint 1: at most one outstanding membership change.
+                // Ordinary writes are a different command and are unaffected.
+                if !self.pending_conf.is_empty() {
+                    let _ = ack.send(Err(ArachneError::ConfChangePending));
+                    return;
+                }
                 match self.node.propose_conf_change(change_type, node_id) {
                     Ok(()) => self.pending_conf.push(PendingConf {
                         change_type,
@@ -1368,6 +1436,62 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         self.pending = still;
     }
 
+    /// Pick a voter to hand leadership to, excluding this node (rev S).
+    ///
+    /// The lowest id wins so the choice is deterministic and testable.
+    /// `LeaderRemovalRequiresTransfer` is the right rejection when there is
+    /// nowhere to go: removing the only voter would leave an empty
+    /// configuration, which raft cannot represent.
+    fn choose_transferee(&self) -> Result<RaftId, ArachneError> {
+        let voters = self
+            .node
+            .voter_ids()
+            .map_err(|e| ArachneError::Unrecoverable(format!("reading the voter set failed: {e}")))?;
+        voters
+            .into_iter()
+            .filter(|v| *v != self.raft_id)
+            .min()
+            .ok_or(ArachneError::LeaderRemovalRequiresTransfer)
+    }
+
+    /// Resolve pending leadership transfers (rev S S2).
+    ///
+    /// Success is the leadership *actually* moving to the target — raft
+    /// accepting the transfer message proves nothing. A leadership that landed
+    /// on a third node, or a timeout, is a failure. A brief `None` (the old
+    /// leader has stepped down but has not yet learned the new one) is not a
+    /// verdict: it waits for the deadline.
+    fn resolve_transfers(&mut self) {
+        let now = Instant::now();
+        let leader = self.node.leader_id();
+        // Read the hint before draining: `self.hint()` needs `&self`, which the
+        // drain borrow rules out for the rest of the loop.
+        let hint = self.hint();
+        let mut still = Vec::with_capacity(self.pending_transfer.len());
+        for mut t in self.pending_transfer.drain(..) {
+            if leader == t.target {
+                if let Some(ack) = t.ack.take() {
+                    let _ = ack.send(Ok(()));
+                }
+            } else if leader != 0 && leader != self.raft_id && leader != t.target {
+                // Leadership went somewhere else entirely (0 means "not known
+                // yet", which is why it is not a verdict here).
+                if let Some(ack) = t.ack.take() {
+                    let _ = ack.send(Err(ArachneError::NotLeader {
+                        leader_hint: hint.clone(),
+                    }));
+                }
+            } else if now >= t.deadline {
+                if let Some(ack) = t.ack.take() {
+                    let _ = ack.send(Err(ArachneError::Timeout));
+                }
+            } else {
+                still.push(t);
+            }
+        }
+        self.pending_transfer = still;
+    }
+
     /// Resolve pending ReadIndex reads (propsol §5.4 steps 3–4).
     ///
     /// For each pending read:
@@ -1441,6 +1565,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     fn fail_all_pending(&mut self, message: &str) {
         for mut p in self.pending_conf.drain(..) {
             if let Some(ack) = p.ack.take() {
+                let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
+            }
+        }
+        for mut t in self.pending_transfer.drain(..) {
+            if let Some(ack) = t.ack.take() {
                 let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
             }
         }
