@@ -164,6 +164,10 @@ const READ_QUEUE_DEPTH: usize = MAX_PENDING_READS;
 /// write work, so a read flood cannot starve apply.
 const READ_BURST: usize = 64;
 
+/// The snapshot duration budget (propsol §8.2 Q4): creating a snapshot blocks
+/// apply, so a longer one is a capacity signal worth warning about.
+const SNAPSHOT_DURATION_BUDGET_MS: u64 = 1_000;
+
 /// How many already-queued events the actor folds into one durability cycle.
 ///
 /// Every cycle costs two real `fsync`s — the entries, then the commit
@@ -397,6 +401,8 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     /// Byte bound on committed-but-unapplied work (Q7 `proposal_queue_bytes`).
     proposal_queue_bytes: u64,
     metrics: Arc<Metrics>,
+    /// Where the Q4 snapshot-budget warning goes.
+    logger: Logger,
     raft_id: RaftId,
     self_node: NodeId,
     /// `node id -> raft id`, for tagging inbound messages.
@@ -533,6 +539,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             sent_bytes_total: 0,
             proposal_queue_bytes: config.profile.proposal_queue_bytes,
             metrics: config.metrics,
+            logger: logger.clone(),
             raft_id: config.self_raft_id,
             self_node: config.self_node_id,
             node_to_raft,
@@ -893,6 +900,20 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             return false;
         }
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        // Q4 budget alarm (propsol §8.2): snapshot creation blocks apply, so
+        // exceeding the budget is the signal that motivated the double-buffer
+        // revisit in v1.1.
+        if elapsed_ms > SNAPSHOT_DURATION_BUDGET_MS {
+            self.metrics.inc_snapshot_slow();
+            slog::warn!(
+                self.logger,
+                "snapshot creation exceeded its budget";
+                "duration_ms" => elapsed_ms,
+                "index" => index,
+                "size_bytes" => size_bytes,
+                "budget_ms" => SNAPSHOT_DURATION_BUDGET_MS,
+            );
+        }
         self.snapshot_index = index;
         self.applied_bytes_at_snapshot = self.applied_bytes_total;
         self.metrics.set_snapshot_last(elapsed_ms, size_bytes);

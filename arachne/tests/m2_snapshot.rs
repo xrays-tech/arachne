@@ -352,6 +352,11 @@ async fn catch_up_scenario(offloaded: bool) {
         nodes[leader].metrics.snapshot_last_duration_ms() < 1_000,
         "Q4 budget: snapshot creation must stay well inside its 1s alarm"
     );
+    assert_eq!(
+        nodes[leader].metrics.snapshot_slow_total(),
+        0,
+        "and the alarm counter must not fire spuriously"
+    );
 
     // The compaction this test depends on: the leader's log no longer starts at
     // the entry carrying `k0`.

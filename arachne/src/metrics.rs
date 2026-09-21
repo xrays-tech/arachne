@@ -42,6 +42,9 @@ pub struct Metrics {
     /// Proposals rejected with `Busy` because the apply backlog was over the
     /// byte bound (propsol v0.2.11 N).
     proposal_busy_total: AtomicU64,
+    /// Local snapshots that exceeded their duration budget (propsol §8.2 Q4:
+    /// `> 1s` warns — snapshot creation blocks apply).
+    snapshot_slow_total: AtomicU64,
 }
 
 impl Metrics {
@@ -141,6 +144,16 @@ impl Metrics {
     /// Proposals rejected with `Busy` by apply backpressure.
     pub fn proposal_busy_total(&self) -> u64 {
         self.proposal_busy_total.load(Ordering::Relaxed)
+    }
+
+    /// Count a local snapshot that blew its duration budget (§8.2).
+    pub fn inc_snapshot_slow(&self) {
+        self.snapshot_slow_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Local snapshots that exceeded their duration budget.
+    pub fn snapshot_slow_total(&self) -> u64 {
+        self.snapshot_slow_total.load(Ordering::Relaxed)
     }
 
     /// The on-disk WAL size in bytes.
@@ -296,6 +309,12 @@ impl Metrics {
             "Proposals rejected with Busy because the apply backlog was too deep.",
             self.proposal_busy_total.load(Ordering::Relaxed),
         );
+        counter(
+            &mut out,
+            "arachne_snapshot_slow_total",
+            "Local snapshots that exceeded the 1s budget (they block apply).",
+            self.snapshot_slow_total.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -353,6 +372,7 @@ mod tests {
         m.inc_snapshots_installed();
         m.set_apply_backlog(7, 2048);
         m.inc_proposal_busy();
+        m.inc_snapshot_slow();
         let text = m.render();
         for name in [
             "arachne_term",
@@ -371,6 +391,7 @@ mod tests {
             "arachne_apply_lag",
             "arachne_apply_backlog_bytes",
             "arachne_proposal_busy_total",
+            "arachne_snapshot_slow_total",
         ] {
             assert!(text.contains(name), "missing {name}");
         }
@@ -392,6 +413,8 @@ mod tests {
         assert!(text.contains("arachne_apply_lag 7"));
         assert!(text.contains("arachne_apply_backlog_bytes 2048"));
         assert!(text.contains("arachne_proposal_busy_total 1"));
+        assert!(text.contains("# TYPE arachne_snapshot_slow_total counter"));
+        assert!(text.contains("arachne_snapshot_slow_total 1"));
         assert_eq!(m.apply_lag(), 7);
         assert_eq!(m.apply_backlog_bytes(), 2048);
         assert_eq!(m.proposal_busy_total(), 1);

@@ -286,6 +286,16 @@ rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉�
 - 单测 2 项（窗口压住水位且保留 ≥ 窗口；窗口 0 与旧行为一致）+ 端到端 `m2_trailing_keep`：在**全员在册**时写够让 leader 真的删掉最旧段（断言最旧段文件名 > 1），再让一个 follower 掉线并只写**少于窗口**的量，重启后必须由日志补上（`snapshots_installed_total == 0`）；**反向对照**：窗口设 0 时同场景失败（`installed == 1`），证明测试非空洞。
 - 这轮全量：workspace **377 passed / 0 failed**，l2 全绿，三个门禁 PASS。
 
+### 1.14 收尾：快照预算告警、CI 单飞项目腐化、fuzz 任务
+
+- **Q4 快照预算告警落地**（propsol §8.2）：`Runtime::poll_snapshot` 在测完时长后，`> 1s` 即 `slog::warn!`（带 duration/index/size/budget）+ `snapshot_slow_total` 计数器（新增指标，已在 `/metrics` 渲染）。此前只有 `snapshot_last_duration_ms` 这个 gauge，没有任何告警路径。测试：指标渲染/计数单测 + `m2_snapshot` 里"正常快照**不**触发告警"的负向断言（避免误报）。正路径要造 >1s 的快照得靠 L4 慢盘，未做，如实记录。
+- **发现并修掉一类系统性腐化：单飞（非 workspace）项目没人建**。追查失败的定时 CI 时发现：
+  1. **fuzz 任务从未装 protoc 3.x**（另两个 job 都装了）→ `raft-proto` 的 build script 直接 panic（`Option::unwrap() on None`），**在构建阶段就死**，压根没跑到 fuzzer；所以定时任务一直红在 job 设置上。
+  2. **fuzz target 本身编译不过**：它用结构体字面量造 `Meta`，而 v0.2.10 M 给 `Meta` 加了 `snapshot_index`/`snapshot_term` → 漏改。已补两个 0 字段。
+  3. **`model-check/Cargo.lock` 缺 5 个包**，`cargo build --locked` 直接拒绝。
+- **防复发**：PR 门禁新增一步 **Build standalone projects (fuzz, model-check)**，两者都用 `--locked` 构建——这类漂移以后在 PR 上就红，而不是等到夜间定时任务。验证：手动 `gh workflow run ci.yml` 触发全量，三个 job（Build & test / **Fuzz (wal_recovery)** / L2）**全绿**。
+- 本轮全量：workspace **377 passed / 0 failed**，三个门禁 PASS。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
