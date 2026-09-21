@@ -435,6 +435,16 @@ async fn s10_a_duplicate_can_only_take_effect_after_the_grace_window() {
 
     // Just inside the grace window: refused, and nothing reaches the log.
     clock.advance(TTL_MS + GRACE_MS / 2);
+    // The applied gauge is published once per actor cycle, so it can still show
+    // the value from *before* the first write's apply. Let it catch up: this
+    // assertion is about the retry not proposing, not about gauge lag (a loaded
+    // CI runner made it flap).
+    for _ in 0..200 {
+        if metrics.applied_index() > 0 {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+    }
     let applied_before = metrics.applied_index();
     match handle
         .propose_raw(
