@@ -38,6 +38,12 @@ use crate::storage::WalStorage;
 /// A `raft::storage::Storage` adapter over an `arachne_seam::Storage`.
 pub struct RaftStorage<S: SeamStorage> {
     inner: S,
+    /// Whether snapshots are transferred by streaming their bytes separately
+    /// (propsol rev T). When set, [`snapshot`](RaftStorageTrait::snapshot)
+    /// answers with **metadata only** and the runtime streams the bytes from
+    /// the peer: a snapshot is far larger than the 8 MiB gRPC message cap, so
+    /// handing it to raft as one message could never be transferred.
+    streamed_snapshots: bool,
     /// Static initial cluster configuration used when the durable store has no
     /// persisted `ConfState` (M0: membership is static; ConfChange lands M3).
     /// Without a voter set containing this node, raft has no quorum and can
@@ -74,6 +80,7 @@ impl<S: SeamStorage> RaftStorage<S> {
         Self {
             inner,
             bootstrap_conf_state: SeamConfState::default(),
+            streamed_snapshots: false,
         }
     }
 
@@ -84,7 +91,25 @@ impl<S: SeamStorage> RaftStorage<S> {
         Self {
             inner,
             bootstrap_conf_state,
+            streamed_snapshots: false,
         }
+    }
+
+    /// Transfer snapshots by streaming their bytes (propsol rev T).
+    ///
+    /// Off by default: with the flag off, `snapshot()` hands raft the whole
+    /// snapshot exactly as it did before streaming existed, which is what every
+    /// in-process transport wants (it delivers the bytes inside the message,
+    /// with no message-size cap) and what keeps the behaviour of existing
+    /// clusters unchanged.
+    pub fn streamed_snapshots(mut self, streamed: bool) -> Self {
+        self.streamed_snapshots = streamed;
+        self
+    }
+
+    /// Whether snapshots are streamed rather than carried in the raft message.
+    pub fn streams_snapshots(&self) -> bool {
+        self.streamed_snapshots
     }
 
     // ---- write side (drives persistence from the `RaftNode`) ----
@@ -305,7 +330,19 @@ impl<S: SeamStorage> RaftStorageTrait for RaftStorage<S> {
 
     fn snapshot(&self, _request_index: u64, _to: u64) -> RaftResult<Snapshot> {
         match self.inner.snapshot().map_err(map_error)? {
-            Some(snap) => Ok(Self::to_raft_snapshot(&snap)),
+            Some(mut snap) => {
+                if self.streamed_snapshots {
+                    // Metadata only: raft still decides *that* this follower
+                    // needs a snapshot (and which one), but the bytes travel
+                    // over the streaming RPC instead of inside the message — a
+                    // snapshot is tens of megabytes and the gRPC message cap is
+                    // 8 MiB, so the whole-message route cannot carry it at all
+                    // (propsol rev T). `len`/CRC are re-derived on the receiving
+                    // side from the file itself.
+                    snap.data.clear();
+                }
+                Ok(Self::to_raft_snapshot(&snap))
+            }
             // No snapshot available: tell raft to retry later. A single-node
             // cluster never reaches this path (no lagging follower to send a
             // snapshot to).
@@ -346,10 +383,14 @@ mod tests {
 
     /// A small in-memory seam storage double that can be pre-populated and
     /// optionally forced to report a specific error. Test-only.
+    #[derive(Clone)]
     struct Double {
         entries: Vec<LogEntry>,
         hard_state: SeamHardState,
         conf_state: SeamConfState,
+        /// The snapshot this store reports, if any (rev T: the adapter decides
+        /// whether raft may see its bytes).
+        snapshot: Option<SeamSnapshot>,
         /// When set, reads of the matching kind return this error.
         forced: Option<ForcedError>,
     }
@@ -387,6 +428,7 @@ mod tests {
                 entries: Vec::new(),
                 hard_state: SeamHardState::default(),
                 conf_state: SeamConfState::default(),
+                snapshot: None,
                 forced: None,
             }
         }
@@ -463,7 +505,7 @@ mod tests {
         }
 
         fn snapshot(&self) -> Result<Option<SeamSnapshot>, SeamStorageError> {
-            Ok(None)
+            Ok(self.snapshot.clone())
         }
 
         fn append(&mut self, entries: &[LogEntry]) -> Result<(), SeamStorageError> {
@@ -496,6 +538,55 @@ mod tests {
 
     /// Round-trip: append seam entries, read them back through the raft trait,
     /// and confirm the fields survive the conversion.
+    #[test]
+    fn a_streamed_snapshot_hands_raft_metadata_only() {
+        // rev T: the whole point of the streaming path is that raft never
+        // carries the bytes. If this regressed, a snapshot larger than the
+        // transport's message cap would be untransferable again — and worse, a
+        // metadata-only follower would install an empty state machine.
+        let mut store = Double::new();
+        store.snapshot = Some(SeamSnapshot {
+            meta: SeamSnapshotMeta {
+                index: 12,
+                term: 3,
+                conf_state: SeamConfState {
+                    voters: vec![1, 2, 3],
+                    learners: vec![],
+                },
+            },
+            data: b"the whole state machine".to_vec(),
+        });
+
+        // Without streaming, raft gets everything (the pre-rev-T behaviour).
+        let adapter = RaftStorage::with_conf_state(store.clone(), SeamConfState::default());
+        assert!(!adapter.streams_snapshots());
+        let full = RaftStorageTrait::snapshot(&adapter, 0, 2).expect("a snapshot exists");
+        assert_eq!(
+            full.get_data(),
+            b"the whole state machine",
+            "the in-message route must still carry the bytes"
+        );
+
+        // With streaming, the same snapshot is metadata only — and the
+        // metadata (index, term, membership) is intact, because raft still
+        // decides *which* snapshot the follower needs.
+        let adapter = RaftStorage::with_conf_state(store, SeamConfState::default())
+            .streamed_snapshots(true);
+        assert!(adapter.streams_snapshots());
+        let meta = RaftStorageTrait::snapshot(&adapter, 0, 2).expect("a snapshot exists");
+        assert!(
+            meta.get_data().is_empty(),
+            "a streamed snapshot must not put its bytes in the raft message"
+        );
+        assert_eq!(meta.get_metadata().get_index(), 12);
+        assert_eq!(meta.get_metadata().get_term(), 3);
+        assert_eq!(
+            meta.get_metadata().get_conf_state().get_voters(),
+            &[1, 2, 3],
+            "membership travels with the metadata: the follower needs it before it can fetch"
+        );
+    }
+
     #[test]
     fn entry_round_trip_through_raft_view() {
         let mut inner = Double::new();

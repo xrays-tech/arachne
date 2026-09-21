@@ -449,7 +449,15 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
   **实现中发现的坑**：`send` 用的缓存 channel 带**按请求超时**（默认 5s），限速下的几十 MB 快照合法地远超它 ⇒ 会掐断健康传输；因此快照走**自己的连接**（保留 connect timeout/keep-alive、不设按请求超时），也不污染发送路径的缓存。
   测试：`the_transport_streams_a_snapshot_into_a_file`（经 trait 拉 2×256 KiB+77B → 文件逐字节相同；未知快照报 "no such snapshot"）+ 反向对照 `the_in_memory_transport_does_not_stream_snapshots`（进程内传输必须答"不支持"且不创建文件）。
 - 验证：workspace **406 passed / 0 failed**、`--features fault-injection` **422 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS；T1 的 CI run（35621219877）**success**。
-- **T2/T3 待做**：元数据快照（`RaftStorage::snapshot()` 返回无 data 版本）+ 运行时编排（收到元数据快照 → 拉取 → 聚合落盘 → `install_snapshot` → `report_snapshot`）+ `Transport::fetch_snapshot` 默认实现 + **真实 tonic 三节点回归**（把 gRPC 上限调到 64 KiB，让单消息路线必失败、流式路线追上）；T3 流中断恢复。
+- **T2a 落地（leader 侧 + node 侧接口，休眠能力）**：
+  - `RaftStorage::streamed_snapshots(bool)`：打开时 `snapshot()` 只交元数据（清空 data，保留 index/term/ConfState）——raft 仍然决定"哪个 follower 需要哪份快照"，只是字节改走流式 RPC。默认关。
+  - `RaftNodeConfig.streamed_snapshots` + `RaftNode` 侧：`on_message` 记录 `MsgSnapshot` 的**来源**（raft 从 `Ready` 交出的快照不带 sender，而拉取需要知道向谁要），经 `StepOutcome.snapshot_from` 透出；新增 `report_snapshot` / `install_local_snapshot` / `fetch_snapshot`（raft id → transport NodeId 的映射留在 node 内）；`submit_ready` 在流式模式下**不安装**元数据快照——否则会用空状态机替换日志 ✗（这是本设计最容易死人的地方）。
+  - 测试：`a_streamed_snapshot_hands_raft_metadata_only`（关 = 消息带全量字节；开 = data 为空但 index/term/成员表完好）。
+  - **当前没有任何生产路径打开这个开关**（`Runtime` 还没按 `transport.supports_snapshot_streaming()` 设置它），所以线上行为与之前逐字节相同 ✓ 分期落地（同 rev P 的 P1/P2/P3 先例）。
+- 验证：workspace **407 passed / 0 failed**、`--features fault-injection` **423 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS。
+- **T2b 待做（下一步）**：`Runtime` 持 transport 克隆（需 `T: Clone`：`TonicTransport` 已是，`InMemoryTx` 补 derive）+ 按能力设 flag；actor 收到元数据快照 → **spawn 拉取**（不能 await，几十 MB 会卡住 tick/心跳/读）→ 结果回 actor → 读文件 `decode_snapshot`（CRC = I9）→ `install_local_snapshot` → 复用既有 `enqueue_apply(Some(完整快照), 暂存条目)` → `report_snapshot(from, true)`；期间该 cycle 与后续 cycle 的 committed 条目**暂存**（快照必须先 restore 才能 apply 其后的条目）。测试：进程内三节点 + 给 `InMemoryTransportFactory` 注册"快照字节来源"（按 `(from,index,term)` 读 leader 数据目录的快照文件）⇒ 与 tonic 相同的运行时路径；**真实 tonic 三节点回归**（gRPC 上限压到 64 KiB 让单消息路线必失败）列为验收项。
+- **T3 待做**：流中断恢复（§9"快照传输中断后恢复"）。
+- 早期计划（已被上面取代）：元数据快照（`RaftStorage::snapshot()` 返回无 data 版本）+ 运行时编排（收到元数据快照 → 拉取 → 聚合落盘 → `install_snapshot` → `report_snapshot`）+ `Transport::fetch_snapshot` 默认实现 + **真实 tonic 三节点回归**（把 gRPC 上限调到 64 KiB，让单消息路线必失败、流式路线追上）；T3 流中断恢复。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。

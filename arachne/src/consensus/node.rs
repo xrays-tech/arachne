@@ -98,6 +98,13 @@ pub struct RaftNodeConfig {
     /// those two facts are conflated, and the existing members would bootstrap
     /// a configuration the rest of the cluster never agreed to.
     pub bootstrap_voters: Option<Vec<RaftId>>,
+    /// Transfer snapshots by streaming their bytes (propsol rev T).
+    ///
+    /// Set from the transport's own capability: a transport that carries the
+    /// snapshot inside the raft message (every in-process one) must leave this
+    /// off, and one with a message-size cap that a snapshot cannot fit through
+    /// (tonic, rev T) must turn it on.
+    pub streamed_snapshots: bool,
     /// Start this node as a **learner** of the peers it was given, rather than
     /// as a voter (propsol §5.3 hard constraint 2, rev S S5).
     ///
@@ -121,6 +128,7 @@ impl Default for RaftNodeConfig {
             max_inflight_msgs: 256,
             bootstrap_voters: None,
             join_as_learner: false,
+            streamed_snapshots: false,
         }
     }
 }
@@ -148,6 +156,7 @@ impl RaftNodeConfig {
             // An operator sets these two directly on the node config.
             bootstrap_voters: None,
             join_as_learner: false,
+            streamed_snapshots: false,
         }
     }
 }
@@ -189,6 +198,8 @@ struct PendingPersist {
     read_states: Vec<(Vec<u8>, LogIndex)>,
     /// An installed snapshot this cycle carried.
     snapshot: Option<SeamSnapshot>,
+    /// The peer a streamed snapshot must be fetched from (rev T).
+    snapshot_from: Option<RaftId>,
 }
 
 /// A committed log entry on its way out of [`RaftNode::step`]:
@@ -217,7 +228,14 @@ pub struct StepOutcome {
     /// A snapshot this node installed during the cycle (it arrived from the
     /// leader). The caller **must** restore the state machine from
     /// `snapshot.data` before applying `committed`.
+    ///
+    /// In streamed mode (rev T) `data` is **empty**: the snapshot's bytes are
+    /// not here, and the caller must fetch them from [`Self::snapshot_from`]
+    /// before anything can be applied.
     pub snapshot: Option<SeamSnapshot>,
+    /// The peer a streamed snapshot must be fetched from (rev T). `None` when
+    /// there is no snapshot, or when the snapshot arrived complete.
+    pub snapshot_from: Option<RaftId>,
     /// Quorum-confirmed ReadIndex results `(request_ctx, read_index)`.
     pub read_states: Vec<(Vec<u8>, LogIndex)>,
 }
@@ -304,6 +322,11 @@ where
     /// Raft id → transport `NodeId` for outbound resolution. Peers not present
     /// here are not yet part of this node's membership and are skipped.
     peers: HashMap<RaftId, NodeId>,
+    /// The peer a snapshot in flight arrived from (rev T). raft hands a
+    /// snapshot out of `Ready` without its sender; the runtime needs the peer id
+    /// to stream the bytes from it, so it is recorded when the message is
+    /// stepped and consumed by the `Ready` that carries the snapshot.
+    snapshot_from: Option<RaftId>,
     /// Outbound raft messages dropped because their transport `send` failed.
     /// A failed send is non-fatal (raft retransmits on a later tick), so it is
     /// counted — not surfaced — making a permanently dead transport visible as
@@ -428,7 +451,8 @@ where
             move || durability.notify_one()
         }));
 
-        let store = RaftStorage::with_conf_state(storage, bootstrap);
+        let store = RaftStorage::with_conf_state(storage, bootstrap)
+            .streamed_snapshots(config.streamed_snapshots);
         let raw = RawNode::new(&raft_config, store, logger).map_err(NodeError::Raft)?;
 
         Ok(Self {
@@ -438,6 +462,7 @@ where
             pending: VecDeque::new(),
             durability,
             peers,
+            snapshot_from: None,
             dropped_sends: 0,
         })
     }
@@ -531,6 +556,7 @@ where
         } else {
             Some(RaftStorage::<S>::from_raft_snapshot(ready.snapshot()))
         };
+        let snapshot_present = snapshot.is_some();
         let entries: Vec<LogEntry> = ready
             .entries()
             .iter()
@@ -540,7 +566,16 @@ where
 
         // A snapshot is a separate file and stays synchronous: it is rare, and
         // it is what lets the log below it be released (propsol §5.5.4).
-        if let Some(snapshot) = &snapshot {
+        //
+        // In streamed mode (rev T) the `Ready` carries **metadata only**, so
+        // there is nothing to install here: installing it would replace the log
+        // with an empty state machine. The runtime fetches the bytes from the
+        // sender, installs them through `install_local_snapshot`, and reports
+        // the outcome to raft.
+        let streamed_snapshot = self.raw.mut_store().streams_snapshots();
+        if let Some(snapshot) = &snapshot
+            && !streamed_snapshot
+        {
             self.raw
                 .mut_store()
                 .install_snapshot(snapshot)
@@ -578,6 +613,13 @@ where
             committed,
             read_states,
             snapshot,
+            // Consumed here: the sender belongs to the snapshot this cycle
+            // carries, and the next snapshot message sets it again.
+            snapshot_from: if snapshot_present {
+                self.snapshot_from.take()
+            } else {
+                None
+            },
         });
         Ok(())
     }
@@ -646,6 +688,7 @@ where
         Ok(Some(StepOutcome {
             committed,
             snapshot: pending.snapshot.take(),
+            snapshot_from: pending.snapshot_from,
             read_states: pending.read_states,
         }))
     }
@@ -835,6 +878,12 @@ where
             .merge_from_bytes(&bytes)
             .map_err(|e| NodeError::Codec(e.to_string()))?;
         raft_msg.set_from(from);
+        // Remember who sent a snapshot: raft hands the snapshot out of `Ready`
+        // without its sender, and the runtime needs the peer's id to stream the
+        // bytes from it (rev T).
+        if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
+            self.snapshot_from = Some(from);
+        }
         self.raw.step(raft_msg).map_err(NodeError::Raft)
     }
 
@@ -909,6 +958,71 @@ where
         store.save_snapshot(&snapshot).map_err(NodeError::Raft)?;
         store.compact(index).map_err(NodeError::Raft)?;
         Ok(())
+    }
+
+    /// Whether this node streams snapshots instead of carrying them in the raft
+    /// message (rev T).
+    pub fn streams_snapshots(&self) -> bool {
+        self.raw.store().streams_snapshots()
+    }
+
+    /// Stream the snapshot at `(index, term)` from `from` into `dest`.
+    ///
+    /// `Ok(None)` means the transport cannot stream (rev T's default): the
+    /// caller must treat the snapshot as untransferable rather than empty.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Transport`] if the peer is unknown to this node's transport
+    /// or the stream fails.
+    pub async fn fetch_snapshot(
+        &self,
+        from: RaftId,
+        index: u64,
+        term: u64,
+        dest: &std::path::Path,
+    ) -> Result<Option<u64>, NodeError<T>> {
+        let Some(node_id) = self.peers.get(&from).cloned() else {
+            return Err(NodeError::Codec(format!(
+                "snapshot fetch from raft id {from}, which is not in this node's peers"
+            )));
+        };
+        self.transport
+            .fetch_snapshot(node_id, index, term, dest)
+            .await
+            .map_err(NodeError::Transport)
+    }
+
+    /// Install a snapshot this node fetched and verified itself (rev T).
+    ///
+    /// The durable side of an install that did not arrive through `Ready`: it
+    /// writes the snapshot file and replaces the log, exactly as the in-`Ready`
+    /// path does. The *state machine* restore is the caller's, because only it
+    /// owns the apply task.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Raft`] if the storage refuses the snapshot (for instance
+    /// because it is older than the local watermark).
+    pub fn install_local_snapshot(&mut self, snapshot: &SeamSnapshot) -> Result<(), NodeError<T>> {
+        self.raw
+            .mut_store()
+            .install_snapshot(snapshot)
+            .map_err(NodeError::Raft)
+    }
+
+    /// Tell raft how a streamed snapshot transfer ended (rev T).
+    ///
+    /// Until this arrives the leader keeps the follower in `Snapshot` state and
+    /// sends it nothing else; `false` makes raft treat the follower as
+    /// unreachable and retry, which is how a failed transfer recovers.
+    pub fn report_snapshot(&mut self, to: RaftId, ok: bool) {
+        let status = if ok {
+            raft::SnapshotStatus::Finish
+        } else {
+            raft::SnapshotStatus::Failure
+        };
+        self.raw.report_snapshot(to, status);
     }
 
     /// The membership configuration the cluster has agreed on, learners

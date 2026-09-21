@@ -347,7 +347,14 @@ M3 的最后一块（验收 ①②③⑥）。先记录**两个已存在的缺�
 - **T2（运行时）**：`RaftStorage::snapshot()` 在"对端支持流式"时只返回元数据；runtime 收到无 data 的快照消息 → `RaftNode::request_snapshot` 已有的是**发起方**能力，follower 侧要新增"收到元数据快照 → 拉取 → 聚合 → `install_snapshot` → `report_snapshot`"的编排；快照请求与 apply 的排队沿用 §5.5.4 的"同序入队"（快照请求不得抢在已提交条目之前 apply）。验证：**真实 tonic 三节点**、把 gRPC 上限调到 64 KiB、让状态机数据超过它 → 单消息路线必失败、流式路线追上（这正是把 8 MiB 缺口钉成回归测试）。
 - **T3（中断恢复）**：流中途断开 → 丢弃 tmp、report failure、重试后追上；并把 §9 的"快照传输中断后恢复"场景补进 L2/L3。
 
-**本 rev 状态**：**T1 已落地**（传输层 RPC + 令牌桶 + 3 项集成测试）；**T2/T3 待做**（元数据快照 + 运行时编排 + 真实 tonic 三节点回归；中断恢复）。这是 M2/M3 收尾清单上的最后一项。
+**本 rev 状态**：**T1 ✓ / T1b ✓ / T2a ✓**（传输层 RPC + 令牌桶 + follower 侧拉取；**leader 侧元数据快照与 node 侧接口**）；**T2b 待做**——把 follower 编排接上并**打开开关**：
+- `Runtime` 持一份 transport 克隆（因此需要 `T: Clone`；`TonicTransport` 已是 Clone，`InMemoryTx` 需补 derive），按 `transport.supports_snapshot_streaming()` 设 `RaftNodeConfig.streamed_snapshots`（**当前没有人打开它**，所以 T2a 是休眠能力、线上行为与之前逐字节相同 ✓ 分期落地的既有先例见 rev P 的 P1/P2/P3）。
+- actor 收到"元数据快照 + `snapshot_from`"→ **spawn 拉取任务**（不能 await：几十 MB 的传输会卡住 tick/读/心跳），结果经一条新通道回到 actor；期间该 cycle 携带的 committed 条目与后续 cycle 的条目一律**暂存**（快照必须先进 SM 才能 apply 其后的条目）。
+- 拉取完成 → 读文件 `decode_snapshot`（CRC 即 I9）→ `install_local_snapshot` → 复用既有 `enqueue_apply(Some(完整快照), 暂存条目)`（安装记账、覆盖语义、SM restore 全在既有路径里）→ `report_snapshot(from, true)`；失败则 `report_snapshot(from, false)`（raft 把该 follower 转回 probe 并重试）并丢弃 tmp。
+- 测试：进程内三节点 + 给 `InMemoryTransportFactory` 注册"快照字节来源"（按 `(from, index, term)` 读 leader 数据目录里的快照文件）⇒ 打开开关后走**与 tonic 相同的运行时路径**；T1/T1b 的传输层测试已覆盖真实 gRPC 流。**真实 tonic 三节点回归**（把 gRPC 上限压到 64 KiB 让单消息路线必失败）仍列为 T2b 的验收项。
+- **T3 待做**：流中断恢复（§9 场景矩阵"快照传输中断后恢复"）。
+
+T2a 已落地的部分：`RaftStorage::streamed_snapshots(bool)` + 元数据快照（`snapshot()` 清空 data，保留 index/term/ConfState——raft 仍决定"要哪份快照"）；`RaftNodeConfig.streamed_snapshots`；`RaftNode` 记录 `MsgSnapshot` 的来源（raft 从 `Ready` 交出的快照不带 sender）并经 `StepOutcome.snapshot_from` 透出；`report_snapshot` / `install_local_snapshot` / `fetch_snapshot`（raft id → transport NodeId 的映射在 node 内）；`submit_ready` 在流式模式下**不安装**元数据快照（否则会用空状态机替换日志）。测试：`a_streamed_snapshot_hands_raft_metadata_only`（开/关两态都断言：关 = 消息里带全量字节，开 = data 为空但 index/term/成员表完好）。
 
 ## 1. 目标与非目标
 
