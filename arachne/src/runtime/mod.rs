@@ -1927,6 +1927,18 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         let hs = self.node.hard_state();
         self.metrics.set_term(hs.term);
         self.metrics.set_commit_index(hs.commit);
+        // How far the worst peer trails this node's commit index. On a follower
+        // raft tracks no peer progress, so this is 0 there; on a leader it is
+        // the number an operator acts on when a follower is not keeping up
+        // (propsol §5.2 asks for this alarm).
+        let worst_lag = self
+            .raft_to_node
+            .keys()
+            .filter_map(|peer| self.node.peer_progress(*peer))
+            .map(|(_, _, matched, _, _, _)| hs.commit.saturating_sub(matched))
+            .max()
+            .unwrap_or(0);
+        self.metrics.set_follower_lag_entries(worst_lag);
         self.metrics.set_applied_index(self.applied_index);
         self.metrics.set_apply_backlog(
             hs.commit.saturating_sub(self.applied_index),

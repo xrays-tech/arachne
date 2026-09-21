@@ -37,6 +37,11 @@ pub struct Metrics {
     snapshots_installed_total: AtomicU64,
     /// Entries committed but not yet applied (the apply task's backlog).
     apply_lag: AtomicU64,
+    /// How far the *worst* follower lags behind this leader's commit index, in
+    /// entries (propsol §5.2's `follower_lag_bytes`, in entries: the WAL keeps no
+    /// index→offset map, the same deviation the promotion gate documents).
+    /// 0 on a follower, and 0 on a leader whose peers are all caught up.
+    follower_lag_entries: AtomicU64,
     /// Bytes committed but not yet applied (the backpressure signal, Q7).
     apply_backlog_bytes: AtomicU64,
     /// Proposals rejected with `Busy` because the apply backlog was over the
@@ -126,6 +131,16 @@ impl Metrics {
     pub fn set_apply_backlog(&self, entries: u64, bytes: u64) {
         self.apply_lag.store(entries, Ordering::Relaxed);
         self.apply_backlog_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Record the worst follower's lag behind this node's commit index.
+    pub fn set_follower_lag_entries(&self, entries: u64) {
+        self.follower_lag_entries.store(entries, Ordering::Relaxed);
+    }
+
+    /// The worst follower's lag in entries (0 when none is behind).
+    pub fn follower_lag_entries(&self) -> u64 {
+        self.follower_lag_entries.load(Ordering::Relaxed)
     }
 
     /// Increment the counter of proposals rejected by apply backpressure.
@@ -310,6 +325,12 @@ impl Metrics {
         );
         gauge(
             &mut out,
+            "arachne_follower_lag_entries",
+            "Worst follower lag behind this node's commit index, in entries (propsol §5.2).",
+            self.follower_lag_entries.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
             "arachne_apply_lag",
             "Entries committed but not yet applied to the state machine.",
             self.apply_lag.load(Ordering::Relaxed),
@@ -394,6 +415,7 @@ mod tests {
         m.inc_snapshots_installed();
         m.inc_snapshots_installed();
         m.set_apply_backlog(7, 2048);
+        m.set_follower_lag_entries(5);
         m.inc_proposal_busy();
         m.inc_snapshot_slow();
         let text = m.render();
@@ -434,11 +456,14 @@ mod tests {
         assert!(text.contains("# TYPE arachne_snapshots_created_total counter"));
         assert!(text.contains("arachne_snapshots_created_total 1"));
         assert!(text.contains("arachne_snapshots_installed_total 2"));
+        assert!(text.contains("# TYPE arachne_follower_lag_entries gauge"));
+        assert!(text.contains("arachne_follower_lag_entries 5"));
         assert!(text.contains("arachne_apply_lag 7"));
         assert!(text.contains("arachne_apply_backlog_bytes 2048"));
         assert!(text.contains("arachne_proposal_busy_total 1"));
         assert!(text.contains("# TYPE arachne_snapshot_slow_total counter"));
         assert!(text.contains("arachne_snapshot_slow_total 1"));
+        assert_eq!(m.follower_lag_entries(), 5);
         assert_eq!(m.apply_lag(), 7);
         assert_eq!(m.apply_backlog_bytes(), 2048);
         assert_eq!(m.proposal_busy_total(), 1);

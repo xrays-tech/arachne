@@ -497,6 +497,16 @@ async fn catch_up_scenario_inner(offloaded: bool, streaming: bool, fail_first: u
             "the snapshot must have travelled over the streaming path"
         );
     }
+    // The leader's follower-lag gauge is wired (propsol §5.2). It is *not*
+    // asserted to be exactly 0: a follower legitimately trails by the entries
+    // still in flight, so only a large number would mean someone is behind. The
+    // victim was hundreds of entries behind while it was down, so this pins the
+    // gauge against the catch-up that just happened.
+    assert!(
+        nodes[leader].metrics.follower_lag_entries() < 100,
+        "a caught-up cluster must report a small follower lag, got {}",
+        nodes[leader].metrics.follower_lag_entries()
+    );
     assert!(
         !snapshot_files(&nodes[victim].dir).is_empty(),
         "the installed snapshot must be durable on the follower"
