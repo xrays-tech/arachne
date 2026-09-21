@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use arachne_seam::storage::{
-    HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
+    ConfState, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
 };
 use arachne_seam::types::{LogIndex, Term};
 
@@ -49,6 +49,8 @@ pub enum OpKind {
     SetHardState,
     SyncEntries,
     Compact,
+    /// Durably recording membership after a ConfChange was applied.
+    SaveConfState,
     InitialState,
     Entries,
     Term,
@@ -227,6 +229,21 @@ impl<S: Storage> Storage for FaultyStorage<S> {
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError> {
         self.log_op(OpKind::Compact);
         self.inner.compact(compact_to)
+    }
+
+    fn save_conf_state(
+        &mut self,
+        conf_change_index: LogIndex,
+        conf_state: &ConfState,
+    ) -> Result<(), StorageError> {
+        // Delegated, not defaulted: a silent no-op here would make the
+        // crash-between-apply-and-persist tests vacuously pass.
+        self.log_op(OpKind::SaveConfState);
+        self.inner.save_conf_state(conf_change_index, conf_state)
+    }
+
+    fn conf_change_index(&self) -> LogIndex {
+        self.inner.conf_change_index()
     }
 }
 

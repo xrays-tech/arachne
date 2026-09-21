@@ -221,6 +221,20 @@ pub fn decode_entry(payload: &[u8]) -> Result<(u64, u64, u8, Vec<u8>), DecodeErr
     Ok((index, term, entry_type, data))
 }
 
+/// Read a little-endian `u32` from `buf` at the given offset.
+///
+/// Returns [`DecodeError::TooShort`] if the buffer is too short.
+#[inline(always)]
+fn le32_at(buf: &[u8], offset: usize) -> Result<u32, DecodeError> {
+    let end = offset.checked_add(4).ok_or(DecodeError::TooShort)?;
+    if buf.len() < end {
+        return Err(DecodeError::TooShort);
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[offset..end]);
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// Read a little-endian `u64` from `buf` at the given offset.
 ///
 /// Returns [`DecodeError::TooShort`] if the buffer is too short.
@@ -278,6 +292,62 @@ pub fn decode_hard_state(payload: &[u8]) -> Result<(u64, Option<u64>, u64), Deco
     };
     let commit = le64_at(payload, 17)?;
     Ok((term, vote, commit))
+}
+
+/// Encode a membership payload: the durable `ConfState` plus the log index of
+/// the ConfChange entry that produced it (propsol v0.2.16 rev S).
+///
+/// Used by the membership file, not by a WAL record type.
+///
+/// Layout: `[u64 conf_change_index][u32 voters_len][u64 voters…]
+/// [u32 learners_len][u64 learners…]`. The member tables are byte-identical to
+/// the snapshot's, so recovery can share the reader.
+pub fn encode_conf_state(conf_change_index: u64, voters: &[u64], learners: &[u64]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + 8 * (voters.len() + learners.len()));
+    buf.extend_from_slice(&conf_change_index.to_le_bytes());
+    buf.extend_from_slice(&(voters.len() as u32).to_le_bytes());
+    for v in voters {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf.extend_from_slice(&(learners.len() as u32).to_le_bytes());
+    for l in learners {
+        buf.extend_from_slice(&l.to_le_bytes());
+    }
+    buf
+}
+
+/// Read a length-prefixed `u64` id list starting at `offset`.
+///
+/// Returns the ids and the offset just past the list.
+///
+/// # Errors
+///
+/// [`DecodeError::TooShort`] if the buffer ends before the list does. A `len`
+/// that is implausible for the remaining bytes is reported the same way: the
+/// caller treats any malformed payload as corruption, so a distinct variant
+/// would not change its behaviour.
+fn read_id_list(payload: &[u8], offset: usize) -> Result<(Vec<u64>, usize), DecodeError> {
+    let len = le32_at(payload, offset)? as usize;
+    let mut cursor = offset + 4;
+    let mut ids = Vec::with_capacity(len.min(1024));
+    for _ in 0..len {
+        ids.push(le64_at(payload, cursor)?);
+        cursor += 8;
+    }
+    Ok((ids, cursor))
+}
+
+/// Decode a membership payload (the inverse of [`encode_conf_state`]).
+///
+/// # Errors
+///
+/// [`DecodeError::TooShort`] if the payload is truncated or its declared list
+/// lengths exceed the remaining bytes.
+pub fn decode_conf_state(payload: &[u8]) -> Result<(u64, Vec<u64>, Vec<u64>), DecodeError> {
+    let conf_change_index = le64_at(payload, 0)?;
+    let (voters, cursor) = read_id_list(payload, 8)?;
+    let (learners, _) = read_id_list(payload, cursor)?;
+    Ok((conf_change_index, voters, learners))
 }
 
 #[cfg(test)]
@@ -535,5 +605,41 @@ mod tests {
             decode_hard_state(&[0u8; 24]),
             Err(DecodeError::TooShort)
         ));
+    }
+
+    #[test]
+    fn conf_state_round_trips() {
+        let payload = encode_conf_state(42, &[1, 2, 3], &[9]);
+        let (index, voters, learners) =
+            decode_conf_state(&payload).expect("a freshly encoded payload must decode");
+        assert_eq!(index, 42);
+        assert_eq!(voters, vec![1, 2, 3]);
+        assert_eq!(learners, vec![9]);
+
+        // Empty membership (e.g. the very first ConfChange is still a valid
+        // set) must round-trip too rather than decode as a truncated payload.
+        let empty = encode_conf_state(0, &[], &[]);
+        let (index, voters, learners) =
+            decode_conf_state(&empty).expect("empty member tables must decode");
+        assert_eq!((index, voters.len(), learners.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn decode_conf_state_rejects_truncated_payloads() {
+        let payload = encode_conf_state(7, &[1, 2], &[3]);
+        // Every proper prefix is either a short header or claims more ids than
+        // remain; both must be a hard decode error, never a silent short read.
+        for cut in 0..payload.len() {
+            assert!(
+                matches!(
+                    decode_conf_state(&payload[..cut]),
+                    Err(DecodeError::TooShort)
+                ),
+                "truncating to {cut} bytes must be rejected"
+            );
+        }
+        // Trailing bytes are ignored (the member table is the last field), but
+        // that must not be mistaken for success on a truncated prefix.
+        assert!(decode_conf_state(&payload).is_ok());
     }
 }

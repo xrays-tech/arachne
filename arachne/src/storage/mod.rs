@@ -8,6 +8,8 @@
 //!   encode/decode functions.
 //! * [`segment`] — segment file naming, append, and read.
 //! * [`meta`] — the cluster/node identity META file with atomic write.
+//! * [`membership`] — the durable `ConfState` a ConfChange produced, written
+//!   atomically (propsol v0.2.16 rev S).
 //! * [`snapshot`] — the on-disk snapshot file format (propsol §5.5.4).
 //! * [`crc32c`] — the CRC32C (Castagnoli) checksum used for record and META
 //!   integrity.
@@ -22,6 +24,7 @@
 
 mod crc32c;
 mod format;
+mod membership;
 mod meta;
 mod segment;
 pub mod snapshot;

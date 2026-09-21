@@ -55,8 +55,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arachne_seam::storage::{
-    FlushToken, FlushWaker, FsyncObserver, HardState, LogEntry, PersistSubmit, RaftState,
-    Snapshot, Storage, StorageError,
+    ConfState, FlushToken, FlushWaker, FsyncObserver, HardState, LogEntry, PersistSubmit,
+    RaftState, Snapshot, Storage, StorageError,
 };
 use arachne_seam::types::{LogIndex, Term};
 
@@ -64,6 +64,7 @@ use crate::storage::format::{
     decode_entry, decode_hard_state, decode_record, encode_entry, encode_hard_state,
     RecordType, MAX_RECORD_BYTES,
 };
+use crate::storage::membership::{read_membership, write_membership, MembershipError};
 use crate::storage::meta::{read_meta, write_meta, fsync_dir, Meta, FORMAT_VERSION};
 use crate::storage::snapshot::{
     decode_snapshot, encode_snapshot, parse_snapshot_file_name, snapshot_file_name,
@@ -263,6 +264,19 @@ pub struct WalStorage {
     meta: Meta,
     /// The current hard state.
     hard_state: HardState,
+    /// The durable membership configuration, mirrored from the `membership`
+    /// file when that file is newer than the snapshot (propsol v0.2.16 rev S).
+    ///
+    /// Empty when the store never applied a ConfChange **and** when the file is
+    /// only as new as the snapshot — in both cases
+    /// [`Storage::initial_state`] falls back to the snapshot's member table and
+    /// finally to the caller's bootstrap voter set.
+    conf_state: ConfState,
+    /// The index replay must resume *after* for ConfChange entries: the
+    /// membership file's index, or the snapshot index when that file is absent
+    /// or older (0 = neither). Entries at or below it are already reflected in
+    /// the membership the node started with.
+    conf_change_index: LogIndex,
     /// Whether there are unfsynced entries since the last real entry fsync.
     pending_entry_fsync: bool,
     /// The fsync policy.
@@ -468,6 +482,18 @@ impl WalStorage {
         // `active_first_index` through the global last.
         let max_entry_in_segment = entries.last().map(|e| e.index).unwrap_or(0);
 
+        // Membership durability (rev S, invariants I6/I7). The membership file
+        // is the seed replay starts from; it only wins when it is newer than the
+        // snapshot, whose member table is authoritative for everything at or
+        // below its index. With no usable file, `conf_change_index` becomes the
+        // snapshot index so replay treats everything above the snapshot as
+        // not-yet-applied and re-derives membership from the log.
+        let membership = read_membership(dir).map_err(membership_err_to_storage_err)?;
+        let (conf_change_index, conf_state) = match membership {
+            Some((index, cs)) if index > compacted_to => (index, cs),
+            _ => (compacted_to, ConfState::default()),
+        };
+
         Ok(Self {
             data_dir: dir.to_path_buf(),
             segment,
@@ -478,6 +504,8 @@ impl WalStorage {
             snapshot,
             meta,
             hard_state,
+            conf_state,
+            conf_change_index,
             pending_entry_fsync: false,
             fsync_policy: opts.config.fsync_policy,
             segment_bytes: opts.config.segment_bytes,
@@ -1302,19 +1330,48 @@ impl WalStorage {
 
 impl Storage for WalStorage {
     fn initial_state(&self) -> Result<RaftState, StorageError> {
-        // A snapshot carries the membership it was taken under, so a node that
-        // installed one (or restarted after doing so) recovers membership from
-        // it. Without a snapshot the durable membership log is still M3 work,
-        // and the caller falls back to the bootstrap voter set.
-        let conf_state = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.meta.conf_state.clone())
-            .unwrap_or_default();
+        // Membership comes from whichever durable source is newest: the
+        // `membership` file (written when a ConfChange was applied), or the
+        // member table of an installed/created snapshot. `open` already
+        // resolved that precedence into `conf_state` (invariant I7), so a
+        // non-empty set here is the answer; an empty one means the snapshot's
+        // table applies, and if there is none the raft adapter falls back to
+        // its bootstrap voter set (fresh store).
+        let conf_state = if self.conf_state.voters.is_empty() && self.conf_state.learners.is_empty()
+        {
+            self.snapshot
+                .as_ref()
+                .map(|s| s.meta.conf_state.clone())
+                .unwrap_or_default()
+        } else {
+            self.conf_state.clone()
+        };
         Ok(RaftState {
             hard_state: self.hard_state.clone(),
             conf_state,
         })
+    }
+
+    fn save_conf_state(
+        &mut self,
+        conf_change_index: LogIndex,
+        conf_state: &ConfState,
+    ) -> Result<(), StorageError> {
+        // Atomic replace, not a WAL record: appending a non-entry record after
+        // the committed entries would make a crash mid-write hit the
+        // commit-window fail-start rule (see the `membership` module docs).
+        write_membership(&self.data_dir, conf_change_index, conf_state)
+            .map_err(membership_err_to_storage_err)?;
+        // The rename is durable only once the directory entry is; that fsync is
+        // accounted for exactly like META's.
+        self.stats.dir_fsyncs += 1;
+        self.conf_change_index = conf_change_index;
+        self.conf_state = conf_state.clone();
+        Ok(())
+    }
+
+    fn conf_change_index(&self) -> LogIndex {
+        self.conf_change_index
     }
 
     fn entries(
@@ -1804,6 +1861,18 @@ fn segment_err_to_storage_err(e: crate::storage::segment::SegmentError) -> Stora
         other => StorageError::Unrecoverable {
             detail: format!("segment error: {other}"),
         },
+    }
+}
+
+/// Map a membership-file failure onto the storage error surface.
+///
+/// I/O failures stay I/O failures (the caller's judgement decides whether to
+/// retry); a present-but-corrupt file is damage and fails the start, matching
+/// how a corrupt WAL record is treated.
+fn membership_err_to_storage_err(e: MembershipError) -> StorageError {
+    match e {
+        MembershipError::Io(io_err) => StorageError::Io(io_err),
+        MembershipError::Corrupt(detail) => StorageError::Corruption { detail },
     }
 }
 
@@ -3505,6 +3574,156 @@ mod tests {
             other => {
                 panic!("expected a fail-stop on overwriting committed entries, got {other:?}")
             }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- rev S: durable membership (the membership file) --------------------
+
+    #[test]
+    fn conf_state_survives_reopen_and_is_absent_until_written() {
+        let dir = temp_dir();
+        let conf = ConfState {
+            voters: vec![1, 2, 3],
+            learners: vec![7],
+        };
+
+        let mut store = WalStorage::open(&dir, test_opts()).expect("open");
+        store.append(&[make_entry(1, 1, b"a")]).expect("append");
+        store.sync_entries().expect("sync");
+        // Negative control: with no membership file the raft adapter must fall
+        // back to its bootstrap voter set, not invent a configuration.
+        assert_eq!(store.conf_change_index(), 0);
+        assert!(store.initial_state().expect("state").conf_state.voters.is_empty());
+        drop(store);
+
+        let store = WalStorage::open(&dir, test_opts()).expect("reopen");
+        assert_eq!(store.conf_change_index(), 0);
+        assert!(store.initial_state().expect("state").conf_state.voters.is_empty());
+        drop(store);
+
+        let mut store = WalStorage::open(&dir, test_opts()).expect("reopen 2");
+        store
+            .save_conf_state(1, &conf)
+            .expect("membership must be writable");
+        drop(store);
+
+        // The write is synchronous (atomic replace + dir fsync), so a reopen
+        // immediately afterwards must already see it.
+        let store = WalStorage::open(&dir, test_opts()).expect("reopen 3");
+        let state = store.initial_state().expect("state");
+        assert_eq!(state.conf_state, conf);
+        assert_eq!(store.conf_change_index(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_membership_older_than_the_snapshot_is_ignored() {
+        let dir = temp_dir();
+        let stale = ConfState {
+            voters: vec![1, 2, 3, 4],
+            learners: vec![],
+        };
+        let mut store = WalStorage::open(&dir, test_opts()).expect("open");
+        store
+            .append(
+                &(1..=5)
+                    .map(|i| make_entry(i, 1, b"x"))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("append");
+        store.save_conf_state(2, &stale).expect("save stale");
+        assert_eq!(store.conf_change_index(), 2);
+        // A snapshot at 5 carries the authoritative membership up to 5.
+        store
+            .save_snapshot(&make_snapshot(5, 1, b"state"))
+            .expect("snapshot");
+        drop(store);
+
+        // Invariant I7: the snapshot's member table wins over the older file,
+        // and replay must resume above the snapshot index.
+        let store = WalStorage::open(&dir, test_opts()).expect("reopen");
+        let state = store.initial_state().expect("state");
+        assert_eq!(
+            state.conf_state,
+            ConfState {
+                voters: vec![1, 2, 3],
+                learners: vec![]
+            },
+            "the snapshot's member table must beat a stale membership file"
+        );
+        assert_eq!(store.conf_change_index(), 5);
+        drop(store);
+
+        // A membership newer than the snapshot wins again.
+        let live = ConfState {
+            voters: vec![1, 2],
+            learners: vec![3],
+        };
+        let mut store = WalStorage::open(&dir, test_opts()).expect("reopen 2");
+        store.save_conf_state(7, &live).expect("save live");
+        drop(store);
+        let store = WalStorage::open(&dir, test_opts()).expect("reopen 3");
+        assert_eq!(store.initial_state().expect("state").conf_state, live);
+        assert_eq!(store.conf_change_index(), 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conf_change_index_falls_back_to_the_snapshot_index() {
+        // With no membership file, everything the snapshot covers is already
+        // reflected in its member table, so replay starts above it.
+        let dir = temp_dir();
+        let mut store = WalStorage::open(&dir, test_opts()).expect("open");
+        store
+            .append(
+                &(1..=3)
+                    .map(|i| make_entry(i, 1, b"x"))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("append");
+        store
+            .save_snapshot(&make_snapshot(3, 1, b"state"))
+            .expect("snapshot");
+        drop(store);
+
+        let store = WalStorage::open(&dir, test_opts()).expect("reopen");
+        assert_eq!(store.conf_change_index(), 3);
+        assert_eq!(
+            store.initial_state().expect("state").conf_state,
+            ConfState {
+                voters: vec![1, 2, 3],
+                learners: vec![]
+            }
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_membership_file_fails_start() {
+        let dir = temp_dir();
+        let conf = ConfState {
+            voters: vec![1, 2, 3],
+            learners: vec![],
+        };
+        let mut store = WalStorage::open(&dir, test_opts()).expect("open");
+        store.save_conf_state(1, &conf).expect("save");
+        drop(store);
+
+        let path = dir.join("membership");
+        let mut bytes = fs::read(&path).expect("read membership");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, &bytes).expect("corrupt membership");
+
+        // A present-but-corrupt membership file is damage, not "absent": the
+        // node must not silently continue with an older configuration.
+        match WalStorage::open(&dir, test_opts()) {
+            Err(StorageError::Corruption { detail }) => {
+                assert!(detail.contains("crc"), "unexpected detail: {detail}");
+            }
+            Err(other) => panic!("expected Corruption, got {other:?}"),
+            Ok(_) => panic!("a corrupt membership file must fail the start"),
         }
         let _ = fs::remove_dir_all(&dir);
     }

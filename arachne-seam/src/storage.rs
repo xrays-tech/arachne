@@ -278,6 +278,38 @@ pub trait Storage: Send + 'static {
     /// compaction lands (M2).
     fn compact(&mut self, compact_to: LogIndex) -> Result<(), StorageError>;
 
+    /// Durably record the membership configuration produced by applying the
+    /// ConfChange entry at `conf_change_index` (propsol v0.2.16 rev S).
+    ///
+    /// **Invariant I6:** callers only invoke this *after* that entry is
+    /// durable, so a recovered membership is always a prefix of the applied
+    /// configuration history — never ahead of the log. Unlike
+    /// [`set_hard_state`](Storage::set_hard_state) this need not be an
+    /// immediate fsync: losing the record is recoverable, because replaying the
+    /// committed ConfChange entry rewrites it.
+    ///
+    /// The default is a no-op: in-memory doubles have no durability to
+    /// provide. Production storage overrides it.
+    fn save_conf_state(
+        &mut self,
+        conf_change_index: LogIndex,
+        conf_state: &ConfState,
+    ) -> Result<(), StorageError> {
+        let _ = (conf_change_index, conf_state);
+        Ok(())
+    }
+
+    /// The log index of the ConfChange entry that produced the [`ConfState`]
+    /// [`initial_state`](Storage::initial_state) now reports, or 0 when no
+    /// membership was ever persisted.
+    ///
+    /// Replay uses it to skip ConfChange entries already reflected in the
+    /// durable membership, which makes re-application idempotent by
+    /// construction instead of relying on upstream behaviour (rev S).
+    fn conf_change_index(&self) -> LogIndex {
+        0
+    }
+
     /// Persist one `Ready`'s records, entries first and then the optional hard
     /// state, in the order raft requires.
     ///
@@ -393,6 +425,8 @@ mod tests {
     struct MemStorage {
         entries: Vec<LogEntry>,
         hard_state: HardState,
+        conf_change_index: LogIndex,
+        conf_state: ConfState,
     }
 
     impl MemStorage {
@@ -400,6 +434,8 @@ mod tests {
             Self {
                 entries: Vec::new(),
                 hard_state: HardState::default(),
+                conf_change_index: 0,
+                conf_state: ConfState::default(),
             }
         }
 
@@ -424,7 +460,7 @@ mod tests {
         fn initial_state(&self) -> Result<RaftState, StorageError> {
             Ok(RaftState {
                 hard_state: self.hard_state.clone(),
-                conf_state: ConfState::default(),
+                conf_state: self.conf_state.clone(),
             })
         }
 
@@ -502,6 +538,20 @@ mod tests {
             // No-op in the P2 double; real compaction lands in M2.
             Ok(())
         }
+
+        fn save_conf_state(
+            &mut self,
+            conf_change_index: LogIndex,
+            conf_state: &ConfState,
+        ) -> Result<(), StorageError> {
+            self.conf_change_index = conf_change_index;
+            self.conf_state = conf_state.clone();
+            Ok(())
+        }
+
+        fn conf_change_index(&self) -> LogIndex {
+            self.conf_change_index
+        }
     }
 
     /// A store with entries at indices 1..=3 (terms 1,1,2; data "a","b","c").
@@ -514,6 +564,41 @@ mod tests {
         ])
         .expect("append to a fresh in-memory store must succeed");
         s
+    }
+
+    #[test]
+    fn saved_conf_state_is_reported_by_initial_state() {
+        // The trait contract rev S adds: what `save_conf_state` records is what
+        // `initial_state` reports, and `conf_change_index` is the matching log
+        // position. A double that kept these separate would let replay skip
+        // ConfChange entries that were never actually reflected.
+        let mut s = MemStorage::new();
+        assert_eq!(s.conf_change_index(), 0);
+        assert!(
+            s.initial_state()
+                .expect("fresh state")
+                .conf_state
+                .voters
+                .is_empty()
+        );
+
+        let conf = ConfState {
+            voters: vec![1, 2],
+            learners: vec![9],
+        };
+        s.save_conf_state(5, &conf).expect("save must succeed");
+        let state = s.initial_state().expect("state");
+        assert_eq!(state.conf_state, conf);
+        assert_eq!(s.conf_change_index(), 5);
+
+        // A later change supersedes the earlier one.
+        let newer = ConfState {
+            voters: vec![1],
+            learners: vec![],
+        };
+        s.save_conf_state(8, &newer).expect("save must succeed");
+        assert_eq!(s.initial_state().expect("state").conf_state, newer);
+        assert_eq!(s.conf_change_index(), 8);
     }
 
     #[test]
