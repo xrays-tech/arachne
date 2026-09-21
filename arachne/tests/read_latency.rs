@@ -163,7 +163,7 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
 
     let mut handles: Vec<Handle> = Vec::new();
     let mut metrics: Vec<Arc<Metrics>> = Vec::new();
-    let mut tasks = Vec::new();
+    let mut runtimes: Vec<arachne::RuntimeThread> = Vec::new();
     let mut dirs = Vec::new();
     for i in 1..=N {
         let dir = temp_dir(&format!("n{i}"));
@@ -191,7 +191,14 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
             metrics: Arc::clone(&m),
         };
         let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger()).expect("runtime");
-        tasks.push(tokio::spawn(runtime.run()));
+        // Production placement: the actor does blocking `fsync`s, so it runs on
+        // its own OS thread instead of a shared async worker (propsol v0.2.13 P
+        // / the dedicated-thread change).
+        runtimes.push(
+            runtime
+                .spawn_dedicated()
+                .expect("spawn the consensus thread"),
+        );
         handles.push(handle);
         metrics.push(m);
         dirs.push(dir);
@@ -344,10 +351,15 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
         "linearizable read p99 under a storm exceeded the absolute ceiling: {storm_p99}us"
     );
 
-    for task in tasks {
-        task.abort();
-    }
-    tokio::time::sleep(core::time::Duration::from_millis(100)).await;
+    // Dropping every client handle closes the command channels, which is what
+    // ends the actors. Their threads are detached rather than joined: a clone
+    // that outlives this point would make a join hang, and the process exits
+    // right after this test anyway. The short sleep lets the actors notice and
+    // release their WAL locks before the directories go away.
+    drop(leader_handle);
+    drop(handles);
+    drop(runtimes);
+    tokio::time::sleep(core::time::Duration::from_millis(200)).await;
     for dir in dirs {
         let _ = std::fs::remove_dir_all(dir);
     }

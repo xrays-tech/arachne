@@ -272,6 +272,8 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 
 **新增守卫**：`read_latency` 增加 **idle 门槛**（idle p99 ≤ 5ms）。这条守卫当天就抓到了第二个真问题：pipeline 下"空记录周期"会搭上更早周期的 flush（idle 6.7ms）——已在 `WalStorage::persist_ready_records` 修掉（只有本次真的写了记录才提交 flush；FIFO 已保证更早周期的负载在它被报告前已持久）。
 
+**顺带把延迟门槛改成生产放置**：`read_latency` 原先在 tokio runtime 上 `tokio::spawn(runtime.run())`，于是 4 个 worker 被 3 个 actor 的同步 `fsync`（本机每次 ~10ms）占住——**弱读 p99 因此在洪峰下是 9–14ms，测的其实是 worker 饥饿**。改用 `Runtime::spawn_dedicated()`（生产放置）并让清理只 drop 句柄 + 短睡（不 join，避免某个 `Handle` 克隆让 join 挂死）后：弱读 **225–438µs**、洪峰读 **35–36ms**（更稳）、写 37–47ms、idle 222–322µs，测试耗时不变。
+
 **对既有结论的反向影响**：此前所有基于内存传输的延迟/吞吐数字都被这个 tick 放大了，rev O / rev P 的数字应在修好的 harness 上重读。rev O 的批周期结论不变；rev P 的"设备是瓶颈、pipeline 不降 p99"在重测后也不变（修好 harness 后：同步 storm 33–70ms vs pipeline 50–56ms），但 pipeline 下"空闲读可能等一次在途 flush"这条已被记录并缓解。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
