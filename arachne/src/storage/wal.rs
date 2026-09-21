@@ -269,6 +269,10 @@ pub struct WalStorage {
     fsync_policy: FsyncPolicy,
     /// The segment rollover threshold.
     segment_bytes: u64,
+    /// How many bytes of log to keep **reachable** behind the compaction
+    /// watermark (propsol §7 `wal_trailing_keep`, Q6). 0 = compact everything the
+    /// snapshot covers.
+    trailing_keep_bytes: u64,
     /// Fsync/recovery counters.
     stats: StorageStats,
     /// Optional fsync observer (zero-overhead when `None`).
@@ -470,6 +474,7 @@ impl WalStorage {
             pending_entry_fsync: false,
             fsync_policy: opts.config.fsync_policy,
             segment_bytes: opts.config.segment_bytes,
+            trailing_keep_bytes: 0,
             stats,
             fsync_observer: opts.fsync_observer,
             offloaded: None,
@@ -989,6 +994,36 @@ impl WalStorage {
             file,
             segment_first_index: self.segment_first_index,
         })
+    }
+
+    /// Keep at least `bytes` of log reachable behind the compaction watermark
+    /// (propsol §7 `wal_trailing_keep`, Q6).
+    ///
+    /// `compact` deletes whole segments only while what remains still covers
+    /// this window, so a follower that lags by less than `bytes` can be caught
+    /// up from the log instead of paying for a snapshot transfer. The window is
+    /// a space/latency trade: the log grows by up to this much more before
+    /// compaction reclaims it.
+    pub fn set_trailing_keep_bytes(&mut self, bytes: u64) {
+        self.trailing_keep_bytes = bytes;
+    }
+
+    /// The trailing window currently configured.
+    pub fn trailing_keep_bytes(&self) -> u64 {
+        self.trailing_keep_bytes
+    }
+
+    /// Bytes held by the segments whose first index is at or above `from`.
+    fn retained_bytes_from(&self, indices: &[u64], from: LogIndex) -> Result<u64, StorageError> {
+        let mut total = 0u64;
+        for index in indices.iter().copied().filter(|index| *index >= from) {
+            match fs::metadata(segment_path(&self.data_dir, index)) {
+                Ok(meta) => total += meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Io(e)),
+            }
+        }
+        Ok(total)
     }
 
     /// Switch this WAL to **off-thread durability** (propsol v0.2.13 P).
@@ -1644,11 +1679,46 @@ impl Storage for WalStorage {
             }
         }
 
-        self.delete_segments_below(compact_to)?;
+        // Without a trailing window, release everything the snapshot covers:
+        // whole segments go, and the cache drops the rest eagerly (a segment's
+        // prefix is never rewritten — propsol v0.2.10 M).
+        if self.trailing_keep_bytes == 0 {
+            self.delete_segments_below(compact_to)?;
+            self.entries.retain(|e| e.index > compact_to);
+            self.compacted_to = compact_to;
+            return Ok(());
+        }
+
+        // With one, delete whole segments from the oldest only while what
+        // remains still covers the window (Q6). Entries behind the watermark
+        // are logically gone, so keeping bytes *below* it would help nobody —
+        // what a slow follower needs is for the watermark itself to stay back
+        // far enough that it can still be served from the log.
+        let indices = list_segment_indices(&self.data_dir).map_err(StorageError::Io)?;
+        let mut effective = self.compacted_to;
+        let mut removed = false;
+        for window in indices.windows(2) {
+            let (this, next) = (window[0], window[1]);
+            if next > compact_to + 1 {
+                break;
+            }
+            if this == self.segment_first_index {
+                continue;
+            }
+            if self.retained_bytes_from(&indices, next)? < self.trailing_keep_bytes {
+                break;
+            }
+            fs::remove_file(segment_path(&self.data_dir, this)).map_err(StorageError::Io)?;
+            removed = true;
+            effective = next - 1;
+        }
+        if removed {
+            fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
+        }
 
         // The snapshot covers everything at or below the watermark.
-        self.entries.retain(|e| e.index > compact_to);
-        self.compacted_to = compact_to;
+        self.entries.retain(|e| e.index > effective);
+        self.compacted_to = effective;
         Ok(())
     }
 }
@@ -2479,6 +2549,65 @@ mod tests {
         assert_eq!(snapshot.meta.index, 2);
         assert_eq!(snapshot.data, b"state@2");
         assert_eq!(snapshot_files(&dir), vec![2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_keep_holds_the_watermark_back() {
+        let dir = temp_dir();
+        // One entry per segment, so every segment boundary is a log index.
+        let opts = test_opts_with_segment_bytes(1);
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        for index in 1..=6 {
+            storage.append(&[make_entry(index, 1, b"x")]).unwrap();
+            storage.sync_entries().unwrap();
+        }
+        storage
+            .save_snapshot(&make_snapshot(5, 1, b"state@5"))
+            .unwrap();
+
+        // A window wider than a couple of segments: compaction must stop before
+        // the reachable log would fall below it.
+        storage.set_trailing_keep_bytes(100);
+        assert_eq!(storage.trailing_keep_bytes(), 100);
+        storage.compact(5).unwrap();
+
+        let first = storage.first_index().unwrap();
+        assert!(
+            first > 1,
+            "the oldest segments must still be reclaimed (first_index {first})"
+        );
+        assert!(
+            first <= 6,
+            "the watermark may never pass the requested point (first_index {first})"
+        );
+        assert!(
+            storage.log_bytes().unwrap() >= 100,
+            "the reachable log must still cover the trailing window ({} bytes)",
+            storage.log_bytes().unwrap()
+        );
+        // The retained window is actually servable.
+        let kept = storage.entries(first, 7, None).unwrap();
+        assert_eq!(kept.len() as u64, 6 - first + 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_keep_zero_compacts_everything_the_snapshot_covers() {
+        let dir = temp_dir();
+        let opts = test_opts_with_segment_bytes(1);
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        for index in 1..=6 {
+            storage.append(&[make_entry(index, 1, b"x")]).unwrap();
+            storage.sync_entries().unwrap();
+        }
+        storage
+            .save_snapshot(&make_snapshot(5, 1, b"state@5"))
+            .unwrap();
+        // Default: no trailing window, so everything the snapshot covers goes.
+        assert_eq!(storage.trailing_keep_bytes(), 0);
+        storage.compact(5).unwrap();
+        assert_eq!(storage.first_index().unwrap(), 6);
         let _ = fs::remove_dir_all(&dir);
     }
 

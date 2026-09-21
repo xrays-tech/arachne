@@ -102,7 +102,7 @@ impl Arachne {
         logger: &Logger,
     ) -> Result<Self, NodeError> {
         let profile = &config.profile_config;
-        let wal = WalStorage::open(
+        let mut wal = WalStorage::open(
             &config.data_dir,
             WalOptions {
                 cluster_id: config.cluster_id.clone(),
@@ -115,6 +115,9 @@ impl Arachne {
                 fsync_observer: None,
             },
         )?;
+        // Q6: keep enough log reachable that a follower trailing by less than
+        // this can be caught up from the log instead of a snapshot transfer.
+        wal.set_trailing_keep_bytes(profile.wal_trailing_keep_bytes);
 
         // The real tonic transport: one factory owns the cluster identity and
         // the `NodeId -> SocketAddr` map and mints this node's halves.

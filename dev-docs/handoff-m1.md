@@ -276,6 +276,16 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 
 **对既有结论的反向影响**：此前所有基于内存传输的延迟/吞吐数字都被这个 tick 放大了，rev O / rev P 的数字应在修好的 harness 上重读。rev O 的批周期结论不变；rev P 的"设备是瓶颈、pipeline 不降 p99"在重测后也不变（修好 harness 后：同步 storm 33–70ms vs pipeline 50–56ms），但 pipeline 下"空闲读可能等一次在途 flush"这条已被记录并缓解。
 
+### 1.13 `wal_trailing_keep` 接线（propsol v0.2.14 Q）——慢 follower 由日志追赶
+
+rev M 留下的"字节级 trailing 窗口"本轮接上，语义按 **Q 节**钉死：窗口**压住压缩水位**，而不是保留水位之下那些 raft 已经拿不到的字节。
+
+- `WalStorage::set_trailing_keep_bytes(bytes)`（inherent setter，默认 0 = 旧行为）+ `trailing_keep_bytes()`；`compact(to)` 只从最旧段删，且一旦"删后仍可达的日志 < 窗口"就停，`first_index` 因此停住。窗口 = 0 时走原来的 `delete_segments_below` 路径，既有测试逐字节不变。
+- node binary 从 `profile.wal_trailing_keep_bytes`（Lan 64MB / Wan 16MB）设置。
+- **顺带给 `RuntimeThread` 补了真正的停止**：原先 drop 只是 detach，actor 仍持有 WAL 与其目录锁（端到端测试里"停一个节点再重启"因此报 `data directory is locked`）。新增 `shutdown()`/`stop()`（`Notify` + `notify_one`，注意 `notify_waiters` 会丢掉"先发后等"的信号——第一版就踩了这个，shutdown 直接挂住）。
+- 单测 2 项（窗口压住水位且保留 ≥ 窗口；窗口 0 与旧行为一致）+ 端到端 `m2_trailing_keep`：在**全员在册**时写够让 leader 真的删掉最旧段（断言最旧段文件名 > 1），再让一个 follower 掉线并只写**少于窗口**的量，重启后必须由日志补上（`snapshots_installed_total == 0`）；**反向对照**：窗口设 0 时同场景失败（`installed == 1`），证明测试非空洞。
+- 这轮全量：workspace **377 passed / 0 failed**，l2 全绿，三个门禁 PASS。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

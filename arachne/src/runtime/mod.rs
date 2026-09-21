@@ -358,6 +358,8 @@ enum Outcome {
     Inbound(Option<(NodeId, TransportMessage)>),
     /// The apply task published new progress (or stopped).
     Progress(Result<(), watch::error::RecvError>),
+    /// The owner asked the actor to stop (`RuntimeThread::shutdown`).
+    Stop,
     /// A durable-storage flush completed (propsol v0.2.13 P). The completion
     /// itself is picked up by the next `drive_cycle`; this event is what wakes
     /// the actor instead of making it wait for a tick.
@@ -378,6 +380,9 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     progress: watch::Receiver<ApplyProgress>,
     /// Woken by the storage when an offloaded flush completes (propsol P).
     durability: Arc<tokio::sync::Notify>,
+    /// Fired by [`RuntimeThread::shutdown`] to stop the actor (and release its
+    /// storage) without waiting for a transport to close.
+    stop: Arc<tokio::sync::Notify>,
     /// A batch that did not fit the apply channel, retried next cycle. At most
     /// one, so a full channel cannot grow the actor's memory without bound.
     deferred: Option<ApplyBatch>,
@@ -512,6 +517,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
 
         let period = Duration::from_millis(config.profile.heartbeat_interval_ms.max(1));
         let durability = node.durability_notifier();
+        let stop = Arc::new(tokio::sync::Notify::new());
         let runtime = Self {
             node,
             apply_task: Some(apply_task),
@@ -519,6 +525,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             reads,
             progress,
             durability,
+            stop: Arc::clone(&stop),
             deferred: None,
             snapshot_wait: None,
             applied_index,
@@ -558,6 +565,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
         loop {
             let outcome = tokio::select! {
                 biased;
+                _ = self.stop.notified() => Outcome::Stop,
                 _ = self.tick.tick() => Outcome::Tick,
                 progress = self.progress.changed() => Outcome::Progress(progress),
                 _ = self.durability.notified() => Outcome::Durability,
@@ -565,6 +573,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 msg = self.node.rx().recv() => Outcome::Inbound(msg),
             };
             match outcome {
+                Outcome::Stop => break,
                 Outcome::Tick => self.node.tick(),
                 Outcome::Inbound(Some((from, msg))) => {
                     self.route_inbound(from, msg);
@@ -1137,11 +1146,31 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
 /// A [`Runtime`] running on its own OS thread.
 pub struct RuntimeThread {
     handle: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<tokio::sync::Notify>,
 }
 
 impl RuntimeThread {
+    /// Ask the actor to stop and wait for its thread to end.
+    ///
+    /// Dropping the handle only detaches; this is what releases the storage
+    /// (and its data-dir lock) without depending on a transport closing.
+    pub fn shutdown(mut self) {
+        // `notify_one` stores a permit, so a stop fired before the actor next
+        // polls its stop branch is not lost (`notify_waiters` would only wake
+        // waiters that already exist).
+        self.stop.notify_one();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Ask the actor to stop without waiting for it.
+    pub fn stop(&self) {
+        self.stop.notify_one();
+    }
+
     /// Wait for the actor to stop (it stops when its inbound stream and command
-    /// channel close, or on a fail-stop).
+    /// channel close, on a fail-stop, or after [`stop`](Self::stop)).
     pub fn join(mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -1184,6 +1213,7 @@ where
     /// for that).
     pub fn spawn_dedicated(self) -> Result<RuntimeThread, std::io::Error> {
         let name = format!("arachne-consensus-{}", self.self_node);
+        let stop = Arc::clone(&self.stop);
         let handle = std::thread::Builder::new().name(name).spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1198,6 +1228,7 @@ where
         })?;
         Ok(RuntimeThread {
             handle: Some(handle),
+            stop: Arc::clone(&stop),
         })
     }
 }
