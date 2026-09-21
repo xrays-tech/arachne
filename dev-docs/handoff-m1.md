@@ -423,6 +423,15 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - **M3 验收 ①②③④⑤⑥ 全部覆盖，ConfChange/Learner/会话幂等收尾完成**；剩余的是 M2 遗留的**快照传输分块与 `snapshot_transfer_rate_bps` 接线**（跨 crate，需传输 RPC）。
 - 验证：workspace 393/0、fault-injection 409/0（含新增 INV-4）、l2 3/0、四门禁全 PASS；S5a 的 CI run（35613202715）**success**。
 
+### 1.26 最后一块：快照流式传输（rev T 设计，待实现）
+
+**实测出来的硬缺口（本轮最有价值的一条）**：传输层默认把 gRPC 消息上限设为 **8 MiB**（`DEFAULT_MAX_MESSAGE_SIZE`，同时作用于 encode/decode，`arachne-transport-tonic/src/factory.rs:70`），而快照阈值是 **Lan 64 MiB / Wan 16 MiB**，且 raft 的 `max_size_per_msg` **只限制 AppendEntries 的条目批量**（`raft.rs:870` 只传给 `entries()`），**不限制快照消息**。所以：**大于 8 MiB 的快照在真实传输上发不出去** ⇒ "落后超过 `wal_trailing_keep` 的 follower 永远追不上"（可用性缺口，非安全性）。它**被所有既有测试掩盖**：快照追赶测试全跑在 in-memory 传输上，直接传 `Vec<u8>`、不经过 gRPC ✓。§5.5.4 早就把 v1 标成"单次 `Ready`（未分片），流式分片随传输层快照 RPC 落地"——就是这个缺口。
+
+- **设计（rev T）**：follower **主动拉**（raft 已有 `request_snapshot`/`pending_request_snapshot`/`report_snapshot` 三个现成钩子）；快照消息改为**只带元数据**（要求 `RaftStorage::snapshot()` 能返回无 data 的元数据快照，否则 raft 仍会塞满整份 data）；新 RPC **server-streaming** `FetchSnapshot`；**服务端令牌桶**限速（速率 = `snapshot_transfer_rate_bps`，0 = 不限，白名单里最后一项由此接线）；follower 侧**分块写 tmp → CRC → fsync → rename → 复用既有 `install_snapshot`**（内存占用与快照大小无关）；失败则丢 tmp + `report_snapshot(Failure)` + 下一轮重拉（v1 不做断点续传）。`Transport` trait 增 `fetch_snapshot` 且**带默认实现**（进程内/turmoil 传输零改动）。
+- 新不变量 **I9**（安装前必须 CRC 校验）/ **I10**（流式与单消息路径**安装结果逐字节一致**，故两条路径共用同一断言）。
+- **落地顺序**：**T1** proto + tonic 服务端流 + 令牌桶 + `Transport::fetch_snapshot` 默认实现（验证：分块拼接逐字节相同 + **限速可观测**，含 rate=0 反向对照）→ **T2** 运行时编排（元数据快照 → 拉取 → 聚合 → `install_snapshot` → `report_snapshot`）+ **真实 tonic 三节点**回归：把 gRPC 上限调到 64 KiB、让状态机数据超过它，单消息路线必失败、流式路线追上（把 8 MiB 缺口钉成回归测试）→ **T3** 流中断恢复（§9 场景矩阵里的"快照传输中断后恢复"）。
+- **状态**：设计已定（propsol rev T，v0.2.17），**代码待做**。这是 M2/M3 收尾清单上的最后一项。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
