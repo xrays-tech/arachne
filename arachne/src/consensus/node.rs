@@ -907,6 +907,9 @@ where
             .merge_from_bytes(&bytes)
             .map_err(|e| NodeError::Codec(e.to_string()))?;
         raft_msg.set_from(from);
+        if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapStatus {
+            eprintln!("[probe] node got MsgSnapshotStatus from={} reject={}", from, raft_msg.get_reject());
+        }
         if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
             // A metadata-only snapshot in streamed mode is held back: the
             // runtime fetches the bytes, installs them, and only then steps the
@@ -1079,7 +1082,7 @@ where
     /// Until this arrives the leader keeps the follower in `Snapshot` state and
     /// sends it nothing else; `false` makes raft treat the follower as
     /// unreachable and retry, which is how a failed transfer recovers.
-    pub fn report_snapshot(&mut self, to: RaftId, ok: bool) {
+    pub async fn report_snapshot(&mut self, to: RaftId, ok: bool) {
         let status = if ok {
             raft::SnapshotStatus::Finish
         } else {
@@ -1119,6 +1122,9 @@ where
     async fn deliver(&mut self, msg: &Message) {
         let self_id = self.raw.raft.id;
         let outcome = send_one(&self.transport, &self.peers, self_id, msg).await;
+        if msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapStatus {
+            eprintln!("[probe] sending MsgSnapStatus to={} ok={}", msg.get_to(), outcome.is_ok());
+        }
         if outcome.is_err() {
             self.dropped_sends += 1;
         }

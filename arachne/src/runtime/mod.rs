@@ -751,19 +751,19 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                 Outcome::Stop => break,
                 Outcome::Tick => self.node.tick(),
                 Outcome::Inbound(Some((from, msg))) => {
-                    self.route_inbound(from, msg);
+                    self.route_inbound(from, msg).await;
                     // Fold the rest of the burst in: one cycle then carries a
                     // bigger `Ready` and one flush can cover more work.
                     for _ in 1..CYCLE_BURST {
                         let next = self.node.rx().try_recv();
                         match next {
-                            Some((from, msg)) => self.route_inbound(from, msg),
+                            Some((from, msg)) => self.route_inbound(from, msg).await,
                             None => break,
                         }
                     }
                 }
                 Outcome::Inbound(None) => break,
-                Outcome::SnapshotFetched(Some(done)) => self.finish_snapshot_fetch(done),
+                Outcome::SnapshotFetched(Some(done)) => self.finish_snapshot_fetch(done).await,
                 // The fetch channel is only closed when the runtime is going
                 // away; there is nothing to finish.
                 Outcome::SnapshotFetched(None) => {}
@@ -1754,14 +1754,14 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
     }
 
     /// Tag an inbound peer message with its raft id and hand it to raft.
-    fn route_inbound(&mut self, from: NodeId, msg: TransportMessage) {
+    async fn route_inbound(&mut self, from: NodeId, msg: TransportMessage) {
         if let Some(id) = self.node_to_raft.get(from.as_str()).copied() {
             let _ = self.node.on_message(id, msg);
             // rev T: a streamed snapshot message is held back by the node (raft
             // must not restore metadata the storage cannot honour). Fetch its
             // bytes now, off the actor.
             if let Some(held) = self.node.take_held_snapshot() {
-                self.start_snapshot_fetch(held);
+                self.start_snapshot_fetch(held).await;
             }
         }
     }
@@ -1771,7 +1771,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
     /// The fetch runs in its own task: a snapshot can be tens of megabytes and
     /// is paced, so awaiting it here would stall ticks, heartbeats and reads for
     /// the whole transfer.
-    fn start_snapshot_fetch(&mut self, held: HeldSnapshot) {
+    async fn start_snapshot_fetch(&mut self, held: HeldSnapshot) {
         // A newer snapshot supersedes one still in flight; its completion is
         // ignored by the identity check in `finish_snapshot_fetch`, and its file
         // is dropped here.
@@ -1781,7 +1781,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         let Some(node_id) = self.raft_to_node.get(&held.from).cloned() else {
             // The sender is not in this node's peer map: nothing to fetch from,
             // so report failure (raft retries) instead of stalling.
-            self.node.report_snapshot(held.from, false);
+            self.node.report_snapshot(held.from, false).await;
             return;
         };
         let dest = std::env::temp_dir().join(format!(
@@ -1815,7 +1815,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
     /// Nothing has reached raft while the transfer was in flight, so every
     /// failure path here is simply "report failure and let raft retry": no
     /// metadata was restored that the storage cannot back.
-    fn finish_snapshot_fetch(&mut self, done: SnapshotFetchDone) {
+    async fn finish_snapshot_fetch(&mut self, done: SnapshotFetchDone) {
         let is_current = self.snapshot_fetch.as_ref().is_some_and(|f| {
             f.held.from == done.from && f.held.index == done.index
         });
@@ -1838,7 +1838,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                 "from" => fetch.held.from,
                 "index" => fetch.held.index,
             );
-            self.node.report_snapshot(fetch.held.from, false);
+            self.node.report_snapshot(fetch.held.from, false).await;
             let _ = std::fs::remove_file(&done.dest);
             return;
         };
@@ -1854,7 +1854,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                     "error" => %e,
                     "index" => fetch.held.index,
                 );
-                self.node.report_snapshot(fetch.held.from, false);
+                self.node.report_snapshot(fetch.held.from, false).await;
                 let _ = std::fs::remove_file(&done.dest);
                 return;
             }
@@ -1875,13 +1875,13 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         if let Err(e) = self.node.step_held_snapshot(&fetch.held, data) {
             // A codec/raft failure: this node cannot make progress from here.
             self.fail_all_pending(&format!("stepping a fetched snapshot failed: {e}"));
-            self.node.report_snapshot(fetch.held.from, false);
+            self.node.report_snapshot(fetch.held.from, false).await;
             let _ = std::fs::remove_file(&done.dest);
             return;
         }
         // raft keeps the follower in `Snapshot` state (and sends it nothing
         // else) until it hears how the transfer ended.
-        self.node.report_snapshot(fetch.held.from, true);
+        self.node.report_snapshot(fetch.held.from, true).await;
         let _ = std::fs::remove_file(&done.dest);
         self.metrics.inc_snapshots_installed();
     }

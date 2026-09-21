@@ -270,6 +270,8 @@ async fn catch_up_scenario(offloaded: bool) {
     catch_up_scenario_with(offloaded, false).await
 }
 
+
+
 /// The same scenario, optionally through the **streamed snapshot** path
 /// (propsol rev T, T2b).
 ///
@@ -279,6 +281,10 @@ async fn catch_up_scenario(offloaded: bool) {
 /// from that peer's own data directory, exactly as the real transport serves
 /// them from the serving node's snapshot provider.
 async fn catch_up_scenario_with(offloaded: bool, streaming: bool) {
+    catch_up_scenario_inner(offloaded, streaming, 0).await
+}
+
+async fn catch_up_scenario_inner(offloaded: bool, streaming: bool, fail_first: u64) {
     let profile = test_profile();
     let factory = if streaming {
         InMemoryTransportFactory::new().with_snapshot_streaming()
@@ -299,9 +305,17 @@ async fn catch_up_scenario_with(offloaded: bool, streaming: bool) {
             // source finds it without any storage handle.
             let source_dir = dir.clone();
             let counter = std::sync::Arc::clone(&fetches);
+            let attempts = std::sync::Arc::new(AtomicU64::new(0));
             factory.set_snapshot_source(
                 node_id(i),
                 std::sync::Arc::new(move |index, term| {
+                    let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                    if attempt < fail_first {
+                        // Simulate a transfer that fails before any byte lands:
+                        // the runtime must treat this as "cannot transfer", not
+                        // as an empty snapshot.
+                        return None;
+                    }
                     // The on-disk name zero-pads both numbers
                     // (`snapshot-<020>-<020>.snap`), while the snapshot metadata
                     // — which is all the request carries — holds them bare. Any
@@ -521,6 +535,8 @@ async fn lagging_follower_catches_up_through_a_snapshot() {
 async fn lagging_follower_catches_up_through_a_streamed_snapshot() {
     catch_up_scenario_with(false, true).await;
 }
+
+
 
 /// The same scenario through the **asynchronous durability pipeline**
 /// (propsol v0.2.13 P): every record is written by the actor and flushed by
