@@ -126,10 +126,25 @@ async fn acked_single_node_with(tag: &str, offloaded: bool) -> (PathBuf, WalOpti
         tokio::time::sleep(core::time::Duration::from_millis(5)).await;
     }
     assert!(metrics.is_leader(), "the single node must elect itself");
-    handle
-        .put(b"acked", b"value")
-        .await
-        .expect("the write must commit+apply");
+    // Bounded retries: this is *setup* for a recovery property, and cargo runs
+    // this binary's tests in parallel, so on a loaded CI machine a single
+    // attempt can miss the client deadline. (The ack path itself — durable
+    // entry, applied, replied — is what the other tests assert.)
+    let mut last = String::new();
+    let mut applied = false;
+    for _ in 0..200 {
+        match handle.put(b"acked", b"value").await {
+            Ok(()) => {
+                applied = true;
+                break;
+            }
+            Err(e) => {
+                last = e.to_string();
+                tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+    assert!(applied, "the write must commit+apply (last error: {last})");
 
     // Stop the actor: it owns the WAL, so this releases the data-dir lock.
     task.abort();
