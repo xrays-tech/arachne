@@ -64,6 +64,38 @@ pub trait Transport: Send + Sync + 'static {
         to: NodeId,
         msg: TransportMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Whether this transport can stream a snapshot on demand (propsol rev T).
+    ///
+    /// The core asks this before it accepts a **metadata-only** snapshot from a
+    /// peer: a transport that hands the bytes over inside the raft message
+    /// itself (every in-process one) neither needs nor supports the streaming
+    /// path, and claiming otherwise would leave a follower with metadata and no
+    /// data.
+    fn supports_snapshot_streaming(&self) -> bool {
+        false
+    }
+
+    /// Stream the snapshot at `(index, term)` from `from` into the file `dest`.
+    ///
+    /// Returns the number of bytes written. `Ok(None)` means this transport
+    /// cannot stream snapshots at all — the default — and the caller must treat
+    /// that as "cannot transfer", never as "empty snapshot".
+    ///
+    /// `dest` is a path rather than a buffer on purpose: a snapshot may be tens
+    /// of megabytes, and the receiver validates its CRC after assembly
+    /// (invariant I9), so streaming straight to a file keeps the whole thing out
+    /// of memory on both ends.
+    fn fetch_snapshot(
+        &self,
+        from: NodeId,
+        index: u64,
+        term: u64,
+        dest: &std::path::Path,
+    ) -> impl Future<Output = Result<Option<u64>, Self::Error>> + Send {
+        let _ = (from, index, term, dest);
+        async { Ok(None) }
+    }
 }
 
 /// The inbound half of a node's transport.

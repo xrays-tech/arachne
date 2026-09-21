@@ -46,6 +46,11 @@ pub enum TransportError {
     #[error("transport send failed: {0}")]
     Send(#[source] Status),
 
+    /// A local failure while assembling a streamed snapshot (propsol rev T):
+    /// writing the received chunks, or the peer's stream ending in an error.
+    #[error("snapshot stream failed: {0}")]
+    SnapshotStream(String),
+
     /// The receiving side has closed its inbound channel (it is shutting down).
     #[error("inbound channel is closed")]
     InboundClosed,

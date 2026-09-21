@@ -14,13 +14,14 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use arachne_seam::seam::{Transport, TransportMessage};
 use arachne_seam::types::NodeId;
+use tokio::io::AsyncWriteExt;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::error::TransportError;
 use crate::factory::TransportConfig;
 use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_client::RaftTransportClient;
-use crate::proto::{Hello, RaftEnvelope};
+use crate::proto::{Hello, RaftEnvelope, SnapshotRequest};
 use crate::unlock;
 use crate::unlock_read;
 
@@ -125,6 +126,78 @@ impl<Io: TransportIo> Transport for TonicTransport<Io> {
         } else {
             Err(TransportError::from_error_code(&reply.error_code))
         }
+    }
+
+    fn supports_snapshot_streaming(&self) -> bool {
+        true
+    }
+
+    /// Fetch a snapshot from `from` and write it to `dest` (propsol rev T).
+    ///
+    /// Deliberately **not** using the cached send channel: that channel carries
+    /// a per-request timeout sized for one raft message (5s by default), and a
+    /// paced snapshot of tens of megabytes legitimately takes far longer — the
+    /// timeout would abort a healthy transfer. A snapshot fetch is rare and
+    /// long-lived, so it opens its own connection (connect timeout and
+    /// keep-alive still apply) rather than polluting the send path's cache.
+    async fn fetch_snapshot(
+        &self,
+        from: NodeId,
+        index: u64,
+        term: u64,
+        dest: &std::path::Path,
+    ) -> Result<Option<u64>, Self::Error> {
+        let Some(addr) = unlock_read(&self.addresses).get(&from).copied() else {
+            return Err(TransportError::UnknownPeer(from));
+        };
+
+        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+            .map_err(|e| TransportError::SnapshotStream(e.to_string()))?
+            .connect_timeout(self.config.connect_timeout)
+            .http2_keep_alive_interval(self.config.keep_alive_interval)
+            .keep_alive_timeout(self.config.keep_alive_timeout)
+            .keep_alive_while_idle(true);
+        let channel = endpoint
+            .connect_with_connector(self.connector.clone())
+            .await
+            .map_err(|e| TransportError::SnapshotStream(e.to_string()))?;
+
+        let mut client = RaftTransportClient::new(channel)
+            .max_decoding_message_size(self.config.max_message_size);
+        let request = SnapshotRequest {
+            index,
+            term,
+            hello: Some(self.hello.clone()),
+        };
+        let mut stream = client
+            .fetch_snapshot(tonic::Request::new(request))
+            .await
+            .map_err(TransportError::Send)?
+            .into_inner();
+
+        // Assemble into a fresh file. The caller validates the snapshot's own
+        // CRC afterwards (I9) and only then installs it, so a truncated or
+        // corrupted stream is caught rather than applied.
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .map_err(|e| TransportError::SnapshotStream(e.to_string()))?;
+        let mut written: u64 = 0;
+        loop {
+            match stream.message().await {
+                Ok(Some(chunk)) => {
+                    file.write_all(&chunk.data)
+                        .await
+                        .map_err(|e| TransportError::SnapshotStream(e.to_string()))?;
+                    written += chunk.data.len() as u64;
+                }
+                Ok(None) => break,
+                Err(status) => return Err(TransportError::Send(status)),
+            }
+        }
+        file.sync_all()
+            .await
+            .map_err(|e| TransportError::SnapshotStream(e.to_string()))?;
+        Ok(Some(written))
     }
 }
 

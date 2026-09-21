@@ -239,6 +239,31 @@ mod tests {
     }
 
     #[test]
+    fn the_in_memory_transport_does_not_stream_snapshots() {
+        // propsol rev T: the streaming path is opt-in. An in-process transport
+        // hands the snapshot over inside the raft message, so it must report
+        // "cannot stream" — the core uses exactly this answer to decide whether
+        // a metadata-only snapshot is acceptable. Claiming `true` here would
+        // leave a follower holding metadata and no data.
+        let factory = InMemoryTransportFactory::new();
+        let (tx, _rx) = factory.create(NodeId::from("a"));
+        assert!(!tx.supports_snapshot_streaming());
+        let dest = std::env::temp_dir().join("arachne-never-written.snap");
+        let result = block_on(tx.fetch_snapshot(
+            NodeId::from("b"),
+            1,
+            1,
+            dest.as_path(),
+        ));
+        assert_eq!(
+            result.map_err(|e| e.to_string()),
+            Ok(None),
+            "the default must say 'unsupported', never 'empty snapshot'"
+        );
+        assert!(!dest.exists(), "an unsupported fetch must not create a file");
+    }
+
+    #[test]
     fn send_to_connected_peer_roundtrips() {
         let factory = InMemoryTransportFactory::new();
         let (a_tx, _a_rx) = factory.create(NodeId::from("a"));

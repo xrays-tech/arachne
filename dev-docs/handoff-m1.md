@@ -445,6 +445,10 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
   - `check-profile-knobs.sh`：新代码文档注释里提到 `snapshot_transfer_rate_bps` 就被判成"已被读取"。门现在忽略**整行注释**（`//`/`*`/`/*` 开头）；真实读取永不在注释行上。白名单条目保留（T2 才接线），理由文案改为"T1 已落地、缺 T2 接线"。
   - `check-entropy.sh` Gate C：`snapshot_stream.rs` 的文档注释引用了被禁的两个标识符就被判违规 ✗（既有的测试文件其实一直在**绕开写**这些字面量）。同样改为忽略整行注释，并做了**反向对照**：临时插入一行真实 `std::time` 用法 → 门 FAIL，撤回 → PASS ✓ 证明门没被削弱。
 - 验证：workspace **404 passed / 0 failed**、`--features fault-injection` **420 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS（含上面两个修好的门）。
+- **T1b 落地（follower 侧客户端）**：seam `Transport` 增 `supports_snapshot_streaming()`（默认 false）与 `fetch_snapshot(from, index, term, dest) -> Result<Option<u64>, _>`（默认 `Ok(None)` = 本传输不支持；用 `Option` 而非构造 `Self::Error`，因为默认实现造不出关联错误类型；**`None` 绝不表示空快照**）。`TonicTransport` 实现两者，写入 `dest` 文件而非内存缓冲。
+  **实现中发现的坑**：`send` 用的缓存 channel 带**按请求超时**（默认 5s），限速下的几十 MB 快照合法地远超它 ⇒ 会掐断健康传输；因此快照走**自己的连接**（保留 connect timeout/keep-alive、不设按请求超时），也不污染发送路径的缓存。
+  测试：`the_transport_streams_a_snapshot_into_a_file`（经 trait 拉 2×256 KiB+77B → 文件逐字节相同；未知快照报 "no such snapshot"）+ 反向对照 `the_in_memory_transport_does_not_stream_snapshots`（进程内传输必须答"不支持"且不创建文件）。
+- 验证：workspace **406 passed / 0 failed**、`--features fault-injection` **422 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS；T1 的 CI run（35621219877）**success**。
 - **T2/T3 待做**：元数据快照（`RaftStorage::snapshot()` 返回无 data 版本）+ 运行时编排（收到元数据快照 → 拉取 → 聚合落盘 → `install_snapshot` → `report_snapshot`）+ `Transport::fetch_snapshot` 默认实现 + **真实 tonic 三节点回归**（把 gRPC 上限调到 64 KiB，让单消息路线必失败、流式路线追上）；T3 流中断恢复。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**

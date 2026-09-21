@@ -222,3 +222,61 @@ async fn a_configured_rate_paces_the_stream() {
     assert_eq!(unlimited.as_slice(), &source[..]);
     fast_factory.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_transport_streams_a_snapshot_into_a_file() {
+    // The follower half of rev T: the seam's `fetch_snapshot` assembles the
+    // stream into a file, which is what `install_snapshot` will validate and
+    // install. Exercised through the `Transport` trait, not the generated
+    // client, because that is the interface the runtime will call.
+    use arachne_seam::seam::{Transport, TransportFactory};
+
+    let source: Arc<[u8]> = payload(2 * CHUNK + 77).into();
+    let (addr, factory) = start_server(Arc::clone(&source), 0).await;
+
+    // A second node's transport, configured with the full address map.
+    let n1 = NodeId::from("n1");
+    let n2 = NodeId::from("n2");
+    let mut map = HashMap::new();
+    map.insert(n1.clone(), addr);
+    map.insert(n2.clone(), addr); // unused; n2 only fetches *from* n1
+    let client_factory = TonicTransportFactory::new("snap", 1, 0, Vec::new(), map);
+    let (tx, _rx) = client_factory.create(n2.clone());
+
+    assert!(
+        tx.supports_snapshot_streaming(),
+        "the tonic transport must advertise the streaming path"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "arachne-snapshot-fetch-{}-{}",
+        std::process::id(),
+        INDEX
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let dest = dir.join("fetched.snap");
+
+    let written = tx
+        .fetch_snapshot(n1.clone(), INDEX, TERM, &dest)
+        .await
+        .expect("the fetch must succeed")
+        .expect("the tonic transport supports streaming");
+    assert_eq!(written, source.len() as u64);
+    let got = std::fs::read(&dest).expect("read the assembled file");
+    assert_eq!(got.as_slice(), &source[..], "the file must match the source");
+
+    // A snapshot the peer does not have is an error, not an empty file that
+    // would then fail CRC far from the cause.
+    let err = tx
+        .fetch_snapshot(n1, INDEX + 5, TERM, &dest)
+        .await
+        .expect_err("an unknown snapshot must be an error");
+    assert!(
+        format!("{err}").contains("no such snapshot"),
+        "unexpected error: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    factory.shutdown().await;
+    client_factory.shutdown().await;
+}
