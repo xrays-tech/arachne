@@ -32,7 +32,7 @@
 //! than on a shared async worker thread; `run` stays available for embedders
 //! and tests that want to place it themselves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,9 @@ use slog::Logger;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::client::{ArachneError, Handle};
-use crate::consensus::{NodeError, RaftNode, RaftNodeConfig};
+use crate::consensus::{
+    CommittedEntry, NodeError, RaftNode, RaftNodeConfig, conf_change_identity,
+};
 use crate::metrics::Metrics;
 use crate::profile::ProfileConfig;
 use crate::state_machine::KvStateMachine;
@@ -52,8 +54,10 @@ use crate::{
     Clock, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx,
 };
 use arachne_seam::storage::{
-    ConfState as SeamConfState, Snapshot as SeamSnapshot, Storage as _,
+    ConfState as SeamConfState, EntryType as SeamEntryType, Snapshot as SeamSnapshot,
+    Storage as _,
 };
+use raft::eraftpb::ConfChangeType;
 
 /// Approximate per-entry durable overhead (record header, type byte, and the
 /// index/term fields) used to size the snapshot trigger.
@@ -68,6 +72,18 @@ const WAL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A request from a client [`Handle`] to the node runtime.
 pub enum Command {
+    /// Propose a single-step membership change (propsol v0.2.16 rev S).
+    ///
+    /// Replies once the change is committed **and applied** — i.e. once the new
+    /// configuration is durable, not merely in the log.
+    ConfChange {
+        /// Which kind of change (add learner, promote, remove).
+        change_type: ConfChangeType,
+        /// The target node's raft id.
+        node_id: RaftId,
+        /// Reply channel.
+        ack: oneshot::Sender<Result<(), ArachneError>>,
+    },
     /// Propose a command and reply once it is committed and applied.
     Propose {
         /// The encoded state-machine command.
@@ -205,6 +221,19 @@ struct ApplyBatch {
     snapshot: Option<SeamSnapshot>,
     /// Committed entries `(index, data)`, ascending.
     entries: Vec<(LogIndex, Vec<u8>)>,
+}
+
+/// A membership change awaiting apply (propsol v0.2.16 rev S, S1b).
+///
+/// ConfChange entries never reach the state machine: they carry a ConfChange
+/// protobuf, and applying them needs `&mut RawNode`, which only the actor has.
+struct PendingConf {
+    change_type: ConfChangeType,
+    node_id: RaftId,
+    ack: Option<oneshot::Sender<Result<(), ArachneError>>>,
+    deadline: Instant,
+    /// The log index carrying this change, once the actor has seen the entry.
+    index: Option<LogIndex>,
 }
 
 /// Requests the actor sends to the apply task, in order.
@@ -436,6 +465,12 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     commands: mpsc::Receiver<Command>,
     tick: tokio::time::Interval,
     pending: Vec<Pending>,
+    /// Committed entries not yet dispatched, in log order. Every entry waits
+    /// behind a preceding ConfChange so that the state machine and the
+    /// membership view are applied in the same order as the log (rev S S1b).
+    committed_queue: VecDeque<CommittedEntry>,
+    /// Membership changes awaiting commit + apply (rev S S1b).
+    pending_conf: Vec<PendingConf>,
     /// Linearizable reads awaiting quorum confirmation / apply (propsol §5.4).
     pending_reads: Vec<PendingRead>,
     /// Wait timeout for a ReadIndex round / apply window (`2 × election_timeout`).
@@ -593,6 +628,8 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             commands,
             tick: tokio::time::interval(period),
             pending: Vec::new(),
+            committed_queue: VecDeque::new(),
+            pending_conf: Vec::new(),
             pending_reads: Vec::new(),
             read_index_timeout: Duration::from_millis(
                 config.profile.read_index_timeout_ms.max(1),
@@ -707,11 +744,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             }
         };
 
-        // Hand committed work to the apply task. It owns the state machine, so
-        // a saturated apply path can no longer keep the actor from ticking or
-        // from answering the ReadIndex round (propsol §347).
-        if !self.enqueue_apply(outcome.snapshot, outcome.committed) {
-            self.fail_all_pending("the apply task stopped");
+        // Hand committed work to the apply task, in log order: normal entries
+        // go to the state machine, ConfChange entries are applied here on the
+        // actor, and nothing behind a not-yet-applied ConfChange is dispatched
+        // (rev S S1b).
+        if !self.stage_committed(outcome.snapshot, outcome.committed) {
             self.metrics.set_is_leader(false);
             return false;
         }
@@ -777,6 +814,122 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// Bytes committed but not yet applied — the backpressure signal (Q7).
     fn apply_backlog_bytes(&self) -> u64 {
         self.sent_bytes_total.saturating_sub(self.applied_bytes_total)
+    }
+
+    /// Stage committed entries and dispatch as much as log order allows.
+    ///
+    /// An installed snapshot goes to the apply task first (it supersedes every
+    /// queued entry at or below its index), then entries are dispatched from
+    /// the front of the queue: runs of normal entries as batches, and a
+    /// ConfChange entry only once the apply task has applied everything before
+    /// it. That barrier is what keeps the KV state machine's view and the
+    /// membership view consistent with the log — without it the actor could
+    /// apply a membership change while the state machine was still catching up
+    /// on commands that preceded it (rev S S1b).
+    ///
+    /// Returns `false` on a fail-stop.
+    fn stage_committed(
+        &mut self,
+        snapshot: Option<SeamSnapshot>,
+        entries: Vec<CommittedEntry>,
+    ) -> bool {
+        if let Some(snapshot) = &snapshot {
+            let index = snapshot.meta.index;
+            self.committed_queue.retain(|(i, _, _)| *i > index);
+        }
+        // Attribute membership changes to their waiting proposals before the
+        // queue owns them. A ConfChange entry carries no session key, so its
+        // identity is decoded instead; the single-flight rule keeps
+        // `(change_type, node_id)` unique among outstanding changes.
+        for (index, kind, data) in &entries {
+            if matches!(kind, SeamEntryType::Entry) {
+                continue;
+            }
+            let Ok((change_type, node_id)) = conf_change_identity(*kind, data) else {
+                // Not decodable as a ConfChange: leave it unattributed and let
+                // `apply_conf_change` report the failure with its own error.
+                continue;
+            };
+            if let Some(p) = self.pending_conf.iter_mut().find(|p| {
+                p.index.is_none() && p.node_id == node_id && p.change_type == change_type
+            }) {
+                p.index = Some(*index);
+            }
+        }
+        self.committed_queue.extend(entries);
+
+        if let Some(snapshot) = snapshot
+            && !self.enqueue_apply(Some(snapshot), Vec::new())
+        {
+            self.fail_all_pending("the apply task stopped");
+            return false;
+        }
+        self.pump_committed()
+    }
+
+    /// Dispatch queued entries from the front while ordering permits.
+    fn pump_committed(&mut self) -> bool {
+        loop {
+            let Some((index, kind, _)) = self.committed_queue.front() else {
+                return true;
+            };
+            let (index, kind) = (*index, *kind);
+
+            if matches!(kind, SeamEntryType::Entry) {
+                // Take the whole run of normal entries so batching is preserved.
+                let mut batch: Vec<(LogIndex, Vec<u8>)> = Vec::new();
+                while let Some((_, k, _)) = self.committed_queue.front() {
+                    if !matches!(k, SeamEntryType::Entry) {
+                        break;
+                    }
+                    let (index, _, data) = self
+                        .committed_queue
+                        .pop_front()
+                        .expect("front was just observed");
+                    batch.push((index, data));
+                }
+                if !self.enqueue_apply(None, batch) {
+                    self.fail_all_pending("the apply task stopped");
+                    return false;
+                }
+                continue;
+            }
+
+            // Ordering barrier: every entry before this one must be applied
+            // before membership may change.
+            if self.applied_index + 1 < index {
+                return true;
+            }
+            let (_, _, data) = self
+                .committed_queue
+                .pop_front()
+                .expect("front was just observed");
+
+            // The state machine must still *see* this index or its applied
+            // watermark would grow a hole and it would fail-stop on the next
+            // entry (it requires `applied + 1`). An empty payload is already its
+            // no-op: the index advances, nothing is interpreted. Enqueueing it
+            // before the change also puts it ahead of every entry behind the
+            // change on the same channel, which is what keeps the state
+            // machine's order equal to the log's.
+            if !self.enqueue_apply(None, vec![(index, Vec::new())]) {
+                self.fail_all_pending("the apply task stopped");
+                return false;
+            }
+
+            match self.node.apply_conf_change(index, kind, &data) {
+                Ok(_applied) => {
+                    // The state machine never sees this index, so the actor's
+                    // own view has to move past it: the barrier, the read
+                    // resolution and the backlog metric all read it.
+                    self.applied_index = self.applied_index.max(index);
+                }
+                Err(e) => {
+                    self.fail_all_pending(&format!("applying a ConfChange failed: {e}"));
+                    return false;
+                }
+            }
+        }
     }
 
     /// Hand committed work to the apply task, attributing entries to waiting
@@ -1094,6 +1247,35 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }
                 }
             }
+            Command::ConfChange {
+                change_type,
+                node_id,
+                ack,
+            } => {
+                if self.node.leader_id() != self.raft_id {
+                    let _ = ack.send(Err(ArachneError::NotLeader {
+                        leader_hint: self.hint(),
+                    }));
+                    return;
+                }
+                // A proposal that is accepted is answered when the change is
+                // applied (or by the timeout sweep); at most one is in flight
+                // until S2 adds the `ConfChangePending` gate on the public API.
+                match self.node.propose_conf_change(change_type, node_id) {
+                    Ok(()) => self.pending_conf.push(PendingConf {
+                        change_type,
+                        node_id,
+                        ack: Some(ack),
+                        deadline: Instant::now() + self.propose_timeout,
+                        index: None,
+                    }),
+                    Err(_) => {
+                        let _ = ack.send(Err(ArachneError::NotLeader {
+                            leader_hint: self.hint(),
+                        }));
+                    }
+                }
+            }
             Command::GetStale { key, ack } => {
                 // The apply task owns the state machine. This rides its own
                 // channel, so a weak read never queues behind the write
@@ -1146,6 +1328,25 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     /// Reply to proposals that have been applied, and time out overdue ones.
     fn reply_pendings(&mut self) {
         let now = Instant::now();
+        // Membership changes reply on the same rule as proposals: applied, or
+        // timed out. `applied_index` is bumped past a ConfChange index when the
+        // actor applies it, so this covers both kinds of entry.
+        let mut still_conf = Vec::with_capacity(self.pending_conf.len());
+        for mut p in self.pending_conf.drain(..) {
+            let applied = matches!(p.index, Some(index) if self.applied_index >= index);
+            if applied {
+                if let Some(ack) = p.ack.take() {
+                    let _ = ack.send(Ok(()));
+                }
+            } else if now >= p.deadline {
+                if let Some(ack) = p.ack.take() {
+                    let _ = ack.send(Err(ArachneError::Timeout));
+                }
+            } else {
+                still_conf.push(p);
+            }
+        }
+        self.pending_conf = still_conf;
         let mut still = Vec::with_capacity(self.pending.len());
         for mut p in self.pending.drain(..) {
             // The entry the proposal was attributed to is applied once the
@@ -1238,6 +1439,11 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     }
 
     fn fail_all_pending(&mut self, message: &str) {
+        for mut p in self.pending_conf.drain(..) {
+            if let Some(ack) = p.ack.take() {
+                let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
+            }
+        }
         for mut p in self.pending.drain(..) {
             if let Some(ack) = p.ack.take() {
                 let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));

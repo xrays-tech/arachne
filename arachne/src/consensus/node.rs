@@ -24,16 +24,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use protobuf::Message as _;
-use raft::eraftpb::Message;
+use raft::eraftpb::{ConfChange, ConfChangeType, ConfChangeV2, Message};
 use raft::ReadOnlyOption;
 use raft::{Config as RaftConfig, RawNode};
 use slog::Logger;
 
 use arachne_seam::seam::{Transport, TransportMessage, TransportRx};
 use arachne_seam::storage::{
-    ConfState as SeamConfState, FlushToken, FlushWaker, HardState as SeamHardState, LogEntry,
-    PersistSubmit, RaftId, Snapshot as SeamSnapshot, SnapshotMeta as SeamSnapshotMeta,
-    Storage as SeamStorage,
+    ConfState as SeamConfState, EntryType as SeamEntryType, FlushToken, FlushWaker,
+    HardState as SeamHardState, LogEntry, PersistSubmit, RaftId, Snapshot as SeamSnapshot,
+    SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage,
 };
 use arachne_seam::types::{LogIndex, NodeId, Term};
 
@@ -149,33 +149,84 @@ struct PendingPersist {
     immediate: Vec<Message>,
     /// Messages that must not leave before their payload is durable.
     persisted: Vec<Message>,
-    /// Committed entries to hand to the state machine.
-    committed: Vec<(LogIndex, Vec<u8>)>,
+    /// Committed entries to hand to the state machine or to the membership
+    /// machinery, tagged with their raft entry type (rev S S1b).
+    committed: Vec<CommittedEntry>,
     /// Quorum-confirmed read states.
     read_states: Vec<(Vec<u8>, LogIndex)>,
     /// An installed snapshot this cycle carried.
     snapshot: Option<SeamSnapshot>,
 }
 
+/// A committed log entry on its way out of [`RaftNode::step`]:
+/// `(index, entry type, data)`.
+///
+/// The type matters because a ConfChange entry's payload is a ConfChange
+/// protobuf, **not** a state-machine command: feeding it to the KV state
+/// machine would fail-stop the node. Entry types were dropped here before M3
+/// ConfChange (rev S).
+pub type CommittedEntry = (LogIndex, SeamEntryType, Vec<u8>);
+
 /// The result of one [`RaftNode::step`] `Ready` cycle.
 ///
-/// `committed` are the entries to apply to the state machine; `read_states`
-/// are quorum-confirmed ReadIndex results `(request_ctx, read_index)` — a read
-/// may be served locally once the applied index reaches `read_index`
+/// `committed` are the entries to apply (normal commands to the state machine,
+/// ConfChange entries to the membership machinery); `read_states` are
+/// quorum-confirmed ReadIndex results `(request_ctx, read_index)` — a read may
+/// be served locally once the applied index reaches `read_index`
 /// (propsol §5.4). Both are empty when there was no pending work.
 #[derive(Debug, Default)]
 pub struct StepOutcome {
-    /// Committed entries `(index, data)` to apply, in ascending index order.
+    /// Committed entries `(index, entry type, data)` in ascending index order.
     ///
     /// When `snapshot` is set, every entry here is strictly newer than it: an
     /// installed snapshot supersedes everything at or below its index.
-    pub committed: Vec<(LogIndex, Vec<u8>)>,
+    pub committed: Vec<CommittedEntry>,
     /// A snapshot this node installed during the cycle (it arrived from the
     /// leader). The caller **must** restore the state machine from
     /// `snapshot.data` before applying `committed`.
     pub snapshot: Option<SeamSnapshot>,
     /// Quorum-confirmed ReadIndex results `(request_ctx, read_index)`.
     pub read_states: Vec<(Vec<u8>, LogIndex)>,
+}
+
+/// Decode a ConfChange entry's identity without applying it:
+/// `(change type, target node)`.
+///
+/// The runtime uses this to attribute a committed change to the proposal
+/// waiting for it (rev S S1b). It is a free function because decoding needs
+/// neither a node, a storage, nor a transport.
+///
+/// # Errors
+///
+/// A message if the payload does not decode, or if a `ConfChangeV2` carries
+/// anything other than exactly one change: v1 is single-step by design
+/// (propsol §5.3), so a multi-change entry is a bug or a foreign writer, not
+/// something to guess about.
+pub fn conf_change_identity(
+    entry_type: SeamEntryType,
+    data: &[u8],
+) -> Result<(ConfChangeType, RaftId), String> {
+    match entry_type {
+        SeamEntryType::ConfChange => {
+            let cc = ConfChange::parse_from_bytes(data)
+                .map_err(|e| format!("ConfChange decode failed: {e}"))?;
+            Ok((cc.get_change_type(), cc.get_node_id()))
+        }
+        SeamEntryType::ConfChangeV2 => {
+            let cc = ConfChangeV2::parse_from_bytes(data)
+                .map_err(|e| format!("ConfChangeV2 decode failed: {e}"))?;
+            let changes = cc.get_changes();
+            if changes.len() != 1 {
+                return Err(format!(
+                    "ConfChangeV2 with {} changes is not single-step",
+                    changes.len()
+                ));
+            }
+            let single = &changes[0];
+            Ok((single.get_change_type(), single.get_node_id()))
+        }
+        SeamEntryType::Entry => Err("conf_change_identity called with a normal entry".into()),
+    }
 }
 
 /// A raft consensus node that drives the `RawNode` Ready loop with the frozen
@@ -402,10 +453,13 @@ where
         // call moves the data into raft's own state.
         let immediate: Vec<Message> = ready.messages().to_vec();
         let persisted: Vec<Message> = ready.persisted_messages().to_vec();
-        let committed: Vec<(LogIndex, Vec<u8>)> = ready
+        let committed: Vec<CommittedEntry> = ready
             .committed_entries()
             .iter()
-            .map(|e| (e.get_index(), e.get_data().to_vec()))
+            .map(|e| {
+                let entry = RaftStorage::<S>::from_raft_entry(e);
+                (entry.index, entry.entry_type, entry.data)
+            })
             .collect();
         let read_states: Vec<(Vec<u8>, LogIndex)> = ready
             .read_states()
@@ -524,7 +578,7 @@ where
         if let Some(snapshot) = &pending.snapshot {
             // An installed snapshot supersedes everything at or below its index,
             // including entries already committed before this cycle.
-            committed.retain(|(index, _)| *index > snapshot.meta.index);
+            committed.retain(|(index, _, _)| *index > snapshot.meta.index);
         }
         // INV2 crash injection: messages are out, nothing has been applied yet.
         #[cfg(feature = "fault-injection")]
@@ -541,6 +595,81 @@ where
         self.raw
             .propose(Vec::new(), cmd.to_vec())
             .map_err(NodeError::Raft)
+    }
+
+    /// Propose a single-step membership change (propsol §5.3, rev S).
+    ///
+    /// Single-step on purpose: v1 does not enter joint consensus. The change is
+    /// committed by raft like any other entry, but its payload is a ConfChange
+    /// protobuf rather than a state-machine command, so it must be routed to
+    /// [`RaftNode::apply_conf_change`] and **never** to the state machine.
+    pub fn propose_conf_change(
+        &mut self,
+        change_type: ConfChangeType,
+        node_id: RaftId,
+    ) -> Result<(), NodeError<T>> {
+        let mut cc = ConfChange::default();
+        cc.set_change_type(change_type);
+        cc.set_node_id(node_id);
+        self.raw
+            .propose_conf_change(Vec::new(), cc)
+            .map_err(NodeError::Raft)
+    }
+
+    /// Apply a committed ConfChange entry to the membership (propsol §5.3, rev S).
+    ///
+    /// The new configuration is persisted through the storage **before this
+    /// returns** (invariant I6), so a restart can skip re-applying the entry and
+    /// raft's progress tracker is rebuilt from it by `initial_state`.
+    ///
+    /// Returns `Ok(true)` when the change was applied and `Ok(false)` when it
+    /// was skipped because the durable membership already reflects it — the
+    /// normal case for the entries replayed after a restart (invariant I8 makes
+    /// that skip sound: the membership is a cache, the log is the authority).
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Codec`] if the payload is not a valid ConfChange for the
+    /// entry type, [`NodeError::Raft`] if raft rejects the change, and
+    /// [`NodeError::Storage`] if the new configuration cannot be persisted.
+    pub fn apply_conf_change(
+        &mut self,
+        index: LogIndex,
+        entry_type: SeamEntryType,
+        data: &[u8],
+    ) -> Result<bool, NodeError<T>> {
+        if index <= self.raw.mut_store().conf_change_index() {
+            return Ok(false);
+        }
+        // Validate the payload up front (single-step, decodable) so a bad entry
+        // fails before raft's progress tracker is touched.
+        conf_change_identity(entry_type, data).map_err(NodeError::Codec)?;
+        let conf_state = match entry_type {
+            SeamEntryType::ConfChange => {
+                let cc = ConfChange::parse_from_bytes(data)
+                    .map_err(|e| NodeError::Codec(format!("ConfChange decode failed: {e}")))?;
+                self.raw.apply_conf_change(&cc).map_err(NodeError::Raft)?
+            }
+            SeamEntryType::ConfChangeV2 => {
+                let cc = ConfChangeV2::parse_from_bytes(data)
+                    .map_err(|e| NodeError::Codec(format!("ConfChangeV2 decode failed: {e}")))?;
+                self.raw.apply_conf_change(&cc).map_err(NodeError::Raft)?
+            }
+            SeamEntryType::Entry => {
+                // A routing bug, not a data problem: normal entries belong to
+                // the state machine. Failing loudly beats mutating membership
+                // from a command payload.
+                return Err(NodeError::Codec(
+                    "apply_conf_change called with a normal entry".into(),
+                ));
+            }
+        };
+        let seam_conf_state = RaftStorage::<S>::to_seam_conf_state(&conf_state);
+        self.raw
+            .mut_store()
+            .save_conf_state(index, &seam_conf_state)
+            .map_err(|e| NodeError::Storage(e.to_string()))?;
+        Ok(true)
     }
 
     /// Issue a quorum-confirmed ReadIndex read (propsol §5.4).
@@ -847,7 +976,7 @@ mod tests {
         for _ in 0..100 {
             node.tick();
             let entries = block_on(node.step()).expect("drive cycle must succeed").committed;
-            for (idx, data) in entries {
+            for (idx, _kind, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
             node.advance_apply();
@@ -869,7 +998,7 @@ mod tests {
         for _ in 0..100 {
             node.tick();
             let entries = block_on(node.step()).expect("drive cycle must succeed").committed;
-            for (idx, data) in entries {
+            for (idx, _kind, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
             node.advance_apply();
@@ -893,7 +1022,7 @@ mod tests {
         for _ in 0..100 {
             node.tick();
             let entries = block_on(node.step()).expect("drive cycle must succeed").committed;
-            for (idx, data) in entries {
+            for (idx, _kind, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
             node.advance_apply();
@@ -910,7 +1039,7 @@ mod tests {
         for _ in 0..100 {
             node.tick();
             let outcome = block_on(node.step()).expect("drive cycle must succeed");
-            for (idx, data) in outcome.committed {
+            for (idx, _kind, data) in outcome.committed {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
             node.advance_apply();
@@ -945,7 +1074,7 @@ mod tests {
         for _ in 0..100 {
             node.tick();
             let entries = block_on(node.step()).expect("drive must succeed").committed;
-            for (idx, data) in entries {
+            for (idx, _kind, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
             node.advance_apply();
@@ -959,7 +1088,7 @@ mod tests {
         for _ in 0..100 {
             node.tick();
             let entries = block_on(node.step()).expect("drive must succeed").committed;
-            for (idx, data) in entries {
+            for (idx, _kind, data) in entries {
                 sm.apply(idx, &data).expect("apply must succeed");
             }
             node.advance_apply();

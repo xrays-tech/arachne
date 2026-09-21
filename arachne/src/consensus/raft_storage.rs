@@ -53,6 +53,23 @@ impl<S: SeamStorage> RaftStorage<S> {
     /// carries one, so a node with no persisted membership can never elect
     /// itself. Use [`RaftStorage::with_conf_state`] to bootstrap a cluster;
     /// this constructor is a convenience for unit tests of the adapter.
+    /// Delegate the seam's membership write to the wrapped storage (rev S).
+    ///
+    /// `RaftNode` reaches its storage through `RawNode::mut_store`, so the
+    /// membership write has to be visible here rather than on `S` directly.
+    pub fn save_conf_state(
+        &mut self,
+        conf_change_index: arachne_seam::types::LogIndex,
+        conf_state: &SeamConfState,
+    ) -> Result<(), arachne_seam::storage::StorageError> {
+        self.inner.save_conf_state(conf_change_index, conf_state)
+    }
+
+    /// Delegate the seam's replay boundary to the wrapped storage (rev S).
+    pub fn conf_change_index(&self) -> arachne_seam::types::LogIndex {
+        self.inner.conf_change_index()
+    }
+
     pub fn new(inner: S) -> Self {
         Self {
             inner,
@@ -182,6 +199,14 @@ impl<S: SeamStorage> RaftStorage<S> {
         }
     }
 
+    /// Convert a raft [`ConfState`] to a seam [`ConfState`] (rev S).
+    pub fn to_seam_conf_state(cs: &ConfState) -> SeamConfState {
+        SeamConfState {
+            voters: cs.get_voters().to_vec(),
+            learners: cs.get_learners().to_vec(),
+        }
+    }
+
     /// Convert a seam [`ConfState`] to a raft [`ConfState`].
     pub fn to_raft_conf_state(cs: &SeamConfState) -> ConfState {
         let mut raft_cs = ConfState::default();
@@ -214,10 +239,7 @@ impl<S: SeamStorage> RaftStorage<S> {
             meta: SeamSnapshotMeta {
                 index: meta.get_index(),
                 term: meta.get_term(),
-                conf_state: SeamConfState {
-                    voters: cs.get_voters().to_vec(),
-                    learners: cs.get_learners().to_vec(),
-                },
+                conf_state: Self::to_seam_conf_state(cs),
             },
             data: snap.get_data().to_vec(),
         }

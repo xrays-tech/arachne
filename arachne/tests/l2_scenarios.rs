@@ -172,7 +172,7 @@ impl Cluster {
                     self.sms[i].restore(&snapshot.data).expect("restore");
                     self.installed[i].push(snapshot.meta.index);
                 }
-                for (idx, data) in outcome.committed {
+                for (idx, _kind, data) in outcome.committed {
                     self.sms[i].apply(idx, &data).expect("apply");
                     self.committed[i].push((idx, data));
                 }
@@ -225,7 +225,7 @@ impl Cluster {
             self.sms[i].restore(&snapshot.data).expect("restore");
             self.installed[i].push(snapshot.meta.index);
         }
-        for (idx, data) in out.committed {
+        for (idx, _kind, data) in out.committed {
             self.sms[i].apply(idx, &data).expect("apply");
             self.committed[i].push((idx, data));
         }
@@ -248,7 +248,7 @@ impl Cluster {
             self.sms[idx].restore(&snapshot.data).expect("restore");
             self.installed[idx].push(snapshot.meta.index);
         }
-        for (ix, data) in committed {
+        for (ix, _kind, data) in committed {
             self.sms[idx].apply(ix, &data).expect("apply");
             self.committed[idx].push((ix, data));
         }

@@ -120,7 +120,7 @@ fn wal_opts() -> WalOptions {
 fn drive(node: &mut Node, sm: &mut KvStateMachine) {
     node.tick();
     let entries = block_on(node.step()).expect("Ready cycle must succeed").committed;
-    for (index, data) in entries {
+    for (index, _kind, data) in entries {
         sm.apply(index, &data).expect("applying a committed entry must succeed");
     }
     node.advance_apply();

@@ -155,6 +155,35 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no).await
     }
 
+    /// **Test-only** (feature `fault-injection`): propose a single-step
+    /// membership change on this handle's own node, without redirects.
+    ///
+    /// The public `add_learner`/`promote_learner`/`remove_member` surface (with
+    /// its `ConfChangePending` single-flight gate) is S2; the routing tests need
+    /// to drive a ConfChange through the real actor before that exists. Like
+    /// [`Handle::propose_raw`] this is deliberately not part of the API.
+    #[cfg(feature = "fault-injection")]
+    pub async fn propose_conf_change_raw(
+        &self,
+        change_type: raft::eraftpb::ConfChangeType,
+        node_id: crate::RaftId,
+    ) -> Result<(), ArachneError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(Command::ConfChange {
+                change_type,
+                node_id,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| ArachneError::ShuttingDown)?;
+        let deadline = Instant::now() + self.inner.timeout;
+        // The ack carries its own result (the actor may reject the change), so
+        // flatten: a dropped sender still maps to `ShuttingDown`.
+        self.await_oneshot(ack_rx, deadline).await?
+    }
+
     /// Linearizable delete (propsol §2.1). See [`Handle::put`].
     pub async fn delete(&self, key: &[u8]) -> Result<(), ArachneError> {
         self.validate_key(key)?;

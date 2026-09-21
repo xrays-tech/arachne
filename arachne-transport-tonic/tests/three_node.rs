@@ -116,7 +116,7 @@ async fn round(
         let node = &mut nodes[i];
         node.tick();
         let outcome = node.step().await?;
-        for (idx, data) in &outcome.committed {
+        for (idx, _kind, data) in &outcome.committed {
             sms[i].apply(*idx, data).expect("apply must succeed");
             // Capture the index of the committed `k => v` put. Every node
             // applies the same log in the same order, so the first capture is

@@ -280,7 +280,7 @@ impl Cluster {
             node.tick();
             match block_on(node.step()) {
                 Ok(outcome) => {
-                    for (idx, data) in outcome.committed {
+                    for (idx, _kind, data) in outcome.committed {
                         self.sms[i].apply(idx, &data).expect("apply");
                         self.committed[i].push((idx, data));
                     }
@@ -370,7 +370,7 @@ impl Cluster {
             node.tick();
             match block_on(node.step()) {
                 Ok(outcome) => {
-                    for (ix, data) in outcome.committed {
+                    for (ix, _kind, data) in outcome.committed {
                         self.sms[idx].apply(ix, &data).expect("apply");
                         self.committed[idx].push((ix, data));
                     }
@@ -416,7 +416,7 @@ impl Cluster {
         match catch_unwind(AssertUnwindSafe(|| block_on(node.step()))) {
             Err(_) => true,
             Ok(Ok(outcome)) => {
-                for (ix, data) in outcome.committed {
+                for (ix, _kind, data) in outcome.committed {
                     self.sms[idx].apply(ix, &data).expect("apply");
                     self.committed[idx].push((ix, data));
                 }

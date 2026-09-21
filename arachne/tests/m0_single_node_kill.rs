@@ -88,7 +88,7 @@ fn single_node_kill_at_each_ready_step() {
         for round in 0..k {
             node.tick();
             let entries = block_on(node.step()).expect("step").committed;
-            for (idx, data) in entries {
+            for (idx, _kind, data) in entries {
                 sm.apply(idx, &data).expect("apply");
                 committed.push((idx, data));
             }

@@ -8,5 +8,5 @@
 pub mod node;
 pub mod raft_storage;
 
-pub use node::{NodeError, RaftNode, RaftNodeConfig};
+pub use node::{CommittedEntry, NodeError, RaftNode, RaftNodeConfig, conf_change_identity};
 pub use raft_storage::RaftStorage;

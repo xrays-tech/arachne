@@ -360,6 +360,18 @@ S1 拆成两步做：**S1a 存储侧**（本轮，`membership` 文件 + seam 契
 - 验证：workspace **391 passed / 0 failed**（基线 378，+12 = membership 6 + wal 4 + 格式层 2；另 +1 seam 契约测试）、`--features fault-injection` **399 passed / 0 failed**、l2 **3 passed / 0 failed**、`arachne-node` 全绿、四个门禁（deps/entropy/release-features/profile-knobs）全 PASS。`check-release-features.sh` 本地须显式给 `CARGO_TARGET_DIR`（默认全局 target 在仓库外，沙箱拒绝写 → 报 `Operation not permitted`；不是代码问题，CI 正常）。
 - **下一步 S1b**：`StepOutcome`/`PersistSubmit` 透传 `entry_type`（今天 `committed: Vec<(LogIndex, Vec<u8>)>` 把类型丢了，见 `node.rs:373` 注释）→ actor 按类型分流 → `apply_conf_change` + `save_conf_state` → 回放按 `conf_change_index` 跳过；**顺序屏障**：ConfChange 只能在其之前的条目都已 apply 之后才应用（以 apply 任务的进度水分为界），否则 KV 与成员视图的应用顺序会与日志顺序不一致。
 
+### 1.21 M3 ConfChange S1b 落地：`entry_type` 透传 + apply 分流 + 顺序屏障
+
+S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIndex, Vec<u8>)>`——**条目类型被丢掉**（`node.rs` 的老注释自认 "dropped for now"），于是提交的 ConfChange 会被当 KV 命令喂给状态机。
+
+- **类型透传**：`CommittedEntry = (LogIndex, SeamEntryType, Vec<u8>)`（consensus 根 re-export），`PendingPersist`/`StepOutcome` 同步；collect 处复用 `RaftStorage::from_raft_entry` 的映射。施工面波及 **9 处**测试/harness 解构（`for (idx, _kind, data) in ...`）——`cargo test --workspace` 一次抓全（先红了才知道有 9 处，这类机械改动不该靠猜）。
+- **`RaftNode::apply_conf_change(index, kind, data)`**：先 `conf_change_identity` 校验（可解码、且 `ConfChangeV2` 必须恰好一个 change——单步是 §5.3 的设计），再 `raw.apply_conf_change`，最后 `mut_store().save_conf_state(index, &conf)` 落盘（I6：返回前已持久）；`index <= conf_change_index()` 时**跳过**（回放幂等，I8）。`conf_change_identity` 做成**自由函数**（不需要 node/storage/transport，返回 `Result<_, String>`），runtime 用它把提交的变更归属到等待中的提案。
+- **actor 分流 + 顺序屏障**：新增 `committed_queue`（日志序）+ `pending_conf`；`stage_committed`/`pump_committed` 把连续普通条目成批下发给 apply 任务，遇到 ConfChange 则先等 `applied_index + 1 >= index`（前序都已 apply）才本地应用。
+- **实现中发现的两个细节**（写进 propsol rev S）：①**KV 状态机的 apply 索引必须连续**（`applied + 1`，缺口即 fail-stop），而 ConfChange 不进 SM ⇒ 必须在同一通道上、在它之后的条目之前给 SM 递一个**空 payload 的 no-op**（复用既有的 "leader term 空条目" 路径：索引推进、状态不变）。第一版没有这一步，测试立刻给出 `state machine apply failed: index ordering violation at 4` ✓ 这就是 TDD 的价值。②**屏障只需挡成员变更本身**：同一 mpsc 通道保证 no-op 先于后续条目到达，日志顺序天然保持。
+- **测试** `arachne/tests/membership_change.rs`（feature 门控，2 项）：①单节点 `AddLearnerNode(2)` → 提案返回即已 apply；**变更后再写一次并读回**（老代码这一步会 fail-stop，是"路由生效"的直接证据）；关停后重开 WAL 断言 `conf_change_index > 0`、voters=[1]、learners=[2]；**再启动**同一目录 → 自选主、读写正常、成员不变（回放走 skip 路径）；②**顺序**：并发发出 ConfChange 与紧随其后的 put（很可能落进同一个 `Ready`），断言两把键都在、且 `conf_change_index == 前一个 put 的 index + 1`（成员变更恰好夹在两条命令之间）。
+- 验证：workspace **391 passed / 0 failed**、`--features fault-injection` **401 passed / 0 failed**（+2 即上面两项）、l2 **3 passed / 0 failed**、四门禁全 PASS。
+- **下一步 S2**：公开 API `Handle::add_learner`/`promote_learner`/`remove_member`/`transfer_leader` + **单飞门 `ConfChangePending`**（清空时机 = 条目 applied，普通写不受影响；raft 自身的 `pending_conf_index` 只作第二道防线、以测试实测其行为）；S3 追平门 + `promote_lag_entries`；S4 快照写 live ConfState；S5 M3 ①② 端到端 + INV-4 + node 运维面。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
