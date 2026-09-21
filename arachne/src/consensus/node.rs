@@ -1083,12 +1083,15 @@ where
     /// sends it nothing else; `false` makes raft treat the follower as
     /// unreachable and retry, which is how a failed transfer recovers.
     pub async fn report_snapshot(&mut self, to: RaftId, ok: bool) {
-        let status = if ok {
-            raft::SnapshotStatus::Finish
-        } else {
-            raft::SnapshotStatus::Failure
-        };
-        self.raw.report_snapshot(to, status);
+        let mut msg = Message::default();
+        msg.set_msg_type(raft::eraftpb::MessageType::MsgSnapStatus);
+        msg.set_from(self.raw.raft.id);
+        msg.set_to(to);
+        // The receiver drops a message whose term is below its own, so the
+        // status must carry this node's current term.
+        msg.set_term(self.raw.raft.term);
+        msg.set_reject(!ok);
+        self.deliver(&msg).await;
     }
 
     /// The membership configuration the cluster has agreed on, learners
@@ -1122,9 +1125,6 @@ where
     async fn deliver(&mut self, msg: &Message) {
         let self_id = self.raw.raft.id;
         let outcome = send_one(&self.transport, &self.peers, self_id, msg).await;
-        if msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapStatus {
-            eprintln!("[probe] sending MsgSnapStatus to={} ok={}", msg.get_to(), outcome.is_ok());
-        }
         if outcome.is_err() {
             self.dropped_sends += 1;
         }

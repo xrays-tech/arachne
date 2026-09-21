@@ -450,10 +450,19 @@ async fn catch_up_scenario_inner(offloaded: bool, streaming: bool, fail_first: u
     // 6. Wait for the follower to converge on the *newest* value...
     let newest_key = key(WRITES);
     let mut newest_seen = None;
-    for _ in 0..1_500 {
+    for i in 0..1_500 {
         if let Ok(Some(v)) = nodes[victim].handle.get_stale(&newest_key).await {
             newest_seen = Some(v);
             break;
+        }
+        if fail_first > 0 && i % 20 == 0 {
+            // A live cluster keeps writing, and raft only re-attempts a
+            // snapshot when it next decides to append. A perfectly quiet
+            // cluster would therefore never retry a failed transfer (upstream
+            // raft's `maybe_send_append` is what notices the follower is below
+            // `first_index`), which is why the recovery case is a traffic case.
+            let extra = WRITES + 1 + i;
+            let _ = leader_handle.put(&key(extra), &value(extra)).await;
         }
         tokio::time::sleep(core::time::Duration::from_millis(20)).await;
     }
