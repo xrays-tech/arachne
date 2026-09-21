@@ -52,6 +52,18 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
+      # `fuzz/` and `model-check/` are standalone workspaces, so the workspace
+      # build above cannot see them — which is how `fuzz/` silently stopped
+      # compiling when `Meta` gained fields, and how `model-check/Cargo.lock`
+      # drifted out of date. Build them here (with `--locked`, so a stale lock
+      # fails too) and the next drift fails this PR gate instead of the nightly
+      # fuzz schedule.
+      - name: Build standalone projects (fuzz, model-check)
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path fuzz/Cargo.toml --locked
+          cargo build --manifest-path model-check/Cargo.toml --locked
+
       - name: Test workspace
         # The double-run determinism gate (m0_determinism.rs: two runs of the
         # same fixed scenario must be byte-identical) is part of this PR gate,
@@ -146,6 +158,19 @@ jobs:
 
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
+
+      # Same requirement as the other jobs: `raft-proto`'s build script needs a
+      # `protoc` 3.x. Without this the fuzz job died while *building* the target
+      # (`protobuf-build` panics with `Option::unwrap() on None`), before the
+      # fuzzer ever ran.
+      - name: Install protoc 3.x (raft-proto codegen requirement)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v3.20.3/protoc-3.20.3-linux-x86_64.zip
+          unzip -o -q /tmp/protoc.zip -d "$HOME/protoc3"
+          echo "$HOME/protoc3/bin" >> "$GITHUB_PATH"
+          "$HOME/protoc3/bin/protoc" --version
 
       - name: Run fuzz target (wal_recovery) for a bounded wall-clock
         working-directory: fuzz

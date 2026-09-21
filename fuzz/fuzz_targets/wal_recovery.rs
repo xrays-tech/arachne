@@ -43,6 +43,9 @@ fn data_dir() -> &'static std::path::PathBuf {
             node_id: "fuzz-node".into(),
             format_version: FORMAT_VERSION,
             created_at: 1_700_000_000_000,
+            // No snapshot: the fuzzer mutates the WAL segment itself.
+            snapshot_index: 0,
+            snapshot_term: 0,
         };
         let _ = write_meta(&dir, &meta);
         dir
