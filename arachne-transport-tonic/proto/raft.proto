@@ -15,6 +15,16 @@ package raft;
 service RaftTransport {
   // Deliver one raft payload to this node.
   rpc Send(RaftEnvelope) returns (SendReply);
+
+  // Stream one snapshot's bytes to a follower (propsol rev T, v0.2.17).
+  //
+  // Why this exists: raft hands a snapshot over as a single `Message`, and the
+  // gRPC message cap above is 8 MiB while the snapshot threshold is 64 MiB
+  // (Lan), so a snapshot above the cap could never be transferred at all — a
+  // follower that fell behind `wal_trailing_keep` could never catch up. The
+  // follower still learns *that* it needs a snapshot from raft itself; this RPC
+  // only carries the bytes, in chunks, without a whole-message size bound.
+  rpc FetchSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
 }
 
 // One message in transit: the opaque raft payload plus its handshake.
@@ -47,6 +57,27 @@ message Hello {
   string node_id = 4;
   // Optional feature flags the sender advertises (empty in M1).
   repeated string feature_flags = 5;
+}
+
+// A follower's request for one snapshot's bytes (rev T).
+message SnapshotRequest {
+  // The snapshot's position. Both are part of its file name, so together they
+  // identify it exactly.
+  uint64 index = 1;
+  uint64 term = 2;
+  // The requester's handshake. Validated *before* a single byte is served: a
+  // snapshot is cluster data, so an unauthenticated caller must not receive it.
+  Hello hello = 3;
+}
+
+// One chunk of a snapshot stream.
+//
+// Chunk boundaries carry no meaning: the receiver concatenates them and
+// validates the snapshot's own CRC (propsol rev T, invariant I9), so the
+// server may split wherever it likes.
+message SnapshotChunk {
+  // The next bytes of the snapshot, in order.
+  bytes data = 1;
 }
 
 // The server's verdict on an inbound `Send`.

@@ -25,8 +25,10 @@ cd "${ROOT_DIR}"
 # feature cannot leave a stale exemption behind.
 known_gaps=(
 
-  # Needs the snapshot transfer path (rate limiting is per stream).
-  "snapshot_transfer_rate_bps:M3 snapshot streaming"
+  # The pacing half is landed (rev T T1: the transport's `snapshot_rate_bps`
+  # token bucket, tested); what is missing is the caller that reads the profile
+  # and installs it (T2, the node/runtime wiring).
+  "snapshot_transfer_rate_bps:rev T T2 (wire the profile into the transport)"
 )
 
 echo "== check-profile-knobs: every ProfileConfig field must be read by production code =="
@@ -50,9 +52,13 @@ is_known_gap() {
 fail=0
 used_gap=""
 for field in "${fields[@]}"; do
+  # A doc comment that *names* a knob is not code that reads it (the transport
+  # documents the profile knob it is given, without seeing the profile). Drop
+  # comment-only lines; a real read is never on one.
   readers="$(
     grep -rEn "\b${field}\b" --include=*.rs arachne/src arachne-node/src arachne-transport-tonic/src \
-      | grep -v '^arachne/src/profile.rs:' || true
+      | grep -v '^arachne/src/profile.rs:' \
+      | grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true
   )"
   if [ -n "${readers}" ]; then
     if is_known_gap "${field}"; then

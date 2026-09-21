@@ -117,6 +117,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Report `std::time` / `tokio::net` occurrences in *code*, i.e. lines that are
+# not purely comments. A test file has to be able to say which imports the rule
+# forbids without tripping the rule itself (this bit is the gate's own
+# documentation problem, not a real violation).
+forbidden_usage() {
+  local root="$1"
+  grep -rn -E 'std::time|tokio::net' --include='*.rs' "${root}" \
+    | grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true
+}
+
 # Gate C — forbid std::time / tokio::net under any *sim* src/ path AND in any
 # tests/ directory.
 # ---------------------------------------------------------------------------
@@ -128,7 +138,9 @@ for root in "${ALL_SRC_ROOTS[@]}"; do
   case "${root}" in
     *sim*)
       [ -d "${root}" ] || continue
-      if grep -rn -E 'std::time|tokio::net' --include='*.rs' "${root}"; then
+      hits="$(forbidden_usage "${root}")"
+      if [ -n "${hits}" ]; then
+        printf '%s\n' "${hits}"
         echo "FAIL (Gate C): found real-time/network usage under '${root}' (matches above)"
         gate_c_status=1
         overall_status=1
@@ -140,7 +152,9 @@ done
 #     into test code either.
 for root in "${ALL_TEST_ROOTS[@]}"; do
   [ -d "${root}" ] || continue
-  if grep -rn -E 'std::time|tokio::net' --include='*.rs' "${root}"; then
+  hits="$(forbidden_usage "${root}")"
+  if [ -n "${hits}" ]; then
+    printf '%s\n' "${hits}"
     echo "FAIL (Gate C): found real-time/network usage under '${root}' (matches above)"
     gate_c_status=1
     overall_status=1

@@ -36,6 +36,7 @@ pub mod factory;
 mod handshake;
 pub mod io;
 pub mod rx;
+pub mod snapshot;
 mod server;
 pub mod transport;
 
@@ -50,6 +51,7 @@ pub use error::TransportError;
 pub use factory::TonicTransportFactory;
 pub use io::{TokioIoProvider, TransportIo};
 pub use rx::TonicRx;
+pub use snapshot::{SnapshotProvider, SnapshotReader};
 pub use transport::TonicTransport;
 
 /// Recover a `Mutex` guard even from a poisoned lock.

@@ -432,6 +432,21 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - **落地顺序**：**T1** proto + tonic 服务端流 + 令牌桶 + `Transport::fetch_snapshot` 默认实现（验证：分块拼接逐字节相同 + **限速可观测**，含 rate=0 反向对照）→ **T2** 运行时编排（元数据快照 → 拉取 → 聚合 → `install_snapshot` → `report_snapshot`）+ **真实 tonic 三节点**回归：把 gRPC 上限调到 64 KiB、让状态机数据超过它，单消息路线必失败、流式路线追上（把 8 MiB 缺口钉成回归测试）→ **T3** 流中断恢复（§9 场景矩阵里的"快照传输中断后恢复"）。
 - **状态**：设计已定（propsol rev T，v0.2.17），**代码待做**。这是 M2/M3 收尾清单上的最后一项。
 
+### 1.27 快照流式传输 T1 落地：`FetchSnapshot` + 令牌桶（传输层）
+
+rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一步（接线在 T2）。
+
+- **proto**：`FetchSnapshot(SnapshotRequest) returns (stream SnapshotChunk)`；`SnapshotRequest{index, term, hello}`（`index`+`term` 就是快照文件名，二者一起唯一确定它）。
+- **`SnapshotProvider` seam**（`arachne-transport-tonic/src/snapshot.rs`）：`open(index, term) -> Option<SnapshotReader{len, reader}>`。**len 与 reader 一次取出**是刻意的——分两次问会撞上"问完大小、快照被压缩掉"从而产生*短读却像传完*的假象；reader 让服务端一次只持有一个分块（64 MiB 快照不该要 64 MiB 堆）。传输 crate 只依赖 `arachne-seam`，所以它不认识存储布局，由知道的人（`arachne-node`）实现 ✓ 依赖方向不变。
+- **服务端**：**先验握手、再取数据**（快照是集群数据；缺握手/异 cluster/协议 major 不符 → `PermissionDenied`，且计入 `handshake_rejections`），随后后台任务从 provider 读 `256 KiB` 分块、经**令牌桶**（`RateLimiter`，0 = 不限）节流、推入**容量 2** 的通道——这就是背压：客户端不读则该任务原地等待，快照不会被堆进内存。
+- **工厂**：`snapshot_provider(...)` / `snapshot_rate_bps(...)` 两个 builder（rate 由调用方给，因为 transmission crate 看不到 profile）。
+- **测试**（`tests/snapshot_stream.rs` 3 项，连跑两次全绿）+ `RateLimiter` 2 项单测：①**逐字节相同**（2×256 KiB+1234 字节跨块拼接；快照自身 CRC 是最终裁判 ⇒ I10）；②**未认证拿不到字节**（三种拒绝 + 计数 = 3）；③**限速可观测**：768 KiB @ 256 KiB/s ⇒ 500ms 内不可能完成、但最终完成，rate=0 同量数据 500ms 内有富余 ⇒ 反向对照成立。
+- **两个门禁的假阳性顺带修掉**（同一类问题：门用纯文本 grep，于是**解释规则的注释**被判成违规）：
+  - `check-profile-knobs.sh`：新代码文档注释里提到 `snapshot_transfer_rate_bps` 就被判成"已被读取"。门现在忽略**整行注释**（`//`/`*`/`/*` 开头）；真实读取永不在注释行上。白名单条目保留（T2 才接线），理由文案改为"T1 已落地、缺 T2 接线"。
+  - `check-entropy.sh` Gate C：`snapshot_stream.rs` 的文档注释引用了被禁的两个标识符就被判违规 ✗（既有的测试文件其实一直在**绕开写**这些字面量）。同样改为忽略整行注释，并做了**反向对照**：临时插入一行真实 `std::time` 用法 → 门 FAIL，撤回 → PASS ✓ 证明门没被削弱。
+- 验证：workspace **404 passed / 0 failed**、`--features fault-injection` **420 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS（含上面两个修好的门）。
+- **T2/T3 待做**：元数据快照（`RaftStorage::snapshot()` 返回无 data 版本）+ 运行时编排（收到元数据快照 → 拉取 → 聚合落盘 → `install_snapshot` → `report_snapshot`）+ `Transport::fetch_snapshot` 默认实现 + **真实 tonic 三节点回归**（把 gRPC 上限调到 64 KiB，让单消息路线必失败、流式路线追上）；T3 流中断恢复。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

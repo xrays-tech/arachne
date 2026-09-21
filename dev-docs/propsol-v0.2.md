@@ -338,11 +338,14 @@ M3 的最后一块（验收 ①②③⑥）。先记录**两个已存在的缺�
 **新增不变量**：**I9** — 安装快照前必须完成 CRC 校验（沿用快照文件的 CRC，不新增信任面）；**I10** — 流式路径与单消息路径**安装结果必须逐字节一致**（同一 `install_snapshot` 入口），因此两条路径可以用同一个断言检查。
 
 **落地顺序**：
-- **T1（传输层）**：proto 增 RPC + tonic 实现（服务端流 + 令牌桶，`snapshot_transfer_rate_bps` 真正被读，从 `check-profile-knobs.sh` 白名单移除）+ `Transport::fetch_snapshot` 默认实现。验证：传输层测试（分块拼接后与原快照逐字节相同、**限速可观测**：上传 N 字节在 `N/rate` 量级完成，反向对照 rate=0 时明显更快）。
+- **T1 ✓（传输层，本轮落地）**：proto 增 `FetchSnapshot(SnapshotRequest) returns (stream SnapshotChunk)`；`SnapshotProvider` seam（`open(index, term) -> Option<SnapshotReader{len, reader}>`——**len 与 reader 一次取出**，避免"问大小"与"取字节"之间被压缩掉而产生的短读；reader 让服务端一次只持有一个分块）；服务端实现为**先验握手再取数据**（快照是集群数据，未认证调用者一个字节也拿不到，拒绝计入 `handshake_rejections`），然后用一个后台任务从 provider 读块、经**令牌桶**（`RateLimiter`，0 = 不限）节流后推入容量 2 的通道（这就是背压：客户端不读则任务原地等待，不会把快照堆进内存）；`TonicTransportFactory` 增 `snapshot_provider(...)` 与 `snapshot_rate_bps(...)` 两个 builder。
+  **验证**（`arachne-transport-tonic/tests/snapshot_stream.rs`，3 项，连跑两次）：①**逐字节相同**（2×256 KiB + 1234 字节跨块拼接，快照自身 CRC 是最终裁判 ⇒ I10）；②**未认证调用者拿不到字节**（缺握手 / 异 cluster / 协议 major 不符 → `PermissionDenied`，且三次拒绝都被计数）；③**限速可观测**：768 KiB @ 256 KiB/s ⇒ 500ms 内**不可能**完成、但最终完成，rate=0 的同一份数据 500ms 内有富余 ⇒ 反向对照成立。另加 `RateLimiter` 单测（rate 0 立即返回；限速后三块耗时落在可观测区间）。
+  **`check-profile-knobs.sh` 的一个假阳性顺带修掉**：新代码的**文档注释**里提到 `snapshot_transfer_rate_bps` 就被判成"已被读取" ✗（门用纯文本 grep）——门现在忽略**整行注释**（`//`/`*`/`/*` 开头），真实读取永远不会在注释行上。白名单条目保留（接线在 T2），理由文案更新为"T1 已落地、缺 T2 接线"。
+  **T1b（原计划放进 T1 的 `Transport::fetch_snapshot` 默认实现）归入 T2**：运行时编排才需要它，留着不接反而多一处未用接口。
 - **T2（运行时）**：`RaftStorage::snapshot()` 在"对端支持流式"时只返回元数据；runtime 收到无 data 的快照消息 → `RaftNode::request_snapshot` 已有的是**发起方**能力，follower 侧要新增"收到元数据快照 → 拉取 → 聚合 → `install_snapshot` → `report_snapshot`"的编排；快照请求与 apply 的排队沿用 §5.5.4 的"同序入队"（快照请求不得抢在已提交条目之前 apply）。验证：**真实 tonic 三节点**、把 gRPC 上限调到 64 KiB、让状态机数据超过它 → 单消息路线必失败、流式路线追上（这正是把 8 MiB 缺口钉成回归测试）。
 - **T3（中断恢复）**：流中途断开 → 丢弃 tmp、report failure、重试后追上；并把 §9 的"快照传输中断后恢复"场景补进 L2/L3。
 
-**本 rev 状态**：**设计已定，代码待做**（T1–T3）。这是 M2/M3 收尾清单上的最后一项。
+**本 rev 状态**：**T1 已落地**（传输层 RPC + 令牌桶 + 3 项集成测试）；**T2/T3 待做**（元数据快照 + 运行时编排 + 真实 tonic 三节点回归；中断恢复）。这是 M2/M3 收尾清单上的最后一项。
 
 ## 1. 目标与非目标
 

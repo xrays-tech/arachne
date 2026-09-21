@@ -24,9 +24,10 @@ prost = "0.13"
 # transitive weight.)
 tokio = { version = "1", features = ["full"] }
 # `tokio-stream` provides `TcpListenerStream`, the incoming-connection stream the
-# tonic server drains from a pre-bound listener. `tokio-util` provides the
+# tonic server drains from a pre-bound listener, and `ReceiverStream`, the
+# server half of the snapshot stream (rev T). `tokio-util` provides the
 # `CancellationToken` used to stop servers on `shutdown`.
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "1"
 # The I/O seam (`src/io.rs`). These are all already in the dependency tree via

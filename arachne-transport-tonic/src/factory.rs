@@ -40,6 +40,7 @@ use crate::handshake::build_hello;
 use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_server::RaftTransportServer;
 use crate::rx::TonicRx;
+use crate::snapshot::SnapshotProvider;
 use crate::server::RaftTransportService;
 use crate::transport::TonicTransport;
 use crate::unlock;
@@ -84,6 +85,11 @@ pub(crate) struct TransportConfig {
     pub keep_alive_timeout: Duration,
     /// Max gRPC message size (decoding and encoding, client and server) (F3).
     pub max_message_size: usize,
+    /// Pacing for an outgoing snapshot stream, in bytes/second (rev T). 0 =
+    /// unlimited, which is the pre-streaming behaviour and the default here:
+    /// the value comes from the profile (`snapshot_transfer_rate_bps`), which
+    /// only the caller holds.
+    pub snapshot_rate_bps: u64,
 }
 
 /// A started server: the token that stops it and the task that owns it.
@@ -117,6 +123,10 @@ struct FactoryInner<Io: TransportIo> {
     receivers: Mutex<HashMap<NodeId, Receiver<Inbound>>>,
     /// Cluster-wide handshake-rejection counter.
     rejects: Arc<AtomicU64>,
+    /// Where snapshot bytes come from, when this node serves them (rev T).
+    /// Set once before `start`; `None` makes `FetchSnapshot` answer
+    /// `unavailable` instead of pretending the node can serve snapshots.
+    snapshot_provider: Mutex<Option<Arc<dyn SnapshotProvider>>>,
     /// Live server handles, set by `start`, consumed by `shutdown`.
     servers: Mutex<Option<Vec<ServerHandle>>>,
     /// Resolved transport knobs; the optional setters overwrite individual
@@ -204,6 +214,7 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
                 senders: Mutex::new(senders),
                 receivers: Mutex::new(receivers),
                 rejects: Arc::new(AtomicU64::new(0)),
+            snapshot_provider: Mutex::new(None),
                 servers: Mutex::new(None),
                 config: Mutex::new(TransportConfig {
                     connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -211,6 +222,7 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
                     keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
                     keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
                     max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                    snapshot_rate_bps: 0,
                 }),
             }),
         }
@@ -242,6 +254,27 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
 
     /// Override the gRPC message-size cap (F3). Applied to decoding *and*
     /// encoding on both the client and the server. Call before [`Self::start`]/[`Self::create`].
+    /// Pace outgoing snapshot streams at `bytes_per_sec` (0 = unlimited).
+    ///
+    /// Comes from the profile's `snapshot_transfer_rate_bps`; the transport
+    /// crate has no access to the profile, so the caller (the node binary)
+    /// passes it down (rev T).
+    pub fn snapshot_rate_bps(&self, bytes_per_sec: u64) -> &Self {
+        unlock(&self.inner.config).snapshot_rate_bps = bytes_per_sec;
+        self
+    }
+
+    /// Install the source of snapshot bytes this node serves (rev T).
+    ///
+    /// Must be called before [`start`](TonicTransportFactory::start): the gRPC
+    /// service is built at start-up and captures the provider then. Without it,
+    /// `FetchSnapshot` answers `unavailable` — a node that cannot serve
+    /// snapshots must say so rather than hang a follower.
+    pub fn snapshot_provider(&self, provider: Arc<dyn SnapshotProvider>) -> &Self {
+        *unlock(&self.inner.snapshot_provider) = Some(provider);
+        self
+    }
+
     pub fn max_message_size(&self, size: usize) -> &Self {
         unlock(&self.inner.config).max_message_size = size;
         self
@@ -384,6 +417,8 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
                 self.inner.protocol_minor,
                 Arc::clone(&self.inner.rejects),
                 sender,
+                unlock(&self.inner.snapshot_provider).clone(),
+                config.snapshot_rate_bps,
             );
             let cancel = CancellationToken::new();
             let server = Server::builder()
