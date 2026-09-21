@@ -1,4 +1,3 @@
-//! `RaftNode`: wraps `raft::RawNode` with the frozen persist/send ordering.
 //!
 //! # Ready loop (invariants I1–I4)
 //!
@@ -908,7 +907,6 @@ where
             .map_err(|e| NodeError::Codec(e.to_string()))?;
         raft_msg.set_from(from);
         if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapStatus {
-            eprintln!("[probe] node got MsgSnapshotStatus from={} reject={}", from, raft_msg.get_reject());
         }
         if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
             // A metadata-only snapshot in streamed mode is held back: the
@@ -1002,6 +1000,30 @@ where
         store.save_snapshot(&snapshot).map_err(NodeError::Raft)?;
         store.compact(index).map_err(NodeError::Raft)?;
         Ok(())
+    }
+
+    /// A snapshot of raft's own view of one peer's replication progress
+    /// (rev T): `(state, paused, matched, next_idx, pending_snapshot,
+    /// recent_active)`.
+    ///
+    /// The gates that decide whether a lagging peer is sent a snapshot live
+    /// inside raft, so answering "why is this follower not being caught up"
+    /// means looking at this state. `None` when raft tracks no progress for
+    /// that node (not a member).
+    pub fn peer_progress(
+        &self,
+        node_id: RaftId,
+    ) -> Option<(raft::ProgressState, bool, u64, u64, u64, bool)> {
+        let status = self.raw.status();
+        let progress = status.progress?.get(node_id)?;
+        Some((
+            progress.state,
+            progress.paused,
+            progress.matched,
+            progress.next_idx,
+            progress.pending_snapshot,
+            progress.recent_active,
+        ))
     }
 
     /// Whether this node streams snapshots instead of carrying them in the raft
