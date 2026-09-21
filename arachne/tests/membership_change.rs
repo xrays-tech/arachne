@@ -109,12 +109,28 @@ async fn until_leader(metrics: &Metrics) {
 }
 
 /// The durable membership as it would be recovered on the next start.
-fn recovered_conf_state(dir: &PathBuf) -> (u64, Vec<u64>, Vec<u64>) {
-    recovered_conf_state_for(dir, 1)
+async fn recovered_conf_state(dir: &PathBuf) -> (u64, Vec<u64>, Vec<u64>) {
+    recovered_conf_state_for(dir, 1).await
 }
 
-fn recovered_conf_state_for(dir: &PathBuf, i: u64) -> (u64, Vec<u64>, Vec<u64>) {
-    let wal = WalStorage::open(dir, wal_options_for(i)).expect("reopen wal");
+async fn recovered_conf_state_for(dir: &PathBuf, i: u64) -> (u64, Vec<u64>, Vec<u64>) {
+    // A crashed node releases its data-directory lock asynchronously, so this
+    // retries rather than assuming the abort has already unwound.
+    let mut last = String::new();
+    let mut opened = None;
+    for _ in 0..200 {
+        match WalStorage::open(dir, wal_options_for(i)) {
+            Ok(wal) => {
+                opened = Some(wal);
+                break;
+            }
+            Err(e) => {
+                last = e.to_string();
+                tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    let wal = opened.unwrap_or_else(|| panic!("reopen wal: {last}"));
     let state = wal.initial_state().expect("initial state");
     (
         wal.conf_change_index(),
@@ -171,7 +187,7 @@ async fn a_conf_change_is_routed_applied_and_survives_restart() {
     // restart would recover.
     drop(handle);
     thread.shutdown();
-    let (index, voters, learners) = recovered_conf_state(&dir);
+    let (index, voters, learners) = recovered_conf_state(&dir).await;
     assert!(index > 0, "the ConfChange index must be durable");
     assert_eq!(voters, vec![1], "this node stays the only voter");
     assert_eq!(learners, vec![2], "node 2 was added as a learner");
@@ -189,7 +205,7 @@ async fn a_conf_change_is_routed_applied_and_survives_restart() {
     drop(handle);
     thread.shutdown();
     assert_eq!(
-        recovered_conf_state(&dir),
+        recovered_conf_state(&dir).await,
         (index, vec![1], vec![2]),
         "membership must be identical after a restart"
     );
@@ -233,7 +249,7 @@ async fn a_conf_change_is_applied_between_the_commands_around_it() {
     // The change sits exactly between the two writes in the log, and the
     // durable membership records that index — which is only possible if the
     // change was applied after `k1` and before `k2`.
-    let (index, voters, learners) = recovered_conf_state(&dir);
+    let (index, voters, learners) = recovered_conf_state(&dir).await;
     assert_eq!(
         index,
         index_before + 1,
@@ -320,7 +336,7 @@ async fn a_second_membership_change_is_rejected_while_one_is_in_flight() {
 
     drop(handle);
     thread.shutdown();
-    let (_, voters, learners) = recovered_conf_state(&dir);
+    let (_, voters, learners) = recovered_conf_state(&dir).await;
     assert_eq!(voters, vec![1]);
     assert_eq!(
         learners.len(),
@@ -362,6 +378,23 @@ async fn spawn_cluster_node_with(
     profile: &ProfileConfig,
 ) -> ClusterNode {
     let dir = temp_dir(&format!("n{i}"));
+    spawn_cluster_node_at(dir, i, n, bootstrap_voters, join_as_learner, factory, addresses, profile)
+        .await
+}
+
+/// Spawn one node on a specific data directory — which is what restarting a
+/// crashed node means (rev S S5, INV-4).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_cluster_node_at(
+    dir: PathBuf,
+    i: u64,
+    n: u64,
+    bootstrap_voters: Vec<u64>,
+    join_as_learner: bool,
+    factory: &InMemoryTransportFactory,
+    addresses: &HashMap<NodeId, SocketAddr>,
+    profile: &ProfileConfig,
+) -> ClusterNode {
     let mut last = String::new();
     let mut opened = None;
     for _ in 0..200 {
@@ -534,7 +567,7 @@ async fn leadership_moves_and_a_leader_can_be_removed() {
         }
     }
     let dir = nodes[(survivor - 1) as usize].dir.clone();
-    let (_, voters, _) = recovered_conf_state_for(&dir, survivor);
+    let (_, voters, _) = recovered_conf_state_for(&dir, survivor).await;
     assert_eq!(voters.len(), 2, "the configuration shrank to two voters");
     assert!(
         !voters.contains(&target),
@@ -587,7 +620,7 @@ async fn a_learner_that_never_answered_cannot_be_promoted() {
     handle.put(b"k", b"v").await.expect("writes still work");
     drop(handle);
     thread.shutdown();
-    let (_, voters, learners) = recovered_conf_state(&dir);
+    let (_, voters, learners) = recovered_conf_state(&dir).await;
     assert_eq!(voters, vec![1], "nothing was promoted");
     assert_eq!(learners, vec![2], "the learner is still a learner");
     let _ = std::fs::remove_dir_all(&dir);
@@ -746,7 +779,7 @@ async fn a_new_node_joins_as_a_learner_is_promoted_and_a_member_is_removed() {
         }
     }
     let dir = nodes[(survivor - 1) as usize].dir.clone();
-    let (_, voters_now, learners_now) = recovered_conf_state_for(&dir, survivor);
+    let (_, voters_now, learners_now) = recovered_conf_state_for(&dir, survivor).await;
     assert_eq!(voters_now.len(), 3, "three voters remain: {voters_now:?}");
     assert!(
         !voters_now.contains(&current),
@@ -755,6 +788,112 @@ async fn a_new_node_joins_as_a_learner_is_promoted_and_a_member_is_removed() {
     assert!(
         learners_now.is_empty(),
         "node 4 was promoted, so no learners remain: {learners_now:?}"
+    );
+
+    for n in &nodes {
+        let _ = std::fs::remove_dir_all(&n.dir);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learner_that_crashes_at_promotion_recovers_and_converges() {
+    // INV-4 (test-plan matrix): power loss at the instant a learner catches up
+    // and is promoted. The crash destroys whatever the learner had applied but
+    // not made durable, so the interesting question is whether it converges
+    // afterwards — membership is a function of the log and the snapshot, never
+    // of what a crashed node remembered (invariants I6/I8).
+    const TOTAL: u64 = 4;
+    let profile = profile();
+    let factory = InMemoryTransportFactory::new();
+    let addresses: HashMap<NodeId, SocketAddr> = (1..=TOTAL)
+        .map(|i| (nid(i), SocketAddr::from(([127, 0, 0, 1], 7400 + i as u16))))
+        .collect();
+    let voters: Vec<u64> = (1..=3).collect();
+
+    let mut nodes: Vec<ClusterNode> = Vec::new();
+    for i in 1..=3 {
+        nodes.push(
+            spawn_cluster_node_with(i, TOTAL, voters.clone(), false, &factory, &addresses, &profile)
+                .await,
+        );
+    }
+    nodes.push(
+        spawn_cluster_node_with(4, TOTAL, voters.clone(), true, &factory, &addresses, &profile).await,
+    );
+    link_peers(&nodes);
+
+    let leader = wait_for_leader(&nodes[..3]).await;
+    let leader_handle = nodes[(leader - 1) as usize].handle.clone();
+    leader_handle
+        .add_learner(4)
+        .await
+        .expect("the learner must be added");
+    for i in 0..10u64 {
+        until_put(&leader_handle, b"load", format!("v{i}").as_bytes()).await;
+    }
+    let target = nodes[(leader - 1) as usize].metrics.commit_index();
+    wait_until(
+        || nodes[3].metrics.applied_index() >= target,
+        "the learner to catch up",
+    )
+    .await;
+
+    // Crash the learner exactly around the promotion: it stops acknowledging, so
+    // the promotion decision is made on its last known progress while the
+    // promotion entry may or may not have reached its log.
+    let learner_dir = nodes[3].dir.clone();
+    if let Some(task) = nodes[3].task.take() {
+        task.abort();
+    }
+    leader_handle
+        .promote_learner(4)
+        .await
+        .expect("a caught-up learner is promotable even while it is away");
+
+    // Three of the four voters are up, so the cluster must keep serving.
+    until_put(&leader_handle, b"during", b"downtime").await;
+
+    // Restart it on its own data directory, and let everyone find its new handle.
+    let restarted = spawn_cluster_node_at(
+        learner_dir.clone(),
+        4,
+        TOTAL,
+        voters.clone(),
+        true,
+        &factory,
+        &addresses,
+        &profile,
+    )
+    .await;
+    nodes[3] = restarted;
+    link_peers(&nodes);
+
+    // It rejoins, catches up, and ends up with the configuration the cluster
+    // agreed on (a voter), not the one it had when it crashed (a learner).
+    let committed = nodes[(leader - 1) as usize].metrics.commit_index();
+    wait_until(
+        || nodes[3].metrics.applied_index() >= committed,
+        "the restarted node to catch up",
+    )
+    .await;
+    until_put(&leader_handle, b"after", b"restart").await;
+
+    // Read the restarted node's own durable membership — the state it would
+    // come back with next time.
+    for n in nodes.iter_mut() {
+        if let Some(task) = n.task.take() {
+            task.abort();
+        }
+    }
+    let (_, voters_now, learners_now) = recovered_conf_state_for(&learner_dir, 4).await;
+    assert_eq!(
+        voters_now.len(),
+        4,
+        "the restarted node must converge on the promoted configuration: {voters_now:?}"
+    );
+    assert!(
+        learners_now.is_empty(),
+        "and must no longer think of itself as a learner: {learners_now:?}"
     );
 
     for n in &nodes {

@@ -412,7 +412,10 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - 顺带把转让后那条断言从"瞬时相等"改成**收敛断言**（`wait_until_all_agree_on`）：leader 交接瞬间旧 leader 会清空自己的 `lead`（`metrics.leader_id()` 短暂为 0），原来那句 `assert_eq!` 是采样了一个瞬时态 ✗（本轮就复现了一次）。
 - 验证：workspace 393/0、fault-injection 408/0、l2 3/0、四门禁全 PASS；S4 的 CI run（35610429679）**success**（含 fault-injection 步骤，抖动修复在 CI 上生效）。
 - **一个未复现的抖动（记录在案）**：本轮的第一次 workspace 全量跑出现 `passed=263 failed=1`（cargo 在首个失败二进制后停止，所以总数偏低），但**失败测试名没有被捕获**（汇总脚本只统计 `test result` 行），随后连跑两次均 393/0。与 §1.17 记录的那个未定位抖动同类：CI 是权威门禁且会打印失败用例名，若再现按 CI 日志定位。
-- **S5 剩余**：INV-4（learner 追平瞬间断电 → 重启后成员状态与日志前缀自洽）；`arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。
+- **INV-4 已落地**（`a_learner_that_crashes_at_promotion_recovers_and_converges`，连跑绿）：第 4 节点追平后**断电**（abort 其 runtime）→ 在它缺席时 `promote_learner(4)` 仍成功（门用的是它最近一次应答的进度：`matched > 0` 且不落后）→ 三票仍可写 → 用**同一 data_dir** 重启（`spawn_cluster_node_at`，并把新 handle 重新注册给所有节点）→ 重新追平，且**它自己的持久成员配置收敛为 4 voter、不再含 learner**。这条断言的要点：成员是"日志 + 快照"的函数，不是"崩溃节点记住了什么"（I6/I8）。
+  顺带把 post-mortem 读 WAL 的 helper 改成**带重试**（崩溃节点的目录锁是异步释放的，第一次跑就撞上 `data directory is locked` ✗）。
+- **S5 剩余**：`arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）——M3 验收 ①②③⑥ 已全部覆盖，这一项是运维面而非验收项。
+- 验证：workspace 393/0、fault-injection 409/0（含新增 INV-4）、l2 3/0、四门禁全 PASS；S5a 的 CI run（35613202715）**success**。
 
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
