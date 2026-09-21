@@ -90,6 +90,12 @@ jobs:
       - name: Entropy gate
         run: bash scripts/check-entropy.sh
 
+      - name: Profile-knob gate
+        # Every tuned knob in `ProfileConfig` must be read by production code:
+        # `wal_trailing_keep` and `proposal_queue_bytes` both sat unread for
+        # milestones while operators could set them.
+        run: bash scripts/check-profile-knobs.sh
+
       - name: Release-feature gate (D-ART-testobs)
         # Proves the shipped `arachne-node` artifact excludes the
         # `test-observability` feature (the one recorded "test code in
