@@ -43,7 +43,12 @@ jobs:
       - name: Install protoc 3.x (raft-proto codegen requirement)
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/protoc.zip \
+          # The GitHub release CDN occasionally answers 502/504; a transient
+          # gateway error must not fail the pipeline (observed on run
+          # 35617415582). `--retry-all-errors` covers those non-2xx statuses,
+          # which plain `--retry` would not.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o /tmp/protoc.zip \
             https://github.com/protocolbuffers/protobuf/releases/download/v3.20.3/protoc-3.20.3-linux-x86_64.zip
           unzip -o -q /tmp/protoc.zip -d "$HOME/protoc3"
           echo "$HOME/protoc3/bin" >> "$GITHUB_PATH"
@@ -144,7 +149,12 @@ jobs:
       - name: Install protoc 3.x (raft-proto codegen requirement)
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/protoc.zip \
+          # The GitHub release CDN occasionally answers 502/504; a transient
+          # gateway error must not fail the pipeline (observed on run
+          # 35617415582). `--retry-all-errors` covers those non-2xx statuses,
+          # which plain `--retry` would not.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o /tmp/protoc.zip \
             https://github.com/protocolbuffers/protobuf/releases/download/v3.20.3/protoc-3.20.3-linux-x86_64.zip
           unzip -o -q /tmp/protoc.zip -d "$HOME/protoc3"
           echo "$HOME/protoc3/bin" >> "$GITHUB_PATH"
@@ -178,7 +188,12 @@ jobs:
       - name: Install protoc 3.x (raft-proto codegen requirement)
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/protoc.zip \
+          # The GitHub release CDN occasionally answers 502/504; a transient
+          # gateway error must not fail the pipeline (observed on run
+          # 35617415582). `--retry-all-errors` covers those non-2xx statuses,
+          # which plain `--retry` would not.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o /tmp/protoc.zip \
             https://github.com/protocolbuffers/protobuf/releases/download/v3.20.3/protoc-3.20.3-linux-x86_64.zip
           unzip -o -q /tmp/protoc.zip -d "$HOME/protoc3"
           echo "$HOME/protoc3/bin" >> "$GITHUB_PATH"
