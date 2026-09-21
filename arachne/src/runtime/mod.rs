@@ -43,7 +43,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::client::{ArachneError, Handle};
 use crate::consensus::{
-    CommittedEntry, NodeError, RaftNode, RaftNodeConfig, conf_change_identity,
+    CommittedEntry, HeldSnapshot, NodeError, RaftNode, RaftNodeConfig, conf_change_identity,
     learner_caught_up,
 };
 use crate::metrics::Metrics;
@@ -258,6 +258,27 @@ struct PendingConf {
     index: Option<LogIndex>,
 }
 
+/// A streamed snapshot transfer in flight (propsol rev T, T2b).
+struct SnapshotFetch {
+    /// The message that was held back, to be stepped once the bytes are in.
+    held: HeldSnapshot,
+    /// Where the fetch task is writing.
+    dest: std::path::PathBuf,
+}
+
+/// A finished background snapshot fetch.
+struct SnapshotFetchDone {
+    /// Which snapshot this was for, so a stale completion (the peer sent a newer
+    /// snapshot while this one was still transferring) is ignored instead of
+    /// installing the wrong bytes.
+    from: RaftId,
+    index: LogIndex,
+    /// Where the bytes landed.
+    dest: std::path::PathBuf,
+    /// `Ok(None)` = this transport cannot stream (never "empty snapshot").
+    result: Result<Option<u64>, String>,
+}
+
 /// A leadership transfer awaiting its outcome (propsol v0.2.16 rev S).
 ///
 /// `RawNode::transfer_leader` only sends a message: the reply has to wait for
@@ -453,10 +474,12 @@ enum Outcome {
     /// the actor instead of making it wait for a tick.
     Durability,
     Command(Option<Command>),
+    /// A background snapshot fetch finished (rev T).
+    SnapshotFetched(Option<SnapshotFetchDone>),
 }
 
 /// The node runtime actor.
-pub struct Runtime<T: Transport, Tr: TransportRx> {
+pub struct Runtime<T: Transport + Clone, Tr: TransportRx> {
     node: RaftNode<WalStorage, T, Tr>,
     /// The apply task, handed to `run` to spawn. `None` once running.
     apply_task: Option<ApplyTask>,
@@ -476,6 +499,15 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     deferred: Option<ApplyBatch>,
     /// A local snapshot the apply task is serializing.
     snapshot_wait: Option<oneshot::Receiver<Result<(LogIndex, Vec<u8>), String>>>,
+    /// A second handle to the transport, for the background snapshot fetch
+    /// (rev T): a fetch can take seconds, so it cannot run on the actor.
+    transport: T,
+    /// A streamed snapshot being fetched: the held message plus where the bytes
+    /// are landing (rev T).
+    snapshot_fetch: Option<SnapshotFetch>,
+    /// Where the fetch task reports back.
+    snapshot_fetches: mpsc::Sender<SnapshotFetchDone>,
+    snapshot_fetch_rx: mpsc::Receiver<SnapshotFetchDone>,
     /// The last confirmed applied index (from the apply task).
     applied_index: LogIndex,
     /// Cumulative bytes confirmed applied.
@@ -552,7 +584,7 @@ pub struct Runtime<T: Transport, Tr: TransportRx> {
     snapshot_index: LogIndex,
 }
 
-impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
+impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
     /// Assemble the runtime and its local [`Handle`].
     pub fn new(
         config: RuntimeConfig,
@@ -603,6 +635,16 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             failed: None,
         };
 
+        // The transport's own answer decides how snapshots travel (rev T): a
+        // transport that carries them inside the raft message keeps the
+        // pre-streaming path, and one that cannot (a message-size cap a
+        // snapshot will not fit through) streams the bytes separately.
+        let streamed_snapshots = transport.supports_snapshot_streaming();
+        let mut raft_config = config.raft.clone();
+        raft_config.streamed_snapshots = streamed_snapshots;
+        // A second handle for background fetches: a transfer can take seconds,
+        // so it cannot run on the actor.
+        let fetch_transport = transport.clone();
         let node = RaftNode::new_with_config(
             config.self_raft_id,
             config.peers.clone(),
@@ -610,7 +652,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             transport,
             rx,
             0,
-            config.raft,
+            raft_config,
             logger,
         )?;
 
@@ -627,6 +669,9 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
 
         let (tx, commands) = mpsc::channel(1024);
         let handle = Handle::new_local(config.self_node_id.clone(), tx, &config.profile);
+        // One fetch at a time: raft hands one snapshot at a time, so a deep
+        // queue would only hide a bug.
+        let (snapshot_fetches, snapshot_fetch_rx) = mpsc::channel::<SnapshotFetchDone>(1);
 
         let period = Duration::from_millis(config.profile.heartbeat_interval_ms.max(1));
         let durability = node.durability_notifier();
@@ -641,6 +686,10 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
             stop: Arc::clone(&stop),
             deferred: None,
             snapshot_wait: None,
+            transport: fetch_transport,
+            snapshot_fetch: None,
+            snapshot_fetches,
+            snapshot_fetch_rx,
             applied_index,
             applied_bytes_total: 0,
             sent_bytes_total: 0,
@@ -696,6 +745,7 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                 _ = self.durability.notified() => Outcome::Durability,
                 cmd = self.commands.recv() => Outcome::Command(cmd),
                 msg = self.node.rx().recv() => Outcome::Inbound(msg),
+                fetch = self.snapshot_fetch_rx.recv() => Outcome::SnapshotFetched(fetch),
             };
             match outcome {
                 Outcome::Stop => break,
@@ -713,6 +763,10 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
                     }
                 }
                 Outcome::Inbound(None) => break,
+                Outcome::SnapshotFetched(Some(done)) => self.finish_snapshot_fetch(done),
+                // The fetch channel is only closed when the runtime is going
+                // away; there is nothing to finish.
+                Outcome::SnapshotFetched(None) => {}
                 // Durability completions are consumed by `drive_cycle` (which
                 // runs after every event); waking is the whole point.
                 Outcome::Durability => {}
@@ -1703,7 +1757,133 @@ impl<T: Transport, Tr: TransportRx> Runtime<T, Tr> {
     fn route_inbound(&mut self, from: NodeId, msg: TransportMessage) {
         if let Some(id) = self.node_to_raft.get(from.as_str()).copied() {
             let _ = self.node.on_message(id, msg);
+            // rev T: a streamed snapshot message is held back by the node (raft
+            // must not restore metadata the storage cannot honour). Fetch its
+            // bytes now, off the actor.
+            if let Some(held) = self.node.take_held_snapshot() {
+                self.start_snapshot_fetch(held);
+            }
         }
+    }
+
+    /// Start the background transfer for a held snapshot message (rev T).
+    ///
+    /// The fetch runs in its own task: a snapshot can be tens of megabytes and
+    /// is paced, so awaiting it here would stall ticks, heartbeats and reads for
+    /// the whole transfer.
+    fn start_snapshot_fetch(&mut self, held: HeldSnapshot) {
+        // A newer snapshot supersedes one still in flight; its completion is
+        // ignored by the identity check in `finish_snapshot_fetch`, and its file
+        // is dropped here.
+        if let Some(previous) = self.snapshot_fetch.take() {
+            let _ = std::fs::remove_file(&previous.dest);
+        }
+        let Some(node_id) = self.raft_to_node.get(&held.from).cloned() else {
+            // The sender is not in this node's peer map: nothing to fetch from,
+            // so report failure (raft retries) instead of stalling.
+            self.node.report_snapshot(held.from, false);
+            return;
+        };
+        let dest = std::env::temp_dir().join(format!(
+            "arachne-snapshot-{}-{}-{}.fetch",
+            held.from, held.index, self.raft_id
+        ));
+        let transport = self.transport.clone();
+        let done_tx = self.snapshot_fetches.clone();
+        let (from, index, term) = (held.from, held.index, held.term);
+        let task_dest = dest.clone();
+        tokio::spawn(async move {
+            let result = transport
+                .fetch_snapshot(node_id, index, term, &task_dest)
+                .await
+                .map_err(|e| e.to_string());
+            // A full queue means the actor is gone; nothing to report to.
+            let _ = done_tx
+                .send(SnapshotFetchDone {
+                    from,
+                    index,
+                    dest: task_dest,
+                    result,
+                })
+                .await;
+        });
+        self.snapshot_fetch = Some(SnapshotFetch { held, dest });
+    }
+
+    /// Finish a streamed snapshot transfer: install, step, report (rev T).
+    ///
+    /// Nothing has reached raft while the transfer was in flight, so every
+    /// failure path here is simply "report failure and let raft retry": no
+    /// metadata was restored that the storage cannot back.
+    fn finish_snapshot_fetch(&mut self, done: SnapshotFetchDone) {
+        let is_current = self.snapshot_fetch.as_ref().is_some_and(|f| {
+            f.held.from == done.from && f.held.index == done.index
+        });
+        if !is_current {
+            // Superseded by a newer snapshot: drop the bytes and say nothing.
+            let _ = std::fs::remove_file(&done.dest);
+            return;
+        }
+        let fetch = self.snapshot_fetch.take().expect("checked just above");
+
+        let Some(file_bytes) = (match done.result {
+            Ok(Some(_)) => std::fs::read(&done.dest).ok(),
+            // `Ok(None)` = this transport cannot stream; `Err` = the transfer
+            // failed. Neither is an empty snapshot.
+            _ => None,
+        }) else {
+            slog::warn!(
+                self.logger,
+                "streamed snapshot fetch failed";
+                "from" => fetch.held.from,
+                "index" => fetch.held.index,
+            );
+            self.node.report_snapshot(fetch.held.from, false);
+            let _ = std::fs::remove_file(&done.dest);
+            return;
+        };
+
+        let snapshot = match crate::storage::snapshot::decode_snapshot(&file_bytes) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                // The file carries its own CRC, so this is a corrupt or
+                // truncated transfer: fail it rather than install it (I9).
+                slog::warn!(
+                    self.logger,
+                    "streamed snapshot failed to decode";
+                    "error" => %e,
+                    "index" => fetch.held.index,
+                );
+                self.node.report_snapshot(fetch.held.from, false);
+                let _ = std::fs::remove_file(&done.dest);
+                return;
+            }
+        };
+
+        // Durable install first: raft must never restore a snapshot the storage
+        // does not have. `install_snapshot` is idempotent, so the copy that
+        // arrives through the next `Ready` is harmless.
+        // Step it into raft **before** touching storage. The message now carries
+        // the real bytes, so raft restores its log state and the ordinary
+        // `Ready` path installs the snapshot and hands it to the state machine —
+        // one code path for both routes. Installing first would be wrong: raft's
+        // `restore` verifies the snapshot against the *storage*, and a storage
+        // that had already rotated its log past that index makes `restore` fail
+        // silently, leaving raft's log inconsistent with it (observed as a raft
+        // `unstable.slice` out-of-bounds panic on the next AppendEntries).
+        let data = snapshot.data.clone();
+        if let Err(e) = self.node.step_held_snapshot(&fetch.held, data) {
+            // A codec/raft failure: this node cannot make progress from here.
+            self.fail_all_pending(&format!("stepping a fetched snapshot failed: {e}"));
+            self.node.report_snapshot(fetch.held.from, false);
+            let _ = std::fs::remove_file(&done.dest);
+            return;
+        }
+        // raft keeps the follower in `Snapshot` state (and sends it nothing
+        // else) until it hears how the transfer ended.
+        self.node.report_snapshot(fetch.held.from, true);
+        let _ = std::fs::remove_file(&done.dest);
+        self.metrics.inc_snapshots_installed();
     }
 
     /// The current leader hint: `(node id, address)` if a leader is known.
@@ -1791,7 +1971,7 @@ impl Drop for RuntimeThread {
 
 impl<T, Tr> Runtime<T, Tr>
 where
-    T: Transport + Send + 'static,
+    T: Transport + Clone + Send + 'static,
     Tr: TransportRx + Send + 'static,
 {
     /// Run this actor on a **dedicated OS thread** with its own current-thread

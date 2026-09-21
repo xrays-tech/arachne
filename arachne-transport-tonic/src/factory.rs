@@ -493,12 +493,17 @@ impl<Io: TransportIo> TransportFactory for TonicTransportFactory<Io> {
             &self.inner.feature_flags,
         );
         let config = *unlock(&self.inner.config);
+        // A transport may fetch snapshots only if this node can serve them too:
+        // mixing the two roles would let a leader send metadata-only snapshots
+        // its peers could never complete (rev T).
+        let serves_snapshots = unlock(&self.inner.snapshot_provider).is_some();
         let tx = TonicTransport::new(
             self.inner.io.connector(),
             Arc::clone(&self.inner.addresses),
             me.clone(),
             hello,
             config,
+            serves_snapshots,
         );
 
         let rx = match unlock(&self.inner.receivers).remove(&me) {

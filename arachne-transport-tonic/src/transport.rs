@@ -53,6 +53,14 @@ pub struct TonicTransport<Io: TransportIo = TokioIoProvider> {
     /// Client-side transport knobs (timeouts, keep-alive, message size),
     /// resolved from the factory's config at construction.
     config: TransportConfig,
+    /// Whether this node can *serve* snapshots — i.e. whether the factory had a
+    /// provider when this transport was minted (rev T).
+    ///
+    /// It gates the streaming capability deliberately: a node that could fetch
+    /// but not serve would make the leader send metadata-only snapshots that its
+    /// peers can never complete, so the safe default (no provider) keeps the
+    /// pre-streaming path exactly as it was.
+    serves_snapshots: bool,
     /// The client-side connector used to dial peers.
     connector: <Io as TransportIo>::Connector,
 }
@@ -68,6 +76,7 @@ impl<Io: TransportIo> TonicTransport<Io> {
         self_id: NodeId,
         hello: Hello,
         config: TransportConfig,
+        serves_snapshots: bool,
     ) -> Self {
         Self {
             addresses,
@@ -75,6 +84,7 @@ impl<Io: TransportIo> TonicTransport<Io> {
             hello,
             channels: Arc::new(Mutex::new(HashMap::new())),
             config,
+            serves_snapshots,
             connector,
         }
     }
@@ -129,7 +139,8 @@ impl<Io: TransportIo> Transport for TonicTransport<Io> {
     }
 
     fn supports_snapshot_streaming(&self) -> bool {
-        true
+        // Only when the node can also serve them (see `serves_snapshots`).
+        self.serves_snapshots
     }
 
     /// Fetch a snapshot from `from` and write it to `dest` (propsol rev T).

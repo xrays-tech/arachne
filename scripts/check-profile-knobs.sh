@@ -23,12 +23,10 @@ cd "${ROOT_DIR}"
 # Knobs that are deliberately not read yet, each with the work that will wire it.
 # Keep this list shrinking: the gate fails if an entry becomes used, so a landed
 # feature cannot leave a stale exemption behind.
+# Empty: every knob is read by production code. The transport's snapshot rate
+# was the last gap, closed by rev T T2b (`arachne-node` installs the provider and
+# the profile's rate on its factory). Keep this list empty, or shrink it.
 known_gaps=(
-
-  # The pacing half is landed (rev T T1: the transport's `snapshot_rate_bps`
-  # token bucket, tested); what is missing is the caller that reads the profile
-  # and installs it (T2, the node/runtime wiring).
-  "snapshot_transfer_rate_bps:rev T T2 (wire the profile into the transport)"
 )
 
 echo "== check-profile-knobs: every ProfileConfig field must be read by production code =="

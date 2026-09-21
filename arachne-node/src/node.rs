@@ -128,6 +128,16 @@ impl Arachne {
             Vec::new(),
             config.addresses.clone(),
         );
+        // Serve snapshots to followers and pace the transfer (propsol rev T):
+        // without a provider the transport does not advertise streaming at all
+        // (a leader that could not serve would hand out metadata-only snapshots
+        // its peers could never complete), and the profile's rate is what keeps
+        // a 64 MiB transfer from starving replication traffic.
+        factory.snapshot_provider(crate::snapshot_source::DataDirSnapshots::new(
+            config.data_dir.clone(),
+        ));
+        factory.snapshot_rate_bps(profile.snapshot_transfer_rate_bps);
+
         // Bind ONLY this node's listener and start serving it. This node id is
         // guaranteed to be in the factory's address map: the map holds every
         // `initial_cluster` member, and this node is one of them.

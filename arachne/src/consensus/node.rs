@@ -202,6 +202,28 @@ struct PendingPersist {
     snapshot_from: Option<RaftId>,
 }
 
+/// A streamed snapshot message held back from raft until its bytes arrive
+/// (propsol rev T, T2b).
+///
+/// The message is *not* stepped into raft while it is held: `Raft::restore`
+/// moves raft's log and committed/applied indexes to the snapshot index
+/// immediately, so a fetch that then failed would leave raft's view and the
+/// durable state disagreeing — and the next entries would kill the node with an
+/// index-ordering violation. Holding it keeps both sides consistent: either the
+/// bytes are installed and the message is stepped with real data, or nothing
+/// happened at all.
+#[derive(Debug)]
+pub struct HeldSnapshot {
+    /// The peer that sent it.
+    pub from: RaftId,
+    /// The snapshot's position.
+    pub index: LogIndex,
+    /// The snapshot's term.
+    pub term: Term,
+    /// The message as it arrived, to be stepped once the bytes are in.
+    pub bytes: Vec<u8>,
+}
+
 /// A committed log entry on its way out of [`RaftNode::step`]:
 /// `(index, entry type, data)`.
 ///
@@ -327,6 +349,8 @@ where
     /// to stream the bytes from it, so it is recorded when the message is
     /// stepped and consumed by the `Ready` that carries the snapshot.
     snapshot_from: Option<RaftId>,
+    /// A streamed snapshot message waiting for its bytes (rev T, T2b).
+    held_snapshot: Option<HeldSnapshot>,
     /// Outbound raft messages dropped because their transport `send` failed.
     /// A failed send is non-fatal (raft retransmits on a later tick), so it is
     /// counted — not surfaced — making a permanently dead transport visible as
@@ -463,6 +487,7 @@ where
             durability,
             peers,
             snapshot_from: None,
+            held_snapshot: None,
             dropped_sends: 0,
         })
     }
@@ -572,9 +597,13 @@ where
         // with an empty state machine. The runtime fetches the bytes from the
         // sender, installs them through `install_local_snapshot`, and reports
         // the outcome to raft.
-        let streamed_snapshot = self.raw.mut_store().streams_snapshots();
+        // The condition is "we do not have the bytes", not "streaming is on":
+        // in the interception flow (rev T T2b) the message is stepped with the
+        // fetched payload, so the `Ready` carries a **complete** snapshot that
+        // must be installed like any other. Only a metadata-only snapshot (the
+        // shape a peer sends before the runtime fetches) has nothing to install.
         if let Some(snapshot) = &snapshot
-            && !streamed_snapshot
+            && !(self.raw.mut_store().streams_snapshots() && snapshot.data.is_empty())
         {
             self.raw
                 .mut_store()
@@ -878,10 +907,22 @@ where
             .merge_from_bytes(&bytes)
             .map_err(|e| NodeError::Codec(e.to_string()))?;
         raft_msg.set_from(from);
-        // Remember who sent a snapshot: raft hands the snapshot out of `Ready`
-        // without its sender, and the runtime needs the peer's id to stream the
-        // bytes from it (rev T).
         if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
+            // A metadata-only snapshot in streamed mode is held back: the
+            // runtime fetches the bytes, installs them, and only then steps the
+            // message (with the data in place). See [`HeldSnapshot`].
+            if self.streams_snapshots() && raft_msg.get_snapshot().get_data().is_empty() {
+                let metadata = raft_msg.get_snapshot().get_metadata();
+                self.held_snapshot = Some(HeldSnapshot {
+                    from,
+                    index: metadata.get_index(),
+                    term: metadata.get_term(),
+                    bytes,
+                });
+                return Ok(());
+            }
+            // Remember who sent a complete snapshot: raft hands the snapshot
+            // out of `Ready` without its sender (rev T).
             self.snapshot_from = Some(from);
         }
         self.raw.step(raft_msg).map_err(NodeError::Raft)
@@ -993,22 +1034,44 @@ where
             .map_err(NodeError::Transport)
     }
 
-    /// Install a snapshot this node fetched and verified itself (rev T).
+    /// Take the held snapshot message, if one is waiting for its bytes.
     ///
-    /// The durable side of an install that did not arrive through `Ready`: it
-    /// writes the snapshot file and replaces the log, exactly as the in-`Ready`
-    /// path does. The *state machine* restore is the caller's, because only it
-    /// owns the apply task.
+    /// The runtime calls this after every inbound message; `Some` means "start
+    /// a fetch for this, then give me back the bytes".
+    pub fn take_held_snapshot(&mut self) -> Option<HeldSnapshot> {
+        self.held_snapshot.take()
+    }
+
+    /// Step a held snapshot message now that its bytes are installed (rev T).
+    ///
+    /// The message is rebuilt with the real snapshot payload first, so raft
+    /// takes the ordinary in-`Ready` path from here: it restores its log state
+    /// and hands the (complete) snapshot out of `Ready` for the state machine,
+    /// exactly as a snapshot carried inside the message would.
+    ///
+    /// It must be called **before** anything installs the snapshot into storage:
+    /// raft's `restore` verifies the snapshot against storage, and a storage
+    /// that had already rotated its log past that index makes the restore fail
+    /// silently, leaving raft's log inconsistent with it.
     ///
     /// # Errors
     ///
-    /// [`NodeError::Raft`] if the storage refuses the snapshot (for instance
-    /// because it is older than the local watermark).
-    pub fn install_local_snapshot(&mut self, snapshot: &SeamSnapshot) -> Result<(), NodeError<T>> {
-        self.raw
-            .mut_store()
-            .install_snapshot(snapshot)
-            .map_err(NodeError::Raft)
+    /// [`NodeError::Codec`] if the held message no longer parses.
+    pub fn step_held_snapshot(
+        &mut self,
+        held: &HeldSnapshot,
+        data: Vec<u8>,
+    ) -> Result<(), NodeError<T>> {
+        let mut raft_msg = Message::default();
+        raft_msg
+            .merge_from_bytes(&held.bytes)
+            .map_err(|e| NodeError::Codec(e.to_string()))?;
+        let mut snapshot = raft_msg.take_snapshot();
+        snapshot.set_data(data.into());
+        raft_msg.set_snapshot(snapshot);
+        raft_msg.set_from(held.from);
+        self.snapshot_from = Some(held.from);
+        self.raw.step(raft_msg).map_err(NodeError::Raft)
     }
 
     /// Tell raft how a streamed snapshot transfer ended (rev T).

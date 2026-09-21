@@ -243,10 +243,30 @@ async fn the_transport_streams_a_snapshot_into_a_file() {
     let client_factory = TonicTransportFactory::new("snap", 1, 0, Vec::new(), map);
     let (tx, _rx) = client_factory.create(n2.clone());
 
+    // The capability is deliberately conservative: a node that has not
+    // registered a snapshot provider does **not** advertise streaming, because
+    // advertising it would make this cluster's leaders send metadata-only
+    // snapshots that no peer could complete. Fetching itself still works (that
+    // is what this test exercises).
     assert!(
-        tx.supports_snapshot_streaming(),
-        "the tonic transport must advertise the streaming path"
+        !tx.supports_snapshot_streaming(),
+        "a node with no snapshot provider must not advertise streaming"
     );
+
+    // Registering a provider flips it, for transports minted afterwards.
+    let mut serving_map = HashMap::new();
+    serving_map.insert(NodeId::from("n3"), claim_ephemeral());
+    let serving_factory = TonicTransportFactory::new("snap", 1, 0, Vec::new(), serving_map);
+    serving_factory.snapshot_provider(Arc::new(FixedProvider {
+        // Any bytes: this asserts the advertised capability, not the data.
+        bytes: payload(16).into(),
+    }));
+    let (serving_tx, _serving_rx) = serving_factory.create(NodeId::from("n3"));
+    assert!(
+        serving_tx.supports_snapshot_streaming(),
+        "a node that can serve snapshots advertises streaming"
+    );
+    serving_factory.shutdown().await;
 
     let dir = std::env::temp_dir().join(format!(
         "arachne-snapshot-fetch-{}-{}",
