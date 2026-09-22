@@ -1,0 +1,120 @@
+# etcd 3-node benchmark cluster — the etcd counterpart to docker/bench.
+#
+# Mirrors the arachne deployment so the comparison is "same configuration":
+# three members on the same fixed subnet (172.30.0.0/24, .11/.12/.13), WAL
+# fsync on every commit (etcd's default durability), same in-network driver.
+#
+# Run (from this directory):
+#   docker compose up -d
+#   docker compose run --rm driver --hosts etcd1,etcd2,etcd3 --ports 2379,2380,2381
+#   docker compose down -v
+services:
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.21
+    command: ["/usr/local/bin/etcd",
+      "--name=etcd1",
+      "--data-dir=/data",
+      "--initial-advertise-peer-urls=http://172.30.0.11:2380",
+      "--listen-peer-urls=http://0.0.0.0:2380",
+      "--advertise-client-urls=http://172.30.0.11:2379",
+      "--listen-client-urls=http://0.0.0.0:2379",
+      "--initial-cluster=etcd1=http://172.30.0.11:2380,etcd2=http://172.30.0.12:2380,etcd3=http://172.30.0.13:2380",
+      "--initial-cluster-state=new",
+      "--initial-cluster-token=arachne-bench"]
+    volumes:
+      - data-etcd1:/data
+    networks:
+      bench-etcd:
+        ipv4_address: 172.30.0.11
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health",
+             "--endpoints", "http://127.0.0.1:2379", "-w", "json"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.21
+    command: ["/usr/local/bin/etcd",
+      "--name=etcd2",
+      "--data-dir=/data",
+      "--initial-advertise-peer-urls=http://172.30.0.12:2380",
+      "--listen-peer-urls=http://0.0.0.0:2380",
+      "--advertise-client-urls=http://172.30.0.12:2379",
+      "--listen-client-urls=http://0.0.0.0:2379",
+      "--initial-cluster=etcd1=http://172.30.0.11:2380,etcd2=http://172.30.0.12:2380,etcd3=http://172.30.0.13:2380",
+      "--initial-cluster-state=new",
+      "--initial-cluster-token=arachne-bench"]
+    volumes:
+      - data-etcd2:/data
+    networks:
+      bench-etcd:
+        ipv4_address: 172.30.0.12
+    ports:
+      - "2480:2379"
+      - "2481:2380"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health",
+             "--endpoints", "http://127.0.0.1:2379", "-w", "json"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.21
+    command: ["/usr/local/bin/etcd",
+      "--name=etcd3",
+      "--data-dir=/data",
+      "--initial-advertise-peer-urls=http://172.30.0.13:2380",
+      "--listen-peer-urls=http://0.0.0.0:2380",
+      "--advertise-client-urls=http://172.30.0.13:2379",
+      "--listen-client-urls=http://0.0.0.0:2379",
+      "--initial-cluster=etcd1=http://172.30.0.11:2380,etcd2=http://172.30.0.12:2380,etcd3=http://172.30.0.13:2380",
+      "--initial-cluster-state=new",
+      "--initial-cluster-token=arachne-bench"]
+    volumes:
+      - data-etcd3:/data
+    networks:
+      bench-etcd:
+        ipv4_address: 172.30.0.13
+    ports:
+      - "2580:2379"
+      - "2581:2380"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health",
+             "--endpoints", "http://127.0.0.1:2379", "-w", "json"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  driver:
+    # Run with `docker compose run --rm --profile bench driver --hosts etcd1,etc…`.
+    # A profile keeps it from starting on plain `up -d`.
+    image: etcd-bench-driver:local
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    profiles: ["bench"]
+    networks:
+      - bench-etcd
+    depends_on:
+      - etcd1
+      - etcd2
+      - etcd3
+
+networks:
+  bench-etcd:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  data-etcd1:
+  data-etcd2:
+  data-etcd3:

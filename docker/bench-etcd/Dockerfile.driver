@@ -1,0 +1,7 @@
+# Driver image: runs the python etcd benchmark inside the compose network.
+FROM alpine:latest
+
+RUN apk add --no-cache python3
+
+COPY driver/etcdbench.py /etcdbench.py
+ENTRYPOINT ["python3", "/etcdbench.py"]
