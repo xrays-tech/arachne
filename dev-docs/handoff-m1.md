@@ -538,6 +538,7 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
   learner 也在拉 ✓）但 `fetch done result_ok=false` ✗ ⇒ 传输中途失败，不是"没人发"。
 - **修法**：分块大小 = `min(SNAPSHOT_CHUNK_BYTES, max_message_size / 2)`（留一半给 gRPC 与
   protobuf 帧头，它们同属一条消息的预算 ✓）。修正后测试 5.6s 通过 ✓，`result_ok=true` ✓。
+- **完整验证（事后补记）**：提交 `e16b9ca` 的同一代码本地全量跑过 ✓——workspace **412/0**、`--features fault-injection` **428/0**、l2 **3/0**、四门禁全 PASS ✓（写提交信息时那次复核跑被我误判为"未完成"✗，实际它随后正常结束 ✓）。
 - **顺带修正前几轮的判断**：第 17/18 轮以为"leader 从未发快照"✗——其实一直在发，只是**每个分块
   都被上限拒绝**；`served=0` 那次是另一个更早的配置问题（`wal_trailing_keep_bytes` 默认 64 MB
   让 leader 能用日志追上 ✗），harness 加上 `= 0` 后才露出真正的分块 bug ✓。
