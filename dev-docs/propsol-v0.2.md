@@ -381,6 +381,67 @@ M3 的最后一块（验收 ①②③⑥）。先记录**两个已存在的缺�
 
 T2a 已落地的部分：`RaftStorage::streamed_snapshots(bool)` + 元数据快照（`snapshot()` 清空 data，保留 index/term/ConfState——raft 仍决定"要哪份快照"）；`RaftNodeConfig.streamed_snapshots`；`RaftNode` 记录 `MsgSnapshot` 的来源（raft 从 `Ready` 交出的快照不带 sender）并经 `StepOutcome.snapshot_from` 透出；`report_snapshot` / `install_local_snapshot` / `fetch_snapshot`（raft id → transport NodeId 的映射在 node 内）；`submit_ready` 在流式模式下**不安装**元数据快照（否则会用空状态机替换日志）。测试：`a_streamed_snapshot_hands_raft_metadata_only`（开/关两态都断言：关 = 消息里带全量字节，开 = data 为空但 index/term/成员表完好）。
 
+### U. v0.2.18：对标 etcd —— HTTP 面重构 + WAL 持久化平台化与组提交（E-rev，设计）
+
+**输入**：handoff §1.35 的 docker 3 节点**同配置对比**——单连接 put/读被钉在 ~40–45 ops/s / ~20–25ms，
+etcd 同拓扑 821–1531 ops/s / 0.6–1.2ms（差距 ~20–35×）。归因有二：① `arachne-node/src/http.rs`
+单线程阻塞 accept + WouldBlock→`sleep(20ms)` 空转轮询 + 一连接一请求（无 keep-alive）；② 每次提交做整设备
+`sync_all`（本机 ~10ms 级）。**并发线性读差距已收窄到 2–3×（767 vs ~2.5k ops/s）** ⇒ 核心读路径有竞争力，
+修复重点是 HTTP 面与持久化原语，不是共识核心。
+
+**（研究结论，2026-09）**：hyper 1.x + tokio 是业界事实标准且是正确升级方向（axum/reqwest 均立于其上，
+hyper 1.11 活跃维护）；io_uring runtime 系（monoio/glommio/tokio-uring）已停更或实验态、对**网络路径**
+无收益，不采纳；Pingora 面向代理、对本品过重。持久化侧：**macOS 上 Rust std 把 `sync_all` 与 `sync_data`
+都实现为 `fcntl(F_FULLFSYNC)`（整设备缓存刷，毫秒级）**——Linux 从不付出该代价，rev O 的"~10ms 设备 flush"
+实为 macOS 语义；Linux 正确做法 = **WAL 段预分配（fallocate）+ 每批 `fdatasync`**（etcd 即
+`fileutil.Fdatasync` 一次/Save，逐条不刷）；`fdatasync` 在 Apple 目标上**不存在**（libc 无此符号），macOS
+只能 `F_FULLFSYNC` 或可选 plain `fsync`（dev 基准用，agent-of-empires 实测 ~0.58ms vs 7.29ms/文件）。
+**组提交**为第一优先级（一次 sync 落一批并发写）：etcd 每 Ready 一批一次 fdatasync、RocksDB
+`WriteGroupToWAL`、LevelDB 组提交，nativeLink 在 macOS 实测 14.5s 中 12s 耗在逐文件 flush 上。
+io_uring `IORING_OP_FSYNC(DATASYNC)` 内核 5.1+、Limbo 生产在用但 RocksDB 未用 ⇒ 后置可选。
+
+**U1（HTTP 面重构，`arachne-node`）**：换用 hyper 1.x 网络模型：
+- `loop { listener.accept().await → tokio::spawn(每连接) }`：tokio epoll 原生唤醒，**空转轮询整体消失**；
+  默认 HTTP/1.1 keep-alive（消掉每次操作重建 TCP 连接/FIN —— 单连接差距的主因之一）；
+  `TokioIo::new(stream)` + `hyper_util::server::conn::auto::Builder` `.http1_only()` +
+  `service_fn` 路由进既有 `HttpHandler`（/readyz /metrics /kv /members 语义不变）；
+  `tokio::sync::Semaphore` 限并发连接；`graceful_shutdown()` 优雅关停。
+- **代价（实测归零级）**：`cargo tree` 证实 hyper 1.11 / hyper-util 0.1 / http-body-util 0.1 **已通过
+  tonic 在依赖树内** ⇒ 换 hyper 只是把这几个已在树的 crate 提升为 arachne-node 的直接依赖，**零新增 crate**；
+  全部限于 `arachne-node`（运维 bin），核心 `arachne` 零依赖红线不破（`check-deps.sh` Gate 复核点）。
+- **收益**：单连接操作从 ~20ms 下限回到核心真实耗时，预期单连接 put/读回到 ~10³ ops/s 级（与 etcd 同量级）；
+  并发弱读的 ~44 ops/s 平顶（§1.35 第 4 条）一并消失（那是外层 HTTP+`get_stale` 路径问题）。
+- **否决**：自研 nonblocking 事件循环（keep-alive/超时/解析/优雅关停难做对、重复造轮子）；io_uring runtime。
+- **验证**：`http.rs` 既有行为测试（/readyz、/metrics 输出、409+hint、431 大行超限、405）在 hyper 服务器上
+  等价重写；docker/bench `driver/bench.py` 对拍（U1 前后单连接延迟/吞吐）。
+
+**U2（WAL 持久化原语平台化，`WalStorage`）**：`sync_entries` 走**平台分派 sync 抽象**：
+- **Linux（生产）**：段**预分配**（`fallocate`，append 不改变 inode size）→ 每批 `fdatasync` 即数据持久
+  （无需 meta 刷），目录 `fsync` 仅在段创建/回收（rename/truncate）后 ⇒ 预期亚毫秒级（overlayfs 上可比 etcd）。
+- **macOS（开发）**：无 `fdatasync`，保持 `F_FULLFSYNC`（现状即整设备刷，持久性契约不变）；可选 plain
+  `fsync` dev 模式（仅供基准、文档标注、不改变契约）——见下"未决 3"。
+- **组提交（U3）先接进 rev P 的异步持久化流水线**：并发提案并入一批（写缓冲满或短提交窗口到点），一次
+  `fdatasync`/`F_FULLFSYNC` 落盘；把 I2/I4 的"每批一次真实 sync"从 actor 同步等待改为 flusher 批处理 +
+  消息/advance 延后到 flush 完成（就是 rev P 的 P1/P2/P3 分期——U3 只补"一次 sync 落 N 条"的批窗口）。
+- **收益**：写 p99 从 ~25ms（整设备刷 + 轮询）→ Linux 亚毫秒级、macOS 每批一次 F_FULLFSYNC；直接削减
+  §1.35 put 差距的持久化部分。
+- **验证**：FsyncLedger / faulty_storage / INV2 崩溃注入 / 恢复 WAL 在平台分派下重跑；docker/bench 驱动
+  对拍（组提交前后 p99/吞吐）。
+
+**U4（观察项，落档）**：io_uring `IORING_OP_FSYNC`（组提交后若 WAL sync 仍是测量瓶颈再采纳；走 sync
+抽象 drop-in；不绑停更的 tokio-uring，用活跃的 `io-uring` crate）；quinn/HTTP3（keep-alive 已拿大头，
+按需再议）；SO_REUSEPORT/DPDK 对本品规模为过度设计，明确不做。
+
+**分期**：P1 = U1（独立可交付，先消单连接下限）；P2 = U2+U3（按 rev P 流水线接续）；P3 = U4 判断点。
+每期各自验证 + §1.35 驱动对拍。
+
+**未完成/未决项（落档）**：
+1. **U1 行为回归面**：431/大行超限、405、409+hint、/metrics 输出等既有行为需在 hyper 上等价重写并有测试钉住。
+2. **U3 提交窗口参数**：批窗口在写稀时是否延长 p99（§1.34 BatchMs 实测写稀无收益）——随 rev P 数据定
+   `BatchMs` 默认与读延迟的权衡。
+3. **macOS plain-fsync dev 模式**：不满足 F_FULLFSYNC 同等崩溃语义——仅限基准/非生产，`fsync_observer`
+   与文档显式标注。
+
 ## 1. 目标与非目标
 
 **目标**

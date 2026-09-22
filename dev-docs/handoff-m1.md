@@ -586,6 +586,38 @@ Lan profile 底、`FsyncPolicy::Always`；数字有 ±20% 级随机波动）：
 command channel 永不关闭 ⇒ actor 永不退出、心跳不停 ⇒ 换主永不发生（实测 10s 无新 leader）。
 **必须用 `RuntimeThread::shutdown()`**（显式 stop + join）。`failover` 相与两处 teardown 均已按此处理。
 
+### 1.35 Docker 3 节点基准 + **同配置 etcd 对比**（启动对标 etcd 的升级设计的依据）
+
+**harness**：`docker/bench/`（arachne 3 节点 compose：固定子网 172.30.0.0/24、静态 IP .11/.12/.13、
+`alpine` 起宿主交叉编译的静态 aarch64-musl 二进制、in-network python 驱动绕过 Docker Desktop
+端口转发）+ `docker/bench-etcd/`（etcd v3.5.21 同拓扑对照）。跑法见各自目录注释；
+**测试毕必须 `docker compose down -v` + 清理镜像/卷/产物**（沙箱 Docker Hub 拉取被墙，etcd 走 quay.io ✓）。
+
+**arachne 3 节点（docker，linux/aarch64，Lan profile，FsyncPolicy::Always，HTTP 面）实测**：
+
+| 操作 | 单连接 | 4 并发 |
+|---|---|---|
+| put | 40 ops/s，p50 25.1ms | 96 ops/s，p50 9.9ms |
+| 线性读 | 44 ops/s，p50 22.3ms | **767 ops/s，p50 0.96ms** |
+| 弱读 | 44 ops/s，p50 21.9ms | **44 ops/s（异常平顶，见下）** |
+
+**etcd v3.5.21 同配置实测**（同主机/同子网/同驱动形态，etcd 网关 JSON API，WAL fsync 默认）：
+put 单连接 **821 ops/s / p50 1.13ms**（keep-alive 1154）；4 并发 375 ops/s；可串行读 1388 ops/s；
+线性读 1531 ops/s / p50 0.58ms（keep-alive 2514）。
+
+**归因（写进升级设计的输入）**：
+1. **HTTP 面（单连接差距主因 ≈20–35×）**：`arachne-node/src/http.rs` 的单线程阻塞 accept +
+   WouldBlock→`sleep(20ms)` 空转轮询 + 一连接一请求（无 keep-alive）→ 单连接每个操作被钉 ~20ms、
+   单客户端吞吐被钉 ~45 ops/s。etcd 用 Go `net/http`（多路复用、keep-alive、无轮询）。
+2. **WAL 持久化原语**：arachne 每次提交做整设备 `sync_all`（本机 ~10ms 级）；etcd 在 Linux overlayfs
+   上对 WAL 用 `fdatasync`（亚毫秒）。同为"提交前落盘"，原语 + 文件系统不同 ⇒ 写路径差距显著。
+3. **并发下核心差距收窄到 2–3×**：arachne 线性读并发 767 ops/s / p50 0.96ms vs etcd ~2.5k ——
+   **共识核心读路径有竞争力**，单连接崩盘主要是 HTTP 层；库级进程内基准（§1.34）弱读 p50 6µs。
+4. **弱读经 HTTP 4–8 并发下 ~44 ops/s 平顶**（16 并发才 162/s）：node 外层 HTTP+`get_stale` 路径
+   的部署特征（归因未定），etcd 可串行读单连接即 1388/s ⇒ 属 HTTP 面问题而非核心。
+
+**已知非缺陷**：值走 URL path（M1 HTTP 面无 body 解析），1 字节值可比。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
