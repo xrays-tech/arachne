@@ -557,6 +557,35 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
 6. **【部署注意，非缺陷】未注册 `SnapshotProvider` 的嵌入方仍受 `max_message_size` 约束**：流式是**安全默认关闭**的 ✓（`arachne-node` 已注册 ✓），但自建 factory 不注册时，大于上限的快照仍传不过去 ✗（与 streaming 之前一致，非回归 ✓）。
 7. **【环境/工具】沙箱与 CI**：本地跑门禁需 `CARGO_TARGET_DIR=<repo>/.dsh-target`（默认全局 target 在仓库外会被沙箱拒绝 ✗）；`gh` 需 `XDG_CACHE_HOME=<repo>/.gh-cache` ✓；`gh run watch … | tail` 会吞掉退出码 ⇒ **必须用 `gh run view --json conclusion` 复核** ✓（这条踩过 ✗）；protoc 下载在 CI 上偶发 502/504，已加 `--retry-all-errors` ✓。
 
+### 1.34 首次 `--release` 综合性能基准（机器相关数字，非 SLO；`--release` 跑）
+
+仓库此前没有性能/吞吐基准体系（test-plan §309 明确留作独立工作流；vendored raft 的 criterion
+benches 不在 lockfile 且 `raft` 非 workspace member，无法直接跑）。本轮新建两个 **`#[ignore]` 基准
+harness**（随 workspace 编译但不执行、不计入 CI 断言），`--release` 首跑（本机 macOS、10 逻辑核、
+Lan profile 底、`FsyncPolicy::Always`；数字有 ±20% 级随机波动）：
+
+| 层面 | 实测 |
+|---|---|
+| raft 核心（RawNode propose+ready，MemStorage，无落盘/网络，进程内单节点） | 8B **216 ns/op / 4.6M ops/s**；1KiB **250 ns/op / 4.0M ops/s** |
+| 3 节点首次选主（内存传输） | 从 spawn 到多数派领导 **≈ 0.8s**（election_timeout=500ms 上界内 ✓） |
+| 写吞吐（Always，4 并发） | **≈ 190 ops/s**，p50 20.6ms / p99 37.5ms —— 每写一次真实设备 flush 把吞吐钉死（与 read_latency 同因） |
+| 写吞吐（BatchMs(10)） | ≈ 170 ops/s，p99 50.5ms —— 与 Always 同量级：写量稀无合批窗口，设备 flush 仍是瓶颈 |
+| 弱读 `get_stale`（空闲） | **≈ 147k ops/s**，p50 6µs / p99 16µs |
+| 线性读 `get`（空闲） | **≈ 68k ops/s**，p50 14µs / p99 25µs |
+| 换主（优雅停 leader，`RuntimeThread::shutdown`） | **733 ms** 到新多数派领导（≈ 一个选举超时窗口 ✓） |
+| 快照追上（in-memory 流式，learner n4 晚启动） | 407,860 B 在 0.11s = **3.7 MiB/s**（拦截→拉取→安装的编排开销，无网络） |
+| 快照传输（真实 tonic，798 KiB @ 64KiB cap / 32KiB 分块） | 不限速：0.07s = **11.2 MiB/s**（loopback）；限速 256KiB/s：3.06s = **255 KiB/s** —— 与 `字节÷速率 = 3.05s` 精确吻合 ⇒ 令牌桶生效 ✓ |
+
+**harness**：`arachne/tests/bench_runtime.rs`（runtime 全维度）+ `arachne-transport-tonic/tests/bench_tonic_snapshot.rs`
+（真实 tonic 快照限速对照）。跑法：
+`CARGO_TARGET_DIR=.dsh-target cargo test --release -p arachne --test bench_runtime -- --ignored --nocapture`
+（tonic 同理换 `-p arachne-transport-tonic --test bench_tonic_snapshot`）。
+
+**踩到的一个 harness 坑（值得记）**：in-memory 下**不能靠 drop 某节点 Handle 来"杀掉"它**——
+`register_peer` 存的是完整 `Handle` 克隆（持 command sender），其余节点的 peer map 会让该节点的
+command channel 永不关闭 ⇒ actor 永不退出、心跳不停 ⇒ 换主永不发生（实测 10s 无新 leader）。
+**必须用 `RuntimeThread::shutdown()`**（显式 stop + join）。`failover` 相与两处 teardown 均已按此处理。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。
