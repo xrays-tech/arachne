@@ -1,0 +1,92 @@
+# Arachne 3-node benchmark cluster.
+#
+# Three `arachne-node` containers on one compose network. Each binds its raft
+# listener and its HTTP listener on 0.0.0.0 inside the container; HTTP ports
+# are published to the host for the benchmark driver (nodes are reachable from
+# one another by service name: node1/node2/node3).
+#
+# Run (from this directory):
+#   docker compose up -d --build
+#   python3 driver/bench.py --ports 8001,8002,8003
+#   docker compose down -v
+services:
+  node1:
+    image: arachne-bench:local
+    command: ["--config", "/etc/arachne/node.toml"]
+    networks:
+      bench:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ./configs/n1.toml:/etc/arachne/node.toml:ro
+      - data-n1:/data
+    ports:
+      - "7001:7001"
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8001/readyz"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 3s
+
+  node2:
+    image: arachne-bench:local
+    command: ["--config", "/etc/arachne/node.toml"]
+    networks:
+      bench:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - ./configs/n2.toml:/etc/arachne/node.toml:ro
+      - data-n2:/data
+    ports:
+      - "7002:7002"
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8002/readyz"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 3s
+
+  node3:
+    image: arachne-bench:local
+    command: ["--config", "/etc/arachne/node.toml"]
+    networks:
+      bench:
+        ipv4_address: 172.30.0.13
+    volumes:
+      - ./configs/n3.toml:/etc/arachne/node.toml:ro
+      - data-n3:/data
+    ports:
+      - "7003:7003"
+      - "8003:8003"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8003/readyz"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 3s
+
+  driver:
+    # Run with `docker compose run --rm driver --hosts node1,node2,node3`.
+    image: arachne-bench-driver:local
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    networks:
+      - bench
+    depends_on:
+      - node1
+      - node2
+      - node3
+
+networks:
+  bench:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  data-n1:
+  data-n2:
+  data-n3:

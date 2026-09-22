@@ -1,0 +1,15 @@
+# Node 1 of the arachne-bench 3-node cluster (docker/bench).
+# The config schema accepts IP literals only, so peers use the static
+# addresses from the compose `bench` network (172.30.0.0/24), not service
+# hostnames. The self entry in `initial_cluster` must equal `listen`.
+cluster_id = "arachne-bench"
+node_id = "n1"
+listen = "172.30.0.11:7001"
+data_dir = "/data"
+http_listen = "0.0.0.0:8001"
+initial_cluster = [
+  "n1=172.30.0.11:7001",
+  "n2=172.30.0.12:7002",
+  "n3=172.30.0.13:7003",
+]
+profile = "lan"

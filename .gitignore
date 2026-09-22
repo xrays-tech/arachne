@@ -12,3 +12,6 @@
 
 # macOS
 .DS_Store
+
+# docker/bench transient cross-compiled binary
+/docker/bench/bin/

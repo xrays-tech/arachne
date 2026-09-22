@@ -1,0 +1,11 @@
+cluster_id = "arachne-bench"
+node_id = "n2"
+listen = "172.30.0.12:7002"
+data_dir = "/data"
+http_listen = "0.0.0.0:8002"
+initial_cluster = [
+  "n1=172.30.0.11:7001",
+  "n2=172.30.0.12:7002",
+  "n3=172.30.0.13:7003",
+]
+profile = "lan"

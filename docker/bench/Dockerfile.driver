@@ -1,0 +1,9 @@
+# Driver image: runs the python benchmark inside the compose network so the
+# measurements do not cross Docker Desktop's host-port forwarding (which
+# charges ~20ms per new TCP connection and would swamp the real numbers).
+FROM alpine:latest
+
+RUN apk add --no-cache python3
+
+COPY driver/bench.py /bench.py
+ENTRYPOINT ["python3", "/bench.py"]
