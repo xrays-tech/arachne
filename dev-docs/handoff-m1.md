@@ -524,6 +524,38 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
 **（历史记录）为什么当时不修**：那时上下文预算已耗尽，而这是一个**独立的测试基建问题**（与 rev T 的
 剩余项无关）✗；留红不可接受，故先把新测试 revert 掉恢复绿 ✓，并把根因与三个候选修法记在此处。
 
+### 1.32 真实 tonic 端到端回归**已通过** ✓，并抓出一个真 bug（rev T 收尾）
+
+- **更小的 harness 就够了（不需要 kill/重启）**：让 node 1 成为**唯一 voter**（`bootstrap_voters = [1]`），
+  node 2 以 **learner** 加入（`join_as_learner`）却**晚点才启动**。node 1 单票即可提交 ✓，
+  先 `add_learner(2)`，写满 200×1 KiB（阈值 4 KiB + `wal_trailing_keep_bytes = 0` ⇒
+  日志被压缩掉 ✓），此时 leader 的快照 **> 64 KiB 上限** ✓，再启动 node 2 ⇒ 它只能靠快照追上 ✓。
+  比原来的 kill/重启版本少了：`AddrInUse`、factory 重绑、handle 重注册、端口复用那一堆坑 ✓✓。
+- **测试抓出的真 bug（这就是这个验收测试的价值）**：服务端按**固定 256 KiB** 分块 ✗，而
+  `max_message_size` 可被配置得更小（本测试 64 KiB ✗）⇒ **每个分块都超过上限**：服务端编码失败、
+  客户端解码也失败 ⇒ **凡是把上限配到 512 KiB 以下，流式快照就永远传不过去** ✗✗（默认 8 MiB
+  下不触发，所以之前没暴露 ✗）。诊断链：`served=8`（provider 被调了 8 次 ⇒ leader 发了快照、
+  learner 也在拉 ✓）但 `fetch done result_ok=false` ✗ ⇒ 传输中途失败，不是"没人发"。
+- **修法**：分块大小 = `min(SNAPSHOT_CHUNK_BYTES, max_message_size / 2)`（留一半给 gRPC 与
+  protobuf 帧头，它们同属一条消息的预算 ✓）。修正后测试 5.6s 通过 ✓，`result_ok=true` ✓。
+- **顺带修正前几轮的判断**：第 17/18 轮以为"leader 从未发快照"✗——其实一直在发，只是**每个分块
+  都被上限拒绝**；`served=0` 那次是另一个更早的配置问题（`wal_trailing_keep_bytes` 默认 64 MB
+  让 leader 能用日志追上 ✗），harness 加上 `= 0` 后才露出真正的分块 bug ✓。
+- rev T 的三条落地（T1/T1b/T2a/T2b/T3）+ **真实 tonic 端到端验收**至此全部完成 ✓；M2/M3 收尾清单
+  只剩可选的 leader-push 硬化（见 rev T 架构备注）。
+
+### 1.33 余下未完成项清单（落档，供接手者直接开工）
+
+按"能不能立刻动手"排序，每条都带证据/入口。
+
+1. **【完成 ✓，留档】真实 tonic 端到端验收**：见 §1.32（5.6s 通过；抓出分块超上限的真 bug 并修掉）。
+2. **【可选】leader-push 硬化**：把 `FetchSnapshot` 改成 leader→follower 方向、由 leader 调 `report_snapshot` 自报结果。收益是消掉第 3 条限制 ✓；代价是新 RPC 方向 + leader 侧编排 ✗。当前 follower-pull + follower 本地重试已可用 ✓。
+3. **【已知限制】快照在 leader 侧被压缩掉时 follower 会持续重试**：follower 侧重试 8 次退避后放弃、等 leader 的下一份快照 ✓；只有 leader 继续产生新快照才会自愈 ✗。若要消除，需按第 2 条改成 leader 驱动（leader 自己知道传输失败 ✓）。
+4. **【测试缺口】流式传输"传到一半断开"的恢复**：T3 覆盖的是"首次尝试即失败" ✓（in-memory，§1.27–1.32）；**没有**覆盖"分块传到中途断开再恢复" ✗。入口：给 `InMemoryTransportFactory` 的 snapshot source 加"第 N 次调用返回截断字节"的能力（`fetch_snapshot` 已把字节写到 `dest` ✓，截断会被 `decode_snapshot` 的 CRC 拒绝 ✓），或在 tonic 层注入流中断。
+5. **【测试缺口】限速 + 大快照的真实传输**：限速已有传输层测试（768 KiB @256 KiB/s ✓），但**没有**在真实 tonic + Runtime 下跑"大快照被限速"的端到端 ✗（第 23 轮的 harness 可加 `snapshot_rate_bps` 直接复用 ✓）。
+6. **【部署注意，非缺陷】未注册 `SnapshotProvider` 的嵌入方仍受 `max_message_size` 约束**：流式是**安全默认关闭**的 ✓（`arachne-node` 已注册 ✓），但自建 factory 不注册时，大于上限的快照仍传不过去 ✗（与 streaming 之前一致，非回归 ✓）。
+7. **【环境/工具】沙箱与 CI**：本地跑门禁需 `CARGO_TARGET_DIR=<repo>/.dsh-target`（默认全局 target 在仓库外会被沙箱拒绝 ✗）；`gh` 需 `XDG_CACHE_HOME=<repo>/.gh-cache` ✓；`gh run watch … | tail` 会吞掉退出码 ⇒ **必须用 `gh run view --json conclusion` 复核** ✓（这条踩过 ✗）；protoc 下载在 CI 上偶发 502/504，已加 `--retry-all-errors` ✓。
+
 ### (D) M1-5：L3 冒烟 + bin CLI 集成测试（M1 验收 ①②③）— **已收尾（commit `adb2bd7`，见 §1.5）**
 - ✅ 3 进程成形/写读/复制冒烟 + **杀 leader 换主 + 窗口内写不挂死**（`arachne-node/tests/multi_node.rs`，2 项）。
 - ✅ **跨进程 `409`+hint**：`Handle::without_redirect()` + node HTTP 单发 handle。跨进程**自动跟随** hint 仍需 HTTP-port 映射（config 暂无），M1 只做「409+hint body」，与 propsol §3.3 一致。

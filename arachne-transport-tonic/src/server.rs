@@ -22,12 +22,14 @@ use crate::proto::raft_transport_server::RaftTransport;
 use crate::proto::{RaftEnvelope, SendReply, SnapshotChunk, SnapshotRequest};
 use crate::snapshot::{RateLimiter, SnapshotProvider};
 
-/// How much of a snapshot one streamed chunk carries.
+/// The largest useful snapshot chunk.
 ///
-/// A constant, not a knob: chunk size is a wire detail that both ends must
-/// agree on implicitly (the receiver concatenates and checks the snapshot's own
-/// CRC, so boundaries are meaningless). Smaller chunks pace more smoothly
-/// against `snapshot_transfer_rate_bps`; larger ones cost fewer wakeups.
+/// An upper bound, not a knob: the actual chunk is
+/// `min(this, max_message_size / 2)`, because a chunk is a gRPC message and one
+/// above the configured cap cannot cross at all. (Sizing it independently of the
+/// cap is what broke every streamed transfer on a transport configured below
+/// 512 KiB.) Within that bound, smaller chunks pace more smoothly against
+/// `snapshot_transfer_rate_bps`; larger ones cost fewer wakeups.
 pub(crate) const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// The gRPC server half for one listening node.
@@ -48,6 +50,14 @@ pub struct RaftTransportService {
     /// Pacing for a snapshot stream, from `snapshot_transfer_rate_bps`
     /// (0 = unlimited).
     snapshot_rate_bps: u64,
+    /// How much of a snapshot one chunk may carry.
+    ///
+    /// Derived from the transport's message cap: a chunk is a gRPC message, so a
+    /// chunk larger than `max_message_size` cannot cross at all — the server
+    /// would fail to encode it and the client to decode it. (That is precisely
+    /// how the original 256 KiB constant broke every streamed transfer on a
+    /// transport configured below it.)
+    snapshot_chunk_bytes: usize,
 }
 
 impl RaftTransportService {
@@ -60,6 +70,7 @@ impl RaftTransportService {
         inbound: Sender<(NodeId, TransportMessage)>,
         snapshot_provider: Option<Arc<dyn SnapshotProvider>>,
         snapshot_rate_bps: u64,
+        max_message_size: usize,
     ) -> Self {
         Self {
             cluster_id,
@@ -69,6 +80,9 @@ impl RaftTransportService {
             inbound,
             snapshot_provider,
             snapshot_rate_bps,
+            // Half the cap leaves room for gRPC and protobuf framing, which are
+            // part of the same message budget.
+            snapshot_chunk_bytes: (max_message_size / 2).clamp(1, SNAPSHOT_CHUNK_BYTES),
         }
     }
 }
@@ -80,15 +94,16 @@ impl RaftTransportService {
 async fn stream_snapshot(
     reader: crate::snapshot::SnapshotReader,
     rate_bps: u64,
+    chunk_bytes: usize,
     tx: Sender<Result<SnapshotChunk, Status>>,
 ) {
     let mut remaining = reader.len;
     let mut reader = reader.reader;
-    let mut limiter = RateLimiter::new(rate_bps, SNAPSHOT_CHUNK_BYTES as u64);
-    let mut buf = vec![0u8; SNAPSHOT_CHUNK_BYTES];
+    let mut limiter = RateLimiter::new(rate_bps, chunk_bytes as u64);
+    let mut buf = vec![0u8; chunk_bytes];
 
     while remaining > 0 {
-        let want = remaining.min(SNAPSHOT_CHUNK_BYTES as u64) as usize;
+        let want = remaining.min(chunk_bytes as u64) as usize;
         let mut filled = 0usize;
         // A single `read` may return short; loop until the chunk is full or the
         // snapshot ends early (which is a real error: the length lied).
@@ -168,8 +183,9 @@ impl RaftTransport for RaftTransportService {
         // reader task parks instead of buffering the snapshot in memory.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SnapshotChunk, Status>>(2);
         let rate = self.snapshot_rate_bps;
+        let chunk_bytes = self.snapshot_chunk_bytes;
         tokio::spawn(async move {
-            stream_snapshot(reader, rate, tx).await;
+            stream_snapshot(reader, rate, chunk_bytes, tx).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }

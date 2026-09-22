@@ -419,6 +419,7 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
                 sender,
                 unlock(&self.inner.snapshot_provider).clone(),
                 config.snapshot_rate_bps,
+                config.max_message_size,
             );
             let cancel = CancellationToken::new();
             let server = Server::builder()
