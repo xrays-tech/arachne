@@ -21,7 +21,8 @@
 //! Values are taken verbatim from the path (URL-safe ASCII) for M1; body
 //! parsing is not implemented yet.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arachne::client::Handle;
@@ -66,9 +67,6 @@ mod markers {
 /// HTTP handler: readiness, metrics, and the KV endpoints.
 struct NodeHttp {
     metrics: Arc<Metrics>,
-    /// A handle to the tokio runtime, so the (blocking) HTTP thread can drive
-    /// the async client calls to completion.
-    rt: tokio::runtime::Handle,
     /// This node's **single-shot** client handle (no redirect): a non-leader's
     /// `NotLeader{hint}` reaches [`NodeHttp::map_error`] and becomes a
     /// `409` + leader body for the external caller.
@@ -76,51 +74,62 @@ struct NodeHttp {
 }
 
 impl HttpHandler for NodeHttp {
-    fn handle(&self, method: &str, path: &str) -> HttpResponse {
-        let (path_only, query) = match path.split_once('?') {
-            Some((p, q)) => (p, q),
-            None => (path, ""),
-        };
-        if let Some(rest) = path_only.strip_prefix("/kv/") {
-            return self.handle_kv(method, rest, query);
-        }
-        if let Some(rest) = path_only.strip_prefix("/members") {
-            return self.handle_members(method, rest);
-        }
-        match path_only {
-            // Read-only endpoints: any other method is a `405`, checked here
-            // rather than relying on the dispatcher's method list (which the
-            // membership surface widened to include `POST`).
-            "/readyz" => {
-                if method != "GET" {
-                    return HttpResponse::method_not_allowed();
-                }
-                if self.metrics.is_ready() {
-                    HttpResponse::text("ready\n")
-                } else {
-                    HttpResponse::unavailable("not ready\n")
-                }
+    fn handle(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>> {
+        let method = method.to_string();
+        let path = path.to_string();
+        Box::pin(async move {
+            let (path_only, query) = match path.split_once('?') {
+                Some((p, q)) => (p.to_string(), q.to_string()),
+                None => (path, String::new()),
+            };
+            if let Some(rest) = path_only.strip_prefix("/kv/") {
+                return self.handle_kv(&method, rest, &query).await;
             }
-            "/metrics" => {
-                if method != "GET" {
-                    return HttpResponse::method_not_allowed();
-                }
-                HttpResponse::ok("text/plain; version=0.0.4", self.metrics.render())
+            if let Some(rest) = path_only.strip_prefix("/members") {
+                return self.handle_members(&method, rest).await;
             }
-            _ => HttpResponse::not_found(),
-        }
+            match path_only.as_str() {
+                // Read-only endpoints: any other method is a `405`, checked here
+                // rather than relying on the dispatcher's method list (which the
+                // membership surface widened to include `POST`).
+                "/readyz" => {
+                    if method != "GET" {
+                        return HttpResponse::method_not_allowed();
+                    }
+                    if self.metrics.is_ready() {
+                        HttpResponse::text("ready\n")
+                    } else {
+                        HttpResponse::unavailable("not ready\n")
+                    }
+                }
+                "/metrics" => {
+                    if method != "GET" {
+                        return HttpResponse::method_not_allowed();
+                    }
+                    HttpResponse::ok(
+                        "text/plain; version=0.0.4",
+                        self.metrics.render(),
+                    )
+                }
+                _ => HttpResponse::not_found(),
+            }
+        })
     }
 }
 
 impl NodeHttp {
-    fn handle_kv(&self, method: &str, rest: &str, query: &str) -> HttpResponse {
+    async fn handle_kv(&self, method: &str, rest: &str, query: &str) -> HttpResponse {
         match method {
             "GET" => {
                 let key = rest.as_bytes();
                 let result = if query.contains("stale=1") {
-                    self.rt.block_on(self.kv.get_stale(key))
+                    self.kv.get_stale(key).await
                 } else {
-                    self.rt.block_on(self.kv.get(key))
+                    self.kv.get(key).await
                 };
                 match result {
                     Ok(Some(value)) => HttpResponse::text(value),
@@ -132,12 +141,12 @@ impl NodeHttp {
                 let Some((key, value)) = rest.split_once('/') else {
                     return HttpResponse::bad_request();
                 };
-                match self.rt.block_on(self.kv.put(key.as_bytes(), value.as_bytes())) {
+                match self.kv.put(key.as_bytes(), value.as_bytes()).await {
                     Ok(()) => HttpResponse::text("ok\n"),
                     Err(e) => Self::map_error(e),
                 }
             }
-            "DELETE" => match self.rt.block_on(self.kv.delete(rest.as_bytes())) {
+            "DELETE" => match self.kv.delete(rest.as_bytes()).await {
                 Ok(()) => HttpResponse::text("ok\n"),
                 Err(e) => Self::map_error(e),
             },
@@ -158,12 +167,12 @@ impl NodeHttp {
     /// A successful change replies only once it is **applied** (durable), not
     /// merely proposed, so an operator can read back `/members` right after a
     /// `200` and see the new configuration.
-    fn handle_members(&self, method: &str, rest: &str) -> HttpResponse {
+    async fn handle_members(&self, method: &str, rest: &str) -> HttpResponse {
         if rest.is_empty() {
             if method != "GET" {
                 return HttpResponse::method_not_allowed();
             }
-            return match self.rt.block_on(self.kv.membership()) {
+            return match self.kv.membership().await {
                 Ok((voters, learners)) => HttpResponse::text(format!(
                     "voters={} learners={}\n",
                     Self::join_ids(&voters),
@@ -182,10 +191,10 @@ impl NodeHttp {
             return HttpResponse::bad_request();
         };
         let result = match op {
-            "add-learner" => self.rt.block_on(self.kv.add_learner(id)),
-            "promote" => self.rt.block_on(self.kv.promote_learner(id)),
-            "remove" => self.rt.block_on(self.kv.remove_member(id)),
-            "transfer-leader" => self.rt.block_on(self.kv.transfer_leader(id)),
+            "add-learner" => self.kv.add_learner(id).await,
+            "promote" => self.kv.promote_learner(id).await,
+            "remove" => self.kv.remove_member(id).await,
+            "transfer-leader" => self.kv.transfer_leader(id).await,
             _ => return HttpResponse::not_found(),
         };
         match result {
@@ -360,20 +369,22 @@ async fn run(
         })
     };
 
-    // Hand-rolled HTTP server on its own blocking thread. The handler drives the
-    // async client calls with `rt.block_on`, which is valid here because the
-    // HTTP thread has no runtime context of its own.
-    let listener = std::net::TcpListener::bind(config.http_listen)?;
-    let http_shutdown = Arc::new(AtomicBool::new(false));
+    // Hyper HTTP/1.1 server (propsol rev U U1): a tokio accept loop, one task
+    // per connection, keep-alive — replacing the hand-rolled blocking HTTP
+    // thread (which had a 20ms idle-accept poll and no keep-alive). The handler
+    // awaits the async KV client directly (no `rt.block_on` bridge).
+    let listener = tokio::net::TcpListener::bind(config.http_listen).await?;
+    let (http_tx, _http_rx) = tokio::sync::watch::channel(false);
+    let http_shutdown = Arc::new(http_tx);
     let handler = Arc::new(NodeHttp {
         metrics: Arc::clone(&metrics),
-        rt: tokio::runtime::Handle::current(),
         kv: node.handle().without_redirect(),
     });
-    let http_thread = {
-        let http_shutdown = Arc::clone(&http_shutdown);
-        std::thread::spawn(move || {
-            if let Err(e) = http::serve(&listener, handler.as_ref(), &http_shutdown) {
+    let http_task = {
+        let handler = Arc::clone(&handler);
+        let shutdown = Arc::clone(&http_shutdown);
+        tokio::spawn(async move {
+            if let Err(e) = http::serve(listener, handler, shutdown).await {
                 eprintln!("http server error: {e}");
             }
         })
@@ -399,8 +410,8 @@ async fn run(
 
     // Graceful shutdown: stop the HTTP server, then stop the runtime actor
     // (which drops the WAL and releases the data-dir lock).
-    http_shutdown.store(true, Ordering::Relaxed);
-    let _ = http_thread.join();
+    http_shutdown.send(true).ok();
+    let _ = http_task.await;
     node.shutdown().await;
     #[cfg(feature = "test-observability")]
     markers::emit("shutdown", config.node_id.as_str());

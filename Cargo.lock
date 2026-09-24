@@ -60,6 +60,9 @@ version = "0.1.0"
 dependencies = [
  "arachne",
  "arachne-transport-tonic",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "slog",
  "tokio",

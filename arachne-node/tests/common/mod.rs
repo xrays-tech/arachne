@@ -70,10 +70,14 @@ pub fn parse_response(response: &str) -> Option<(u16, String)> {
 /// full response. `None` if connect/write/read fails (the node is not up yet,
 /// the connection was reset, or the read timed out) — callers treat that as
 /// "retry later". The 2s read timeout guarantees a stuck request never hangs.
+///
+/// The request sends `Connection: close`: the hyper server (rev U, U1) speaks
+/// keep-alive by default, and this helper reads to EOF, so without asking the
+/// server to close the response the read would block until the 2s timeout.
 pub fn http_request(addr: SocketAddr, method: &str, path: &str) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect(addr).ok()?;
     let _ = stream.set_read_timeout(Some(core::time::Duration::from_millis(2000)));
-    let request = format!("{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     Read::read_to_string(&mut stream, &mut response).ok()?;

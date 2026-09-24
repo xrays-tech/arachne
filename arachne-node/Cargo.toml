@@ -25,7 +25,14 @@ arachne = { workspace = true }
 # mints its `(Tx, Rx)` halves through a `TonicTransportFactory`.
 arachne-transport-tonic = { workspace = true }
 # Async runtime: drives the raft Ready loop, the tick interval, and signals.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time"] }
+# Hyper HTTP/1.1 server (propsol rev U U1). Already in the dependency tree via
+# tonic; here promoted to direct deps to replace the hand-rolled blocking HTTP
+# server (which had a 20ms idle-accept poll and no keep-alive). hyper-util is
+# only for the `TokioIo` bridge to hyper's rt traits.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+http-body-util = "0.1"
 # Config parsing (TOML).
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
