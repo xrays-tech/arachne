@@ -68,24 +68,28 @@ B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne 核心   ←
 - **验收**：§2 回归门（T1–T3 阈值由 orchestrator 复测；本批次只要求编译 + 测试 + 门禁绿，HTTP 行为等价）。
 - **红线**：不碰 `arachne/` 核心、不碰 `arachne-transport-tonic/`、不碰基准 harness；不 git commit。
 
-### B2（U2）：WAL sync 平台化 + 段预分配（std-only，零新增依赖）
-- **范围**：`arachne/src/storage/`（新增 `sync.rs`；改 `wal.rs` 的 sync 调用点与段创建/回卷路径）；新增单测。
+### B2（U2）：WAL sync 平台化（std-only，零新增依赖）
+- **范围**：`arachne/src/storage/`（新增 `sync.rs`；改 `wal.rs`/`segment.rs` 的 sync 调用点）；新增单测。
   **禁止**引入 `libc`/`rustix`（核心零外部 crate 红线，Gate B）——**只用 std**。
 - **现状**：真实 sync 落在三处 `file.sync_all()`：`FlushHandle::flush`（wal.rs≈223，flusher 线程路径）、
-  flusher 循环（≈1117）、`sync_entries` 同步路径（≈1630）；`fsync_dir` 已在段创建/rename 后调用（≈474/819/896/907/911）✓；
+  flusher 循环（≈1117）、`Segment::sync`（`sync_entries` 同步路径走这里）；`fsync_dir` 已在段创建/rename 后调用 ✓；
   rev P 单 flusher 线程 + FlushToken 已存在；`fsync_observer`（每真实 fsync 后通知）语义不能变。
-- **做法**：
-  1. 新增 `storage/sync.rs`：`pub fn sync_durable(file: &File, preallocated: bool) -> io::Result<()>`，
-     `#[cfg(target_os = "linux")]` 用 `file.sync_data()`（= `fdatasync(2)`：数据可持久、不刷 meta），
-     其余平台（含 macOS）用 `file.sync_all()`（macOS std 即 `F_FULLFSYNC`，维持现状）。
-     注释写明语义与前提：**段已预分配 ⇒ append 不改变 inode size ⇒ fdatasync 就是完备的可持久屏障**；
-     meta 持久由既有 `fsync_dir` 覆盖。
-  2. **段预分配**：段创建/回卷处（`open_segment_at` / rollover ≈ 470、798-821）在首次数据写前
-     `set_len(segment_bytes)`（钉死 size，避免随后 append 触发 size/meta 变更）。注意首次 size 变更后
-     与 `fsync_dir` 的时序（先建文件+设长 → fsync_dir → 之后每批 fdatasync 即数据持久）。
-  3. 三处 `sync_all` 全部改走 `sync_durable`；`fsync_observer` 通知时机与次数不变。
-  4. 测试：平台分派单测（Linux 走 sync_data 分支的行为证据：可用 `fsync_observer` 计数 + 既有
-     FsyncLedger/INV2 断言兜底）；**不改既有持久性测试语义**，全部必须绿。
+- **做法（已落地，B2 完成）**：
+  1. 新增 `storage/sync.rs`：`pub fn sync_durable(file: &File) -> io::Result<()>`：
+     `#[cfg(target_os = "linux")]` 用 `file.sync_data()`（= `fdatasync(2)`），其余平台（含 macOS）用
+     `file.sync_all()`（macOS std 即 `F_FULLFSYNC`，维持现状）。**Linux 恒定 `fdatasync`**：其语义覆盖
+     "检索数据所需的全部元数据"——append 造成的 `i_size` 扩展也在其范围内，故非预分配下也是完备屏障。
+  2. **段预分配已放弃（决策落档，dev 时为 oracle 裁决）**：std-only `File::set_len` 是 `ftruncate(2)`，
+     在 ext4/xfs 上产生**稀疏文件（holes）而非 reserved extents**——首次写入 hole 仍触发延迟分配/extent
+     journal 工作，`fdatasync` 并不会变为 `fallocate` 那种廉价 data-only 屏障（xfs 上 `fdatasync`≡`fsync`）。
+     且预分配会让 WAL 恢复/截断（`recover_wal` 整文件读）变成每段固定 128 MiB、tear 检测整体失效、
+     rollover 恒触发——是 WAL 恢复子系统重写，与"不改既有持久性测试语义 + INV2/ledger/faulty_storage/恢复"
+     验收门直接冲突。**结论：收益在 std-only 下不存在 → 不引入 crate、不重写恢复，推迟**。
+     `sync_durable` 无需 preallocated 标志。
+  3. 三处 `sync_all` 全部改走 `sync_durable`；`fsync_observer` 通知时机与次数不变；快照文件 `sync_all` 保持
+     原样（非 WAL 段）。
+  4. 测试：单测 `sync_durable_persists_written_bytes` + Linux-only `fdatasync` 行为证据（`#[cfg(target_os = "linux")]`，
+     CI 覆盖）；**不改既有持久性测试语义**，全部必须绿（INV2/ledger/faulty_storage/恢复全绿）。
 - **验收**：§2 回归门（build/全 workspace 测试/release-fi、fault-injection、门禁）；INV2 + ledger + 恢复全绿。
 - **红线**：不碰 `arachne-node/`、`arachne-transport-tonic/`、`arachne-seam/`、基准 harness；不 git commit。
 

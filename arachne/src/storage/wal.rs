@@ -72,6 +72,7 @@ use crate::storage::snapshot::{
 use crate::storage::segment::{
     parse_segment_name, segment_path, Segment, DEFAULT_SEGMENT_BYTES,
 };
+use crate::storage::sync::sync_durable;
 
 /// How many snapshot files to retain on disk.
 ///
@@ -220,7 +221,7 @@ impl FlushHandle {
     /// Flush every byte written to this segment through the original descriptor
     /// before this call.
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.file.sync_all().map_err(StorageError::Io)
+        sync_durable(&self.file).map_err(StorageError::Io)
     }
 
     /// The first log index of the segment this handle flushes. A pipeline that
@@ -1114,7 +1115,7 @@ impl WalStorage {
             .name(format!("arachne-wal-flush-{}", self.meta.node_id))
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    let result = job.file.sync_all().map_err(|e| e.to_string());
+                    let result = sync_durable(&job.file).map_err(|e| e.to_string());
                     if let Ok(mut queue) = thread_done.lock() {
                         queue.push_back(FlushJobResult {
                             id: job.id,

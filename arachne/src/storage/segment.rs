@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::storage::format::{encode_record, DecodeError, RecordType};
 #[cfg(test)]
 use crate::storage::format::decode_record;
+use crate::storage::sync::sync_durable;
 
 /// The default maximum size of a single segment file before rollover.
 pub const DEFAULT_SEGMENT_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
@@ -201,8 +202,13 @@ impl Segment {
     }
 
     /// Fsync the segment file (durability barrier for appended records).
+    ///
+    /// Dispatches through [`sync_durable`]: on Linux this is `fdatasync(2)`
+    /// (which covers the `i_size` extension of an appending write); on other
+    /// platforms it is the platform's full `fsync` (`F_FULLFSYNC` on macOS),
+    /// preserving the historical behaviour.
     pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_all()
+        sync_durable(&self.file)
     }
 
     /// Truncate the segment file to the given byte offset.

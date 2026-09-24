@@ -28,6 +28,7 @@ mod membership;
 mod meta;
 mod segment;
 pub mod snapshot;
+mod sync;
 mod wal;
 
 // Re-export the seam's storage types so `arachne::storage::Storage` etc.
