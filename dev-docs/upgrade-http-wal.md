@@ -18,13 +18,15 @@
 正确性 + 组提交带来的减少 flush 次数收益。**基准工具**：`docker/bench/`（arachne）+ `docker/bench-etcd/`（etcd 对照）
 in-network 驱动；`arachne/tests/bench_runtime.rs`（进程内，`#[ignore]`）。
 
-| # | 目标 | 现状 | 验收阈值（docker，交付批次后复测） |
-|---|---|---|---|
-| T1 | 单连接线性读脱离 20ms 地板 | 44 ops/s / 22.3ms | **≥ 400 ops/s 且 p50 ≤ 5ms**（B1 后） |
-| T2 | 单连接 put 脱离轮询地板 | 40 ops/s / 25.1ms | **≥ 80 ops/s 且 p50 ≤ 15ms**（B1 后）；`fdatasync` 落地后进一步 ≥200 ops/s / p50 ≤5ms（B1+B2 后） |
-| T3 | 弱读 4 并发平顶消失 | 44 ops/s / 22ms | **≥ 200 ops/s**（B1 后） |
-| T4 | 写 p99 降低（Linux fdatasync） | ~25ms | B1+B2 后 put p50 ≤ 5ms（overlayfs fdatasync 亚毫秒级）；B3 组提交后再降 |
-| T5 | 正确性零回归 | — | 见"回归门"：全部现有测试 + 门禁绿 |
+| # | 目标 | 现状 | 实测（B1+B2 后，两次） | 验收阈值（docker） | 判定 |
+|---|---|---|---|---|---|
+| T1 | 单连接线性读脱离 20ms 地板 | 44 / 22.3ms | 701–809 ops/s / p50 1.10–1.13ms | **≥ 400 ops/s 且 p50 ≤ 5ms**（B1 后） | ✅ |
+| T2 | 单连接 put 脱离轮询地板 | 40 / 25.1ms | 224–238 ops/s / p50 4.10–4.29ms | **≥ 200 ops/s / p50 ≤5ms**（B1+B2 后） | ✅ |
+| T3 | 弱读 4 并发平顶消失 | 44（平顶） | 746–859 ops/s / p50 1.01–1.18ms（单连接 1239–1443） | **≥ 200 ops/s**（B1 后） | ✅ |
+| T4 | 写 p99 降低（Linux fdatasync） | ~25ms | put p50 4.1ms（含 keep-alive 收益，fdatasync 已在 Linux 侧落地） | B1+B2 后 put p50 ≤ 5ms；B3 组提交后再降 | ✅ |
+| T5 | 正确性零回归 | — | workspace 414 / fi 430 / 门禁 4/4 全绿 | 全部现有测试 + 门禁绿 | ✅ |
+
+**⚠ 观察项（未归因，B3 前留意）**：**线性读 4 并发较 M1 基线下滑**——M1 767 ops/s / p50 0.96ms，B1+B2 后实测 286–337 ops/s / p50 2.83–3.30ms（两次稳定）。单连接线性读达标（T1）且并发差距主要在并发 driver 侧的线性一致读聚合。已排除 HTTP 轮询地板（单连接已脱困）；待确认是 driver 并发形态、hyper 连接复用 vs 旧一连接一请求、还是核心 ReadIndex 并发路径被 B1/B2 之外的改动影响。B3 调和后复测，若仍下滑再单独归因。
 
 **回归门（每个批次通过才算完成）**：
 - `cargo build --workspace`；`cargo test -p <该批 crate>`；全 workspace `cargo test --workspace`（fault-injection 全 workspace 也要过：`cargo test --workspace --features fault-injection`）。
