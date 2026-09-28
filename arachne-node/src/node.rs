@@ -119,6 +119,13 @@ impl Arachne {
         // this can be caught up from the log instead of a snapshot transfer.
         wal.set_trailing_keep_bytes(profile.wal_trailing_keep_bytes);
 
+        // B3 (U3): run durability off the actor thread so the raft pipeline
+        // pays one device fsync per coalesced batch instead of one per Ready.
+        // The raft node already handles the resulting `FlushToken` (it polls
+        // it in `finish_persisted` and fail-stops on an error), so enabling
+        // here is all the wiring the node needs.
+        wal.enable_offloaded_durability()?;
+
         // The real tonic transport: one factory owns the cluster identity and
         // the `NodeId -> SocketAddr` map and mints this node's halves.
         let factory = TonicTransportFactory::new(

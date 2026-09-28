@@ -321,6 +321,11 @@ struct Offloaded {
     waker: Arc<Mutex<FlushWaker>>,
     next_id: u64,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// B3 (U3): number of real fsyncs the flusher has performed. One per
+    /// distinct segment in a batch; a failed batch still counts its attempts.
+    /// `stats().offloaded_fsyncs` is derived from this, not from per-token
+    /// polling.
+    flusher_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only slow-disk delay shared with the flusher thread.
     #[cfg(feature = "fault-injection")]
     delay: Arc<std::sync::atomic::AtomicU64>,
@@ -336,6 +341,11 @@ struct FlushJobResult {
     id: u64,
     segment_first_index: LogIndex,
     result: Result<(), String>,
+    /// B3 (U3): `true` when this job is the LAST job of its segment in a batch,
+    /// i.e. the one whose completion should trigger the single per-segment
+    /// fsync notification. The flusher sets this so the main thread can collapse
+    /// the per-job `notify_fsynced` calls of the sync path into one per segment.
+    is_segment_owner: bool,
 }
 
 impl Drop for Offloaded {
@@ -522,8 +532,24 @@ impl WalStorage {
     }
 
     /// Return the current fsync/recovery counters.
+    ///
+    /// `offloaded_fsyncs` is the sum of the synchronous-path counter
+    /// (`note_flushed`) and the flusher thread's real fsync count (one per
+    /// distinct segment per batch, failures included). In offloaded mode the
+    /// sync path is idle, so the flusher count dominates; in sync mode the
+    /// flusher count is zero and the sync-path counter dominates.
     pub fn stats(&self) -> StorageStats {
-        self.stats
+        let mut s = self.stats;
+        if let Some(offloaded) = &self.offloaded {
+            s.offloaded_fsyncs = s
+                .offloaded_fsyncs
+                .saturating_add(
+                    offloaded
+                        .flusher_syncs
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+        }
+        s
     }
 
     /// Return the data directory path.
@@ -1108,20 +1134,114 @@ impl WalStorage {
         let waker: Arc<Mutex<FlushWaker>> = Arc::new(Mutex::new(FlushWaker::default()));
         let thread_done = Arc::clone(&done);
         let thread_waker = Arc::clone(&waker);
+        // B3 (U3): the flusher's real fsync count. One per distinct segment
+        // flushed in a batch; a failed batch still counts its attempts.
+        // `stats().offloaded_fsyncs` adds this on top of the sync-path
+        // (`note_flushed`) counter.
+        let flusher_syncs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Two independent Arc clones: one moved into the flusher thread (the
+        // thread owns its own handle), one kept by the storage struct. Both
+        // alias the same counter.
+        let thread_flusher_syncs = Arc::clone(&flusher_syncs);
+        let struct_flusher_syncs = Arc::clone(&flusher_syncs);
         // Shared with the flusher thread so `set_flush_delay_ms` can reach it.
+        // The `move` closure below moves `thread_delay` into itself, so we keep
+        // a separate clone (`struct_thread_delay`) for the storage struct.
         #[cfg(feature = "fault-injection")]
         let thread_delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(feature = "fault-injection")]
+        let struct_thread_delay = Arc::clone(&thread_delay);
         let thread = std::thread::Builder::new()
             .name(format!("arachne-wal-flush-{}", self.meta.node_id))
             .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    let result = sync_durable(&job.file).map_err(|e| e.to_string());
+                let flusher_syncs = thread_flusher_syncs;
+                loop {
+                    // 1. Receive the first job in this batch, or exit.
+                    let first = match rx.recv() {
+                        Ok(j) => j,
+                        Err(_) => break,
+                    };
+                    // 2. Respect the delay knob (fault-injection, e.g. slow disk).
+                    #[cfg(feature = "fault-injection")]
+                    {
+                        let delay_ms = thread_delay.load(std::sync::atomic::Ordering::Relaxed);
+                        if delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        }
+                    }
+                    // 3. Drain all jobs coalesced with this one into a batch.
+                    let mut batch: Vec<FlushJob> = vec![first];
+                    loop {
+                        match rx.try_recv() {
+                            Ok(next) => batch.push(next),
+                            Err(_) => break,
+                        }
+                    }
+                    // 4. One sync per distinct segment. `groups` is in first-
+                    //    occurrence order; for each, the LAST job's fd wins,
+                    //    because a later job is a newer view of the same file.
+                    //    Files are *moved* out of `batch` (std::fs::File is
+                    //    !Clone); per-job ids/segments are kept in `report`.
+                    //    `last_id[g]` is the last job id that belongs to group
+                    //    `g`; that job is the segment's "owner" — the one token
+                    //    whose completion triggers the single per-segment fsync
+                    //    notification. The sync path's `notify_fsynced` is per
+                    //    job, so the flusher collapses it to one call per
+                    //    segment by marking only owners.
+                    let mut groups: Vec<(u64, File)> = Vec::with_capacity(batch.len()); // (segment_first_index, file)
+                    let mut last_id: Vec<u64> = Vec::with_capacity(batch.len());        // last job id per group
+                    let mut report: Vec<(u64, u64, usize)> = Vec::with_capacity(batch.len()); // (job_id, segment_first_index, group_idx)
+                    for job in batch {
+                        let group_idx = match groups.iter().position(|(si, _)| *si == job.segment_first_index) {
+                            Some(pos) => {
+                                // Later job for a segment already seen: its fd
+                                // supersedes the stored one and it becomes the
+                                // segment's owner (last job per segment wins).
+                                groups[pos] = (job.segment_first_index, job.file);
+                                last_id[pos] = job.id;
+                                pos
+                            }
+                            None => {
+                                groups.push((job.segment_first_index, job.file));
+                                last_id.push(job.id);
+                                groups.len() - 1
+                            }
+                        };
+                        report.push((job.id, job.segment_first_index, group_idx));
+                    }
+                    // 5. Sync each distinct segment once; fail-stop on first
+                    //    failure (conservative: the whole batch fails).
+                    let mut sync_count = 0u64;
+                    let mut any_failed = false;
+                    for (_, file) in &groups {
+                        let result = sync_durable(file).map_err(|e| e.to_string());
+                        sync_count += 1;
+                        if result.is_err() {
+                            any_failed = true;
+                            // fail-stop: the rest of this batch's tokens go Err
+                            // even though their segments may not have been
+                            // attempted; reporting the whole batch Err is
+                            // conservative and forces the node to stop.
+                            break;
+                        }
+                    }
+                    // Count the real fsync attempts the flusher made.
+                    flusher_syncs.fetch_add(sync_count, std::sync::atomic::Ordering::Relaxed);
+                    let batch_result = if any_failed {
+                        Err("flusher batch sync failed; node must fail-stop".to_string())
+                    } else {
+                        Ok(())
+                    };
                     if let Ok(mut queue) = thread_done.lock() {
-                        queue.push_back(FlushJobResult {
-                            id: job.id,
-                            segment_first_index: job.segment_first_index,
-                            result,
-                        });
+                        for (job_id, si, group_idx) in report {
+                            let is_owner = job_id == last_id[group_idx];
+                            queue.push_back(FlushJobResult {
+                                id: job_id,
+                                segment_first_index: si,
+                                result: batch_result.clone(),
+                                is_segment_owner: is_owner,
+                            });
+                        }
                     }
                     if let Ok(waker) = thread_waker.lock() {
                         waker.wake();
@@ -1139,8 +1259,9 @@ impl WalStorage {
             waker,
             next_id: 0,
             thread: Some(thread),
+            flusher_syncs: struct_flusher_syncs,
             #[cfg(feature = "fault-injection")]
-            delay: Arc::clone(&thread_delay),
+            delay: struct_thread_delay,
         });
         Ok(())
     }
@@ -1750,8 +1871,19 @@ impl Storage for WalStorage {
         // A failed flush leaves the bytes unsynced: report it without claiming
         // durability, so the node fail-stops instead of acknowledging.
         if finished.result.is_ok() {
-            self.stats.offloaded_fsyncs += 1;
-            if finished.segment_first_index == self.segment_first_index {
+            // B3 (U3): the offloaded fsync count now comes from the flusher's
+            // `flusher_syncs` (one per distinct segment per batch), not from a
+            // per-token increment, so we no longer touch `stats.offloaded_fsyncs`
+            // here. The sync path (`note_flushed`) still increments that field,
+            // and `stats()` sums the two.
+            //
+            // Only the segment's *owner* token (last job for that segment in a
+            // batch) triggers the single per-segment fsync notification; the
+            // flusher marked all others `is_segment_owner = false` so a batch
+            // of N jobs in one segment records exactly one fsync event.
+            if finished.is_segment_owner
+                && finished.segment_first_index == self.segment_first_index
+            {
                 self.pending_entry_fsync = false;
                 self.notify_fsynced();
             }
@@ -3801,6 +3933,211 @@ mod tests {
             store2.initial_state().expect("state").conf_state,
             snapshot.meta.conf_state
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // B3 (U3): flusher group commit — drain coalescing + correct fsync count
+    //
+    // These tests exercise the new flush-loop behavior (drain-coalescing
+    // queued jobs into one real sync per distinct segment, and fail-stop on
+    // a sync error). They are gated behind `fault-injection` (the offloaded
+    // path + delay knobs) and are written TDD-style: they fail against the
+    // current per-job flush loop and pass once the drain-coalesce loop is
+    // wired in.
+    // ---------------------------------------------------------------------
+
+    /// Poll a single token until it reports, returning the reported result.
+    ///
+    /// `poll_flush` yields `None` while the flusher has not finished the token
+    /// and `Some(result)` exactly once it has (each token is reported at most
+    /// once). The panic is fine here (tests only).
+    fn poll_token(
+        store: &mut WalStorage,
+        token: FlushToken,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let id = token.0;
+        loop {
+            match store
+                .poll_flush(&token)
+                .unwrap_or_else(|e| panic!("poll poisoned: {e}"))
+            {
+                Some(res) => return res,
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("token {id} timed out waiting for the flusher");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn coalesced_flush_counted_once_per_segment() {
+        use arachne_testsupport::FsyncLedger;
+        use std::sync::Arc;
+        // 5 entries, all in one segment (default 128 MiB). A drain-coalescing
+        // flush loop must emit exactly ONE real fsync for the 5 queued jobs,
+        // not five. The observer is wired in before `open` so that
+        // `notify_fsynced` (which reads `self.fsync_observer`) records the
+        // per-segment fsync event.
+        let dir = temp_dir();
+        let ledger = Arc::new(FsyncLedger::new());
+        let opts = WalOptions {
+            fsync_observer: Some(Arc::clone(&ledger) as Arc<dyn FsyncObserver>),
+            ..test_opts()
+        };
+        let mut store = WalStorage::open(&dir, opts).expect("open");
+        store
+            .enable_offloaded_durability()
+            .expect("offload");
+        store.set_flush_delay_ms(100);
+
+        let mut tokens = Vec::new();
+        for i in 1..=5 {
+            let submitted = store
+                .persist_ready_records(
+                    &[make_entry(i, 1, "v".as_bytes())],
+                    None,
+                )
+                .expect("append");
+            let PersistSubmit::Offloaded(token) = submitted else {
+                panic!("expected offloaded, got {submitted:?}");
+            };
+            tokens.push(token);
+        }
+
+        // Let the flusher drain the batch before we poll.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for t in &tokens {
+            assert!(poll_token(&mut store, *t, deadline).is_ok(), "healthy disk → Ok");
+        }
+
+        // B3 core: 5 queued jobs collapsed to exactly one real sync.
+        assert_eq!(
+            store.stats().offloaded_fsyncs, 1,
+            "5 jobs in one segment = 1 fsync, not 5"
+        );
+        assert_eq!(
+            ledger.events().len(),
+            1,
+            "one segment fsync event recorded, not five"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn coalesced_flush_syncs_each_segment_across_rollover() {
+        // 6 entries × 30 bytes = 180 bytes. With an 80-byte segment cap,
+        // entries 1–3 fill seg1 (90 ≥ 80 → rollover before entry 4), and
+        // entries 4–6 land in seg4 (named by entry 4's index). Two distinct
+        // segments → two real syncs, not six.
+        let dir = temp_dir();
+        let mut store = WalStorage::open(&dir, test_opts_with_segment_bytes(80))
+            .expect("open");
+        store.enable_offloaded_durability().expect("offload");
+        store.set_flush_delay_ms(100);
+
+        let mut tokens = Vec::new();
+        for i in 1..=6 {
+            let submitted = store
+                .persist_ready_records(
+                    &[make_entry(i, 1, "v".as_bytes())],
+                    None,
+                )
+                .expect("append");
+            let PersistSubmit::Offloaded(token) = submitted else {
+                panic!("expected offloaded, got {submitted:?}");
+            };
+            tokens.push(token);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for t in &tokens {
+            assert!(poll_token(&mut store, *t, deadline).is_ok(), "healthy disk → Ok");
+        }
+
+        // B3 core: 6 queued jobs across two segments collapsed to two real syncs.
+        assert_eq!(
+            store.stats().offloaded_fsyncs, 2,
+            "6 jobs across 2 segments = 2 fsyncs, not 6"
+        );
+
+        // Sanity: both segments are physically present (20-digit zero-padded
+        // names, per `segment_name`).
+        let n1 = dir.join("wal-00000000000000000001.log");
+        let n4 = dir.join("wal-00000000000000000004.log");
+        assert!(n1.exists(), "wal-1 segment must exist");
+        assert!(n4.exists(), "wal-4 segment must exist");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn coalesced_flush_failure_fails_every_covered_token() {
+        // Pre-create the active segment as a symlink to /dev/null: writes are
+        // accepted (silently discarded) but sync_data/sync_all fail with
+        // ENOTSUP on macOS/Linux. The flusher's batched sync therefore fails
+        // and every token the flusher touched must surface as Err (fail-stop,
+        // no partial ack).
+        let dir = temp_dir();
+
+        // Replace the would-be wal-1.log (fresh dir active segment) with a
+        // symlink to a non-syncable character device. Segment names are
+        // `wal-{index:020}.log`, so the active (first) segment is wal-1 with
+        // 20-digit zero-padding.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = dir.join("/dev/null");
+            let link = dir.join("wal-00000000000000000001.log");
+            symlink(target, link).expect("create /dev/null symlink");
+        }
+
+        let mut store = WalStorage::open(&dir, test_opts()).expect("open");
+        store.enable_offloaded_durability().expect("offload");
+        store.set_flush_delay_ms(100);
+
+        let mut tokens = Vec::new();
+        for i in 1..=3 {
+            let submitted = store
+                .persist_ready_records(
+                    &[make_entry(i, 1, "v".as_bytes())],
+                    None,
+                )
+                .expect("append");
+            let PersistSubmit::Offloaded(token) = submitted else {
+                panic!("expected offloaded, got {submitted:?}");
+            };
+            tokens.push(token);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for t in &tokens {
+            assert!(
+                poll_token(&mut store, *t, deadline).is_err(),
+                "sync to /dev/null must fail → token Err (fail-stop)"
+            );
+        }
+
+        // A failed flush batch still counts as 1 fsync attempt: the flusher
+        // made one real (failed) sync for the single segment. This pin-downs
+        // B3's "fail-stop counts the attempt" (the per-job loop would have
+        // counted zero here).
+        assert_eq!(
+            store.stats().offloaded_fsyncs, 1,
+            "failed batch still counts as 1 fsync attempt"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

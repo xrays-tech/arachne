@@ -95,10 +95,28 @@ B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne 核心   ←
 - **验收**：§2 回归门（build/全 workspace 测试/release-fi、fault-injection、门禁）；INV2 + ledger + 恢复全绿。
 - **红线**：不碰 `arachne-node/`、`arachne-transport-tonic/`、`arachne-seam/`、基准 harness；不 git commit。
 
-### B3（U3）：组提交 —— 一次 sync 落一批并发写（**等 B2 调和后派发**）
-- 范围与做法待 B2 落地后细化；核心：在 rev P flusher 的批量语义上把"每批一次 sync"落到"一个提交窗口
-  （写缓冲满或短窗口到点）内的所有并发提案"，并在 `FsyncPolicy::BatchMs(ms)` 语义上给出默认参数。
-- 验收门：`I2/I4` 持久性不变式 + INV2 故障注入 + 读延迟（不能在窗口期恶化 p99）+ §2 T4。
+### B3（U3）：组提交 —— 一次 sync 落一批并发写（**已落地**）
+- **范围**：`arachne/src/storage/wal.rs`（flusher 批排合并 + fsync 计数修正）；
+  `arachne-node/src/node.rs`（生产接线）；新增单测；新增 `dev-docs/b3-group-commit-spec.md`。
+  **不**动 seam 类型（`FlushToken`/`PersistSubmit`/`FlushHandle`）、**不**动 `FsyncPolicy`
+  变体/默认（B2 已定）、**不**动 HardState 批处理（I1）。
+- **做法**：
+  1. flusher 循环改为**排空合并**（无计时窗）：`recv` 取本批锚 Job → `try_recv` 排空
+     所有已到达 Job → 按 `segment_first_index` 分组（同段取最后 Job 的 fd）→ **每段
+     一次 `sync_durable`**（fail-stop：任一段失败则整批 tokens 报 `Err`）。
+  2. `FlushJobResult` 增 `is_segment_owner: bool`（段内最后 Job）。`poll_flush`
+     仅在 `is_segment_owner && 段==当前段` 时触发**单次** `notify_fsynced` +
+     `pending_entry_fsync=false`，把 sync 路径的"逐 Job fsync 事件"坍缩为"每段一次"。
+  3. `Offloaded` 增 `flusher_syncs: Arc<AtomicU64>`（每批每段一次，失败计入尝试）；
+     `stats().offloaded_fsyncs` = 同步路径 `note_flushed` + `flusher_syncs`（`stats()` 求和）。
+     **核心修正**：不再用 token 数冒充设备 fsync 数。
+  4. `node.rs`：`Runtime::new` 前 `wal.enable_offloaded_durability()?` —— 生产节点
+     默认走 offloaded 流水线；raft 节点（`consensus/node.rs`）已有 token 轮询 + fail-stop。
+- **验收**：§2 回归门（build/全 workspace 测试/release-fi、fault-injection、门禁）；
+  三处 TDD（单段 5/1=1、跨段 6/2=2、失败段全 Err）全绿；`I2/I4` + INV2 + 恢复全绿。
+  效率 T4（put p50 进一步下降）由 orchestrator 用 `docker/bench` 复测对拍。
+- **红线**：不碰 `arachne-node/` 之外的 crate、`arachne-transport-tonic/`、`arachne-seam/`、
+  基准 harness；不 git commit。
 
 ## 5. 工具与沙箱
 - 编译/测试/门禁必须 `CARGO_TARGET_DIR=$PWD/.dsh-target`（沙箱拒绝仓库外 target）；fi 全套同。
