@@ -16,6 +16,19 @@ regression-gate script `scripts/check-perf-baseline.sh` consumes this). Human
 text lines are re-routed to stderr so stdout carries *only* the JSON object.
 Default (no --json) behaviour is unchanged: all output is the familiar text
 report on stdout.
+
+--keep-alive: make the *read* benchmarks reuse a single persistent
+HTTP/1.1 connection per worker (one `HTTPConnection` built outside the request
+loop, `request()`/`getresponse()` reused, re-opened on a broken conn) instead of
+opening a fresh connection per request. This matches etcd's keep-alive
+client model and isolates client-side per-connection cost from server-side
+throughput. Default (no --keep-alive) keeps the existing one-connection-per
+request behaviour so the gate and prior baselines are byte-identical.
+
+--read-workers W1,W2,...: run the linear/stale read benchmarks across a
+concurrency gradient (e.g. 1,2,4,8). Without the flag the historical
+layout is preserved (linear 1w/4w, stale 1w/4w); the puts are unchanged either
+way.
 """
 
 import argparse
@@ -75,6 +88,35 @@ def req(method, port, path, timeout=15.0):
         ok, status, body = False, 0, str(e).encode()
     finally:
         conn.close()
+    dt = time.perf_counter_ns() - t0
+    return ok, status, body.decode("utf-8", "replace"), dt
+
+
+def _make_conn(port, timeout=15.0):
+    """Open one reusable (keep-alive) HTTPConnection for ``port``."""
+    return http.client.HTTPConnection(
+        HOSTS_BY_PORT.get(port, HOST), port, timeout=timeout)
+
+
+def req_reuse(conn, method, path, timeout=15.0):
+    """Send ``method``/``path`` on an ALREADY-OPEN connection, leaving it open.
+
+    The caller owns the lifecycle of ``conn`` (it must close it when done).
+    ``http.client`` reuses one HTTP/1.1 connection across a continuous
+    request()/getresponse() sequence; the response body *must* be fully read
+    (we do ``resp.read()``) before the next request on the same connection.
+    Mirrors ``req()``'s timing/return contract so it can drop in as the
+    keep-alive replacement for the fresh-connection path.
+    """
+    t0 = time.perf_counter_ns()
+    try:
+        conn.request(method, path)
+        resp = conn.getresponse()
+        body = resp.read()
+        ok = resp.status == 200
+        status = resp.status
+    except Exception as e:  # reset / timeout / close-mid-request
+        ok, status, body = False, 0, str(e).encode()
     dt = time.perf_counter_ns() - t0
     return ok, status, body.decode("utf-8", "replace"), dt
 
@@ -143,14 +185,47 @@ def run_put_benchmark(leader, workers, per_worker, tag):
     return samples
 
 
-def run_get_benchmark(port, key, stale, tag, n, workers=1):
-    def job(seed):
-        out = []
-        for i in range(seed, n, workers):
-            ok, _, _, dt = get(port, key, stale=stale)
-            if ok:
-                out.append(dt)
-        return out
+def run_get_benchmark(port, key, stale, tag, n, workers=1, keep_alive=False):
+    """Run a read benchmark on ``port``.
+
+    keep_alive=False (default): one *fresh* HTTP connection per request — the
+    historical behaviour (new TCP/HTTP conn per op).
+    keep_alive=True: one *persistent* connection per worker, reused across all
+    of that worker's requests (matches etcd's keep-alive client model: one
+    ``HTTPConnection`` per worker, `request()`/`getresponse()` reused, re-opened
+    on a broken conn).
+    """
+    path = f"/kv/{key}" + ("?stale=1" if stale else "")
+
+    if keep_alive:
+        def job(seed):
+            out = []
+            conn = _make_conn(port)
+            try:
+                for i in range(seed, n, workers):
+                    ok, status, _, dt = req_reuse(conn, "GET", path)
+                    if ok:
+                        out.append(dt)
+                    if status == 0:  # wire connection died; reopen for the rest
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = _make_conn(port)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return out
+    else:
+        def job(seed):
+            out = []
+            for i in range(seed, n, workers):
+                ok, _, _, dt = get(port, key, stale=stale)
+                if ok:
+                    out.append(dt)
+            return out
 
     if workers == 1:
         samples = job(0)
@@ -158,10 +233,12 @@ def run_get_benchmark(port, key, stale, tag, n, workers=1):
         with futures.ThreadPoolExecutor(max_workers=workers) as ex:
             results = list(ex.map(job, range(workers)))
         samples = [d for r in results for d in r]
+
     report(f"get ({tag})", samples, n)
     if _JSON_MODE:
         mode = "stale" if stale else "linear"
-        record(f"get-{mode}-{workers}w", f"get ({tag})", "get", workers, samples, n)
+        record(f"get-{mode}-{workers}w", f"get ({tag})", "get", workers,
+               samples, n)
     return samples
 
 
@@ -178,11 +255,26 @@ def main():
     ap.add_argument("--n", type=int, default=100,
                     help="op count for each critical benchmark (default 100 puts / 100 reads; "
                          "used only when --fast)")
+    ap.add_argument("--keep-alive", action="store_true",
+                    help="reuses one persistent connection per worker for the read "
+                         "benchmarks (keep-alive / etcd-style model) instead of a "
+                         "fresh connection per request. Default (off) keeps the "
+                         "historical per-request-connection behaviour.")
+    ap.add_argument("--read-workers", type=str, default="",
+                    help="comma-separated concurrency gradient for the reads, e.g. "
+                         "'1,2,4,8'. Without it the historical read layout is kept "
+                         "(linear 1w/4w, stale 1w/4w). Puts are unaffected.")
     args = ap.parse_args()
     global HOST, HOSTS_BY_PORT, _JSON_MODE
     _JSON_MODE = args.json
     fast = args.fast
     n = args.n
+    keep_alive = args.keep_alive
+    raw_rw = args.read_workers
+    if raw_rw:
+        read_workers = [int(x) for x in raw_rw.split(",") if x.strip()]
+    else:
+        read_workers = None
     host_list = [h for h in args.hosts.split(",") if h]
     ports = [int(x) for x in args.ports.split(",")]
     if len(host_list) == len(ports):
@@ -237,10 +329,25 @@ def main():
             if o:
                 break
             time.sleep(0.05)
-        run_get_benchmark(leader, seed, stale=False, tag="linear", n=400)
-        run_get_benchmark(leader, seed, stale=False, tag="linear-con4", n=400, workers=4)
-        run_get_benchmark(leader, seed, stale=True, tag="stale", n=400)
-        run_get_benchmark(leader, seed, stale=True, tag="stale-con4", n=400, workers=4)
+        if read_workers:
+            # Concurrency gradient: linear read at each worker count, plus the
+            # historical stale 4-way shape (T3). Per-op scale is --n.
+            for w in read_workers:
+                run_get_benchmark(leader, seed, stale=False, tag=f"linear {w}w",
+                                 n=n, workers=w, keep_alive=keep_alive)
+            run_get_benchmark(leader, seed, stale=True, tag="stale 4w", n=n,
+                             workers=4, keep_alive=keep_alive)
+        else:
+            # Historical read layout (backward-compatible default). keep_alive is
+            # False by default, so this is byte-identical to the prior driver.
+            run_get_benchmark(leader, seed, stale=False, tag="linear", n=400,
+                             keep_alive=keep_alive)
+            run_get_benchmark(leader, seed, stale=False, tag="linear-con4", n=400,
+                             workers=4, keep_alive=keep_alive)
+            run_get_benchmark(leader, seed, stale=True, tag="stale", n=400,
+                             keep_alive=keep_alive)
+            run_get_benchmark(leader, seed, stale=True, tag="stale-con4", n=400,
+                             workers=4, keep_alive=keep_alive)
 
     log("=== done ===")
 
@@ -250,6 +357,8 @@ def main():
             "schema": 1,
             "leader_port": leader,
             "value": VALUE,
+            "keep_alive": bool(keep_alive),
+            "read_workers": read_workers,
             "results": RESULTS,
         }
         # stdout carries *only* the JSON object in --json mode.

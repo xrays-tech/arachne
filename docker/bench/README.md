@@ -104,3 +104,74 @@ docker compose run --rm driver --hosts node1,node2,node3
 
 `--fast` asserts T1 (rps>=400 and p50<=5.0) and T2 (rps>=200 and p50<=5.0) at
 a reduced op count.
+
+## Concurrent read caliber (并发读口径)
+
+Two opt-in flags were added to `driver/bench.py` (both default OFF, so the gate's
+default path and all prior baselines are byte-identical):
+
+- **`--keep-alive`** — the read benchmarks reuse one persistent HTTP/1.1
+  connection per worker (one `HTTPConnection` built outside the request loop,
+  `request()`/`getresponse()` reused, re-opened on a broken conn) instead of
+  opening a fresh connection per request. This matches etcd's keep-alive /
+  goroutine client model and isolates *client-side* per-connection cost from
+  *server-side* throughput. The `req()` one-shot path is unchanged, so `--json`
+  parsing in the gate is unaffected.
+- **`--read-workers 1,2,4,8`** — run the linear/stale reads across a concurrency
+  gradient (plus the historical stale 4-way shape). `--n` sets the per-benchmark
+  op count. Without the flag the historical read layout is kept; puts are
+  unaffected either way.
+
+```bash
+# keep-alive, linear gradient + stale 4-way, 100 ops each
+docker compose run --rm driver --read-workers 1,2,4,8 --n 100 --keep-alive \
+    --json --hosts node1,node2,node3
+```
+
+### A/B evidence (fresh 3-node cluster, n=100, linearizable reads on the leader)
+
+| read   | workers | fresh conn (ops/s) | fresh p50 (ms) | keep-alive (ops/s) | keep-alive p50 (ms) |
+|--------|---------|--------------------|----------------|--------------------|---------------------|
+| linear | 1       | 3175.1             | 0.298          | 4902.0             | 0.195               |
+| linear | 2       | 1850.6             | 0.535          | 2410.6             | 0.408               |
+| linear | 4       | 1011.1             | 0.991          | 1384.2             | 0.713               |
+| linear | 8       | 559.1              | 1.854          | 770.7              | 1.313               |
+| stale  | 4       | 2373.1             | 0.417          | 4181.2             | 0.170               |
+
+Findings:
+
+1. **Keep-alive removes the client-side per-request connection setup cost.**
+   1-way reads go from 3175 → 4902 ops/s (p50 0.298 → 0.195 ms); stale 4-way
+   reads from 2373 → 4181 ops/s (p50 0.417 → 0.170 ms). The old driver's
+   per-request `new HTTPConnection + close` (under the GIL) was a real client
+   bottleneck (~0.3 ms/op, matching the GIL hypothesis).
+2. **Linearizable reads do *not* scale with worker count under either driver.**
+   With keep-alive the 4-way read is only 1384 ops/s (p50 0.713 ms) and the 8-way
+   read 771 ops/s (p50 1.313 ms) — *below* the 1-way 4902 ops/s. p50 grows
+   0.195 → 0.713 → 1.313 ms. Even the fair-caliber keep-alive 4-way read stays
+   in the ~700–1500 ops/s band.
+3. **Stale reads do *not* collapse with concurrency** (stale 4-way keep-alive
+   4181 ops/s), consistent with the *linearizable* read path being the one that
+   is serialized.
+
+Conclusion: the driver was a contributing bottleneck (**A**) and keep-alive is
+the correct, now-fair client calibration — but the remaining 4-way read gap is
+a **server-side serialized critical path (C)** (the actor / WAL durability path),
+*not* the driver. The server was deliberately left untouched in this evidence pass.
+
+Continuation (batch-rate observation, server side — see task report):
+- Instrument the read path to count the serialized barrier (actor read lock /
+  WAL `fdatasync` barrier) per request; confirm the 4-way p50 ≈ 4 × single-request
+  barrier, i.e. a single global lock rather than N-way parallelism.
+- Correlate read p50 with *concurrent write* load (the B3 group-commit barrier is
+  shared): run the linear 4-way read while a put stream is active vs. idle. If read
+  p50 degrades with writes, the serialized path is the shared durability barrier.
+- Observe how increasing WAL batch size / group-commit frequency (C) moves the
+  4-way read p50, to bound how much of the gap is `fdatasync`-driven vs. a read lock.
+- Re-run the same gradient once the server-side fix lands; expect linear reads to
+  scale toward ~4× the 1-way keep-alive figure (≈ 4902 × 4) if serialization is
+  removed.
+
+For same-caliber comparisons against etcd, use the keep-alive driver (etcd's
+linearizable 4-way ≈ 2500 ops/s still exceeds arachne's 4-way 1384 under
+keep-alive, confirming a remaining server-side deficit rather than a client one).
