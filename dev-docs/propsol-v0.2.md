@@ -428,11 +428,18 @@ io_uring `IORING_OP_FSYNC(DATASYNC)` 内核 5.1+、Limbo 生产在用但 RocksDB
 - **验证**：FsyncLedger / faulty_storage / INV2 崩溃注入 / 恢复 WAL 在平台分派下重跑；docker/bench 驱动
   对拍（组提交前后 p99/吞吐）。
 
-**U4（观察项，落档）**：io_uring `IORING_OP_FSYNC`（组提交后若 WAL sync 仍是测量瓶颈再采纳；走 sync
-抽象 drop-in；不绑停更的 tokio-uring，用活跃的 `io-uring` crate）；quinn/HTTP3（keep-alive 已拿大头，
-按需再议）；SO_REUSEPORT/DPDK 对本品规模为过度设计，明确不做。
+**U4（io_uring 判定，B4 后收尾，Lane ④）**：**暂不采纳。** 采纳前提"WAL sync 是写路径测量瓶颈"已被实测否定（B3 drain 合并摊薄批次 + B4 fallocate KEEP_SIZE 消除分配/extent-journal 成本；put p50 1.13ms 与 etcd 持平，etcd 亦不用 io_uring）。io_uring 仅消除 µs 级 syscall 开销，设备屏障成本不变——在已消除的瓶颈上引入 `io-uring` 依赖与第二套 I/O 栈为纯负收益。**复测触发条件（满足其一即重开评估，实现仍走 `sync_durable` 抽象 drop-in，用活跃的 `io-uring` crate，不绑 tokio-uring）**：
+> ① 对拍/火焰图显示 `sync_durable`（fdatasync/jbd2/extent 路径）重新占写路径 p50 的 **≥30%**，且 flusher drain 已无法进一步摊薄（flusher 线程 sync 忙占比 >50%，即合并已到顶仍不够）；
+> ② 硬件/内核变更使单次 sync 成本数量级抬升（网络块设备、SMR HDD 等单次 >5ms 的存储）；
+> ③ 高写并发吞吐出现平台期且证据指向 flusher 单线程 sync 串行（排除网络/actor 归因后）。
 
-**分期**：P1 = U1（独立可交付，先消单连接下限）；P2 = U2+U3（按 rev P 流水线接续）；P3 = U4 判断点。
+quinn/HTTP3（keep-alive 已拿大头，按需再议）；SO_REUSEPORT/DPDK 对本品规模为过度设计，明确不做。
+
+**BatchMs 默认参数钉死（B4 后收尾，Lane ②）**：`FsyncPolicy` 默认恒为 `Always`（§5.5 参数表维持）；`BatchMs(ms)` 为显式 opt-in，**`ms` 参数冻结、无消费点（非定时器）**——同步路径下语义仅为"有 pending 才刷"的 no-op skip；offloaded 流水线下与 `Always` 行为逐字节相同，批量化由 B3 的 flusher drain 合并实现（只合并已在途 Job、从不等待，零新增延迟）。
+写稀无收益是**结构性**的而非调参问题：flusher 只合并已到达的 Job，写稀时无物可合；定时器窗口只会恶化 p99 且无可攒事务（v0.2.12 论证在异步流水线下仍成立：actor 单写者无并发等待者，等待即 ack 提前于落盘）。I1 不受影响：**HardState 恒不参与任何批量窗口**——同步路径逐次 fsync，offloaded 路径由同周期的一次 sync 覆盖、FIFO 完成序保证先于任何 ack（I2/I4 同此保持）。§1.34 的旧实测（BatchMs(10) ≈170 ops/s）取自该参数仍为占位的时期，仅证明"标签不改变行为"，不作本结论主证据。
+> 不再跑"写稀×窗口"实验（当前架构下两组无行为差异，实验无分辨力）；本项标记**待观察**，观察信号与 U4 复测条件共享（见上）。
+
+**分期**：P1 = U1（独立可交付，先消单连接下限）；P2 = U2+U3（按 rev P 流水线接续）；P3 = U4 判断点（已关闭为暂不采纳，见上）。
 每期各自验证 + §1.35 驱动对拍。
 
 **未完成/未决项（落档）**：
