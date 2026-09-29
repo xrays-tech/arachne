@@ -504,7 +504,14 @@ rev U 的 U2 "Linux 段预分配 + 每批 `fdatasync`" 中，**预分配**在 B2
 
 **验证**：`cargo test -p arachne`（含 5 个新测）+ `--features fault-injection` +
 `cargo test --workspace` + `check-deps.sh` / `check-entropy.sh` 全绿；`cargo tree -p
-arachne --no-default-features | grep libc` ≥1（零树增长，libc 已在树）；
+arachne --no-default-features | grep libc` ≥1（零树增长，libc 已在树）。
+
+**对拍结论（orchestrator，2026-09，docker/bench 同 n=100 口径）**：B4 落地后较 B3：
+put 单连接 **703 ops/s / p50 1.13ms**（B3：~445 / ~2.0ms → **吞吐 +58%、p50 −44%**），
+线性读单连接 2859–3503 / p50 ~0.3ms（B3：~1560），弱读 4 并发 ~2200（B3：~1500）。
+收益**远超**本 rev 预期的 10–15%。etcd 同配置对照（put 821/1.13ms、线性读 1531/0.58ms）：
+**put/线性读/弱读 4 并发均已达或反超 etcd**。验收目标（put p50 ≤1.8ms、吞吐 +5%）
+全面达成，B4 采纳成立。
 Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 **后续**：`docker/bench` 复测写 p99（Linux 上预期更平/更快 —— append 不再触发延迟
 分配 + extent-journal，每段一次 `fdatasync` 即 data-only 屏障，见 etcd `fileutil.Preallocate`）。
