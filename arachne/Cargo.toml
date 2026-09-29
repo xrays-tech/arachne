@@ -45,6 +45,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # only crate allowed to reference tonic/rustls types.
 arachne-transport-tonic = { workspace = true, optional = true }
 
+# B4 / U2-bis: WAL segment extent pre-allocation (fallocate(2) with
+# FALLOC_FL_KEEP_SIZE) needs a thin C binding on Linux. `libc` is already in
+# the tree (via tokio) and is a ~2-line stdlib wrapper, so this adds no new
+# crate to the dependency graph.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Test-only: the test support crate provides the FsyncLedger and FaultyStorage
 # for integration tests. This is a dev-dependency only (enforced by

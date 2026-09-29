@@ -79,7 +79,9 @@ B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne 核心   ←
 
 ### B2（U2）：WAL sync 平台化（std-only，零新增依赖）
 - **范围**：`arachne/src/storage/`（新增 `sync.rs`；改 `wal.rs`/`segment.rs` 的 sync 调用点）；新增单测。
-  **禁止**引入 `libc`/`rustix`（核心零外部 crate 红线，Gate B）——**只用 std**。
+    B2 本批 std-only；后续 B4（U2-bis）例外：仅 Linux 下经 cfg-gated 引入零树增长的 `libc`（0.2，
+    已在 tokio 树内）做段预分配，**Gate B 红线不变**（瘦核 `--no-default-features` 仍无传输依赖，
+    `libc` 不触 Gate B）。
 - **现状**：真实 sync 落在三处 `file.sync_all()`：`FlushHandle::flush`（wal.rs≈223，flusher 线程路径）、
   flusher 循环（≈1117）、`Segment::sync`（`sync_entries` 同步路径走这里）；`fsync_dir` 已在段创建/rename 后调用 ✓；
   rev P 单 flusher 线程 + FlushToken 已存在；`fsync_observer`（每真实 fsync 后通知）语义不能变。
@@ -88,13 +90,15 @@ B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne 核心   ←
      `#[cfg(target_os = "linux")]` 用 `file.sync_data()`（= `fdatasync(2)`），其余平台（含 macOS）用
      `file.sync_all()`（macOS std 即 `F_FULLFSYNC`，维持现状）。**Linux 恒定 `fdatasync`**：其语义覆盖
      "检索数据所需的全部元数据"——append 造成的 `i_size` 扩展也在其范围内，故非预分配下也是完备屏障。
-  2. **段预分配已放弃（决策落档，dev 时为 oracle 裁决）**：std-only `File::set_len` 是 `ftruncate(2)`，
-     在 ext4/xfs 上产生**稀疏文件（holes）而非 reserved extents**——首次写入 hole 仍触发延迟分配/extent
-     journal 工作，`fdatasync` 并不会变为 `fallocate` 那种廉价 data-only 屏障（xfs 上 `fdatasync`≡`fsync`）。
-     且预分配会让 WAL 恢复/截断（`recover_wal` 整文件读）变成每段固定 128 MiB、tear 检测整体失效、
-     rollover 恒触发——是 WAL 恢复子系统重写，与"不改既有持久性测试语义 + INV2/ledger/faulty_storage/恢复"
-     验收门直接冲突。**结论：收益在 std-only 下不存在 → 不引入 crate、不重写恢复，推迟**。
-     `sync_durable` 无需 preallocated 标志。
+   2. **段预分配（B2 时"推迟"，B4 / U2-bis 已落地）**：B2 的结论（std-only `set_len` 是
+      `ftruncate(2)`，产生稀疏 holes 而非 reserved extents）在 B4 下被 `fallocate(2)` +
+      **`FALLOC_FL_KEEP_SIZE`** 推翻：该 flag 仅 Linux 可用，reserve extents 而 **不增大 `i_size`**。
+      新增 `storage/prealloc.rs`（libc 0.2，linux-gated，零树增长），在 `Segment::open_with_max_bytes`
+      后调 `preallocate(&file, max_bytes)`。因 `i_size` 不变，五个读 `i_size` 的子系统
+      （`recover_wal`/tear 检测/`truncate_log_to`/`size`·`should_rollover`/`log_bytes`）字节不变，
+      **不重写恢复、tear 检测、rollover 均不受影响**——"rollover 恒触发"结论不再成立。
+      失败（EOPNOTSUPP/ENOSYS/EINVAL/ENOSPC）→ skip（非致命）；`StorageStats::segment_prealloc_skips`
+      计数。`sync_durable` 仍无需 preallocated 标志。
   3. 三处 `sync_all` 全部改走 `sync_durable`；`fsync_observer` 通知时机与次数不变；快照文件 `sync_all` 保持
      原样（非 WAL 段）。
   4. 测试：单测 `sync_durable_persists_written_bytes` + Linux-only `fdatasync` 行为证据（`#[cfg(target_os = "linux")]`，
@@ -127,5 +131,11 @@ B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne 核心   ←
 
 ## 5. 工具与沙箱
 - 编译/测试/门禁必须 `CARGO_TARGET_DIR=$PWD/.dsh-target`（沙箱拒绝仓库外 target）；fi 全套同。
-- 基准复测：orchestrator 用 `docker/bench`（重建 musl 二进制 → `docker compose up` → `driver/bench.py`）
-  与 `docker/bench-etcd` 复核 T1–T4；不做代码的批次结论以 §2 回归门为准。
+- 基准复测：orchestrator 用 `docker/bench`（重建 musl 二进制 → `docker compose up`
+  → `driver/bench.py`）与 `docker/bench-etcd` 复核 T1–T4；不做代码的批次结论以 §2
+  回归门为准。
+- 基准门禁（防回归复测面）：`scripts/check-perf-baseline.sh`（重建 musl 二进制 →
+  起 3 节点集群 → 等待 readyz → `docker compose run --rm driver --json` → 解析 JSON
+  阈值表 T1–T4 + B3 基线；`--fast` 只跑关键项（put 单连 + 线性读单连）控制时长、
+  `--etcd` 附 etcd v3.5.21 对照；跑毕自动 `down -v`、清节点镜像，driver 镜像作为
+  缓存依赖保留，细节见 `docker/bench/README`）。

@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use crate::storage::format::{encode_record, DecodeError, RecordType};
 #[cfg(test)]
 use crate::storage::format::decode_record;
+
+/// Linux-only WAL segment extent pre-allocation (B4 / U2-bis).
+use crate::storage::prealloc::preallocate;
 use crate::storage::sync::sync_durable;
 
 /// The default maximum size of a single segment file before rollover.
@@ -128,20 +131,15 @@ impl Segment {
     ///
     /// The file is opened in read-write + append mode. If the file does not
     /// exist, it is created.
+    ///
+    /// On Linux the segment extent is pre-allocated up front via
+    /// [`prealloc::preallocate`] (`fallocate(2)` with `FALLOC_FL_KEEP_SIZE`).
+    /// This reserves the full `max_bytes` extents for appends without growing
+    /// `i_size`, so recovery, tear detection, and rollover (all `i_size`-
+    /// driven) are byte-identical to the non-preallocated case. A failed
+    /// pre-allocation is skipped, not fatal (see `storage::prealloc`).
     pub fn open(data_dir: &Path, first_index: u64) -> Result<Self, SegmentError> {
-        let path = segment_path(data_dir, first_index);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(SegmentError::Io)?;
-        Ok(Self {
-            path,
-            file,
-            max_bytes: DEFAULT_SEGMENT_BYTES,
-        })
+        Self::open_with_max_bytes(data_dir, first_index, DEFAULT_SEGMENT_BYTES)
     }
 
     /// Open a segment with a custom maximum size (useful for tests).
@@ -151,6 +149,9 @@ impl Segment {
     }
 
     /// Open a segment with a custom maximum rollover size.
+    ///
+    /// On Linux, after opening the file, the extent is pre-allocated (see
+    /// [`Segment::open`]).
     pub fn open_with_max_bytes(data_dir: &Path, first_index: u64, max_bytes: u64) -> Result<Self, SegmentError> {
         let path = segment_path(data_dir, first_index);
         let file = OpenOptions::new()
@@ -160,6 +161,9 @@ impl Segment {
             .append(true)
             .open(&path)
             .map_err(SegmentError::Io)?;
+        // Reserve the full segment extent up front (no-op off Linux / on
+        // fallocate failure; see `storage::prealloc`). Never fatal.
+        let _ = preallocate(&file, max_bytes);
         Ok(Self {
             path,
             file,
@@ -348,6 +352,88 @@ mod tests {
     #[test]
     fn default_rollover_is_128mib() {
         assert_eq!(DEFAULT_SEGMENT_BYTES, 128 * 1024 * 1024);
+    }
+
+    // ---- Rollover uses the *logical* size even on a preallocated segment ----
+
+    // KEEP_SIZE reserves extents but never moves `i_size`, so `size()` stays
+    // the real (logical) byte count and `should_rollover` is driven by it. If
+    // pre-allocation had inflated the logical size to the reserved extent (as a
+    // naive `set_len(max_bytes)` would), `should_rollover` would fire immediately.
+    #[test]
+    fn should_rollover_uses_logical_size_when_preallocated() {
+        let dir = temp_dir();
+        let mut seg = Segment::open_with_max(&dir, 1, 80).unwrap();
+        // Fresh segment: logical size 0, not full — even though the 80-byte
+        // extent is (Linux) reserved at open.
+        assert_eq!(seg.size().unwrap(), 0, "pre-allocated extent must not change size");
+        assert!(!seg.should_rollover().unwrap(), "fresh segment must not roll over");
+
+        // A small record stays below the logical threshold.
+        let small = vec![0u8; 10];
+        seg.append_record(RecordType::Entry, &small).unwrap();
+        // framed size = 8 (header) + 1 (type) + payload = 9 + payload.len()
+        assert_eq!(
+            seg.size().unwrap(),
+            (9 + small.len()) as u64,
+            "size is the logical byte count"
+        );
+        assert!(!seg.should_rollover().unwrap(), "19 < 80, still below threshold");
+
+        // A record that crosses the threshold flips rollover.
+        let big = vec![0u8; 200];
+        seg.append_record(RecordType::Entry, &big).unwrap();
+        assert!(seg.size().unwrap() >= 80);
+        assert!(seg.should_rollover().unwrap(), ">= 80 must roll over");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Pre-allocation + downward truncation + further append must coexist:
+    // the reserved extent survives truncation (extents are discarded), and appends
+    // after truncation land in the real logical tail. Reopen and read back the
+    // exact record sequence with no holes.
+    #[test]
+    fn truncate_then_append_roundtrip_on_preallocated_segment() {
+        let dir = temp_dir();
+        let mut seg = Segment::open_with_max(&dir, 1, 80).unwrap();
+
+        // Two complete records A and B.
+        let payload_a = crate::storage::format::encode_entry(1, 1, 0, b"AAA");
+        let payload_b = crate::storage::format::encode_entry(2, 1, 0, b"BBB");
+        let rec_a = crate::storage::format::encode_record(RecordType::Entry, &payload_a);
+        // B is appended too, then cut away below.
+        let rec_b = crate::storage::format::encode_record(RecordType::Entry, &payload_b);
+        seg.append_record(RecordType::Entry, &payload_a).unwrap();
+        seg.append_record(RecordType::Entry, &payload_b).unwrap();
+        assert_eq!(
+            seg.size().unwrap(),
+            rec_a.len() as u64 + rec_b.len() as u64
+        );
+
+        // Truncate to the end of record A: keeps A, drops B.
+        let mid: u64 = rec_a.len() as u64;
+        seg.truncate_at(mid).unwrap();
+        assert_eq!(seg.size().unwrap(), mid, "truncate_at must set the logical length");
+
+        // Append record C into the (pre-allocated) space after the cut.
+        let payload_c = crate::storage::format::encode_entry(3, 1, 0, b"CCC");
+        seg.append_record(RecordType::Entry, &payload_c).unwrap();
+
+        // Reopen and read back: exactly [A, C], B gone, no holes.
+        let reopened = Segment::open_with_max(&dir, 1, 80).unwrap();
+        let records = reopened.read_all_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, RecordType::Entry);
+        assert_eq!(records[1].0, RecordType::Entry);
+        let (ia, _, _, da) = crate::storage::format::decode_entry(&records[0].1).unwrap();
+        let (ic, _, _, dc) = crate::storage::format::decode_entry(&records[1].1).unwrap();
+        assert_eq!(ia, 1);
+        assert_eq!(da, b"AAA".to_vec());
+        assert_eq!(ic, 3);
+        assert_eq!(dc, b"CCC".to_vec());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- Append + read ----

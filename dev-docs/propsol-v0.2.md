@@ -466,6 +466,49 @@ rev U 的 U2/U3 已按 `upgrade-http-wal.md` §4 与 `dev-docs/b3-group-commit-s
 `--features fault-injection` + 四门禁全绿。**后续**：`docker/bench` 复测 T4 写 p99，
 线性读 4 并发观察项（§1.29）复测。
 
+### W. v0.2.20：B4（U2-bis）WAL 段预分配（fallocate + `FALLOC_FL_KEEP_SIZE`）落地（E-rev，实现）
+
+rev U 的 U2 "Linux 段预分配 + 每批 `fdatasync`" 中，**预分配**在 B2 时因 std-only
+`File::set_len` 仅产生**稀疏 holes 而非 reserved extents** 而被"推迟"（详见
+`upgrade-http-wal.md` §4 B2）；B4 用 Linux `fallocate(2)` + `FALLOC_FL_KEEP_SIZE`
+落地，推翻该结论。`KEEP_SIZE` 只 reserve extents、**不增大 `i_size`**，故读 `i_size`
+的五个子系统（`recover_wal` / tear 检测 / `truncate_log_to` / `size`·`should_rollover` /
+`log_bytes`）字节不变 —— 不重写恢复、tear 检测、rollover 均不受影响，"rollover 恒触发"
+结论不再成立。核心四事：
+
+1. **新增 `storage/prealloc.rs`**：`pub(crate) fn preallocate(file, len) -> bool`；
+   `#[cfg(target_os = "linux")]` 调 `libc::fallocate(fd, FALLOC_FL_KEEP_SIZE=0x01, 0,
+   len as i64)`（libc 0.2 原始返回 `c_int`，`ret>=0` 成功；失败 `EOPNOTSUPP/ENOSYS/
+   EINVAL/ENOSPC/…` 消费 errno 后非致命 `false`，**不** fail-open 也**不** fail-close ——
+   早期 ENOSPC 会改既有失败路径）。`libc` 0.2 仅 Linux-gated，已随 tokio 在依赖树
+   （`cargo tree` 零树增长）。非 Linux 为编译期 `false`（不触 counter）。
+2. **`Segment::open_with_max_bytes` 接线**：打开后 `let _ = preallocate(&file, max_bytes)`；
+   `Segment::open` 委托之（`max_bytes = DEFAULT_SEGMENT_BYTES`）。`sync.rs` 注释改写
+   指向本模块。
+3. **`StorageStats` 增 `segment_prealloc_skips: u64`**：`stats()` 读
+   `prealloc::skips()`（`AtomicU64` Relaxed，**仅**在 Linux fallocate 失败时递增；
+   非 Linux 恒 0）。
+4. **零回归证明（TDD）**：新增三个回归测试钉住"KEEP_SIZE 不动 `i_size`"不变式：
+   - `should_rollover_uses_logical_size_when_preallocated`（rollover 看逻辑 len，非 `blocks()`）
+   - `truncate_then_append_roundtrip_on_preallocated_segment`（向下截断后续写可读回、无洞）
+   - `recovery_on_preallocated_segment_is_unchanged`（末段结构性撕裂 auto-truncate 语义
+     不变、commit 存活）
+   Linux-only 两测（`fallocate_reserves_blocks_without_changing_len`、
+   `preallocate_unsupported_len_degrades_without_error`）由 CI 覆盖。
+
+**红线保持**：不动 seam 类型、不动 `FsyncPolicy` 变体/默认、不动 HardState 批处理
+（I1）、不动既有持久性测试语义（INV2/ledger/faulty_storage/恢复全绿）。只改
+`arachne/src/storage/`（`prealloc.rs`/`mod.rs`/`segment.rs`/`wal.rs`/`sync.rs` 注释）
++ `arachne/Cargo.toml`（Linux-gated `libc`）；**不**碰 `arachne-node/` /
+`arachne-transport-tonic/` / `arachne-seam/` / 基准 harness；不 git commit。
+
+**验证**：`cargo test -p arachne`（含 5 个新测）+ `--features fault-injection` +
+`cargo test --workspace` + `check-deps.sh` / `check-entropy.sh` 全绿；`cargo tree -p
+arachne --no-default-features | grep libc` ≥1（零树增长，libc 已在树）；
+Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
+**后续**：`docker/bench` 复测写 p99（Linux 上预期更平/更快 —— append 不再触发延迟
+分配 + extent-journal，每段一次 `fdatasync` 即 data-only 屏障，见 etcd `fileutil.Preallocate`）。
+
 ## 1. 目标与非目标
 
 **目标**

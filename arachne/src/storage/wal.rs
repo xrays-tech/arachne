@@ -193,6 +193,10 @@ pub struct StorageStats {
     /// it is counted here rather than in `entry_fsyncs`/`hard_state_fsyncs`
     /// (which count the synchronous barriers).
     pub offloaded_fsyncs: u64,
+    /// Number of WAL segment opens whose Linux extent pre-allocation
+    /// (`fallocate(2)` + `FALLOC_FL_KEEP_SIZE`) had to be skipped because the
+    /// call failed (EOPNOTSUPP/ENOSYS/EINVAL/ENOSPC/…). Off-Linux this stays 0.
+    pub segment_prealloc_skips: u64,
 }
 
 /// The outcome of a [`WalStorage::force_recovery`] rewrite (propsol §6.1).
@@ -549,6 +553,9 @@ impl WalStorage {
                         .load(std::sync::atomic::Ordering::Relaxed),
                 );
         }
+        // Linux segment pre-allocation skips (fallocate failures). Off-Linux this
+        // is always 0 (the counter is only ever incremented by the Linux arm).
+        s.segment_prealloc_skips = crate::storage::prealloc::skips();
         s
     }
 
@@ -4137,6 +4144,82 @@ mod tests {
             store.stats().offloaded_fsyncs, 1,
             "failed batch still counts as 1 fsync attempt"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- Recovery on a preallocated segment is byte-ident ----
+    //
+    // `FALLOC_FL_KEEP_SIZE` reserves extents without touching `i_size`, so
+    // startup recovery — `recover_wal`'s `fs::read` up to `i_size`, tear
+    // detection via `record_end > file_len` — and automatic tail truncation are
+    // all byte-identical to the non-preallocated path. On Linux the segment
+    // is preallocated at `WalStorage::open`; this end-to-end pin-down verifies
+    // that recovery (write entries + HardState, structural tear beyond
+    // commit+1, reopen) still recovers the same state and auto-truncates the
+    // torn tail.
+    #[test]
+    fn recovery_on_preallocated_segment_is_unchanged() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut storage = WalStorage::open(&dir, opts.clone()).expect("open");
+            storage
+                .append(&[
+                    make_entry(1, 1, b"committed"),
+                    make_entry(2, 1, b"uncommitted"),
+                    make_entry(3, 1, b"also-uncommitted"),
+                ])
+                .expect("append");
+            storage.sync_entries().expect("sync_entries");
+            storage
+                .set_hard_state(&HardState {
+                    term: 1,
+                    vote: Some(1),
+                    commit: 1,
+                })
+                .expect("set_hard_state");
+            // One more entry *after* the HardState, so the tail tear lands on an
+            // Entry record, leaving the commit record fully intact on disk.
+            storage.append(&[make_entry(4, 1, b"tail")]).expect("append");
+            storage.sync_entries().expect("sync_entries");
+        }
+
+        // Structural tear beyond commit+1=2: chop the tail mid-record (the
+        // trailing Entry 4), so recovery must auto-truncate it and keep the
+        // commit record (commit=1).
+        let seg_path = dir.join(segment_name(1));
+        let mut buf = fs::read(&seg_path).expect("read");
+        // Cut off the last 3 bytes so the final (entry) record is mid-body.
+        buf.truncate(buf.len() - 3);
+        fs::write(&seg_path, &buf).expect("write tear");
+
+        // Reopen: same state; torn tail auto-truncated, exactly as on a
+        // non-preallocated segment.
+        let storage = WalStorage::open(&dir, opts).expect("reopen");
+        assert_eq!(storage.first_index().unwrap(), 1);
+        assert_eq!(storage.last_index().unwrap(), 3);
+        assert_eq!(
+            storage.stats().wal_truncated_records,
+            1,
+            "torn tail must be auto-truncated (1 record dropped)"
+        );
+        assert_eq!(
+            storage.initial_state().unwrap().hard_state.commit,
+            1,
+            "hard_state.commit must survive recovery"
+        );
+        // All intact entries before the tear are retained; entry 4 (torn) is
+        // dropped. The WAL keeps them regardless of commit — commit only gates
+        // the fail-safe (which is not tripped here).
+        let entries = storage.entries(1, 4, None).expect("entries");
+        assert_eq!(entries.len(), 3, "intact entries 1..=3 retained, 4 torn");
+        assert_eq!(entries[0].index, 1);
+        assert_eq!(entries[0].data, b"committed");
+        assert_eq!(entries[1].index, 2);
+        assert_eq!(entries[1].data, b"uncommitted");
+        assert_eq!(entries[2].index, 3);
+        assert_eq!(entries[2].data, b"also-uncommitted");
 
         let _ = fs::remove_dir_all(&dir);
     }

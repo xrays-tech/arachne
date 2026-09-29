@@ -28,6 +28,7 @@ mod membership;
 mod meta;
 mod segment;
 pub mod snapshot;
+mod prealloc;
 mod sync;
 mod wal;
 

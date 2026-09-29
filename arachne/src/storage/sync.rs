@@ -16,15 +16,19 @@
 //!
 //! # Pre-allocation
 //!
-//! Segment pre-allocation (pinning a segment to `segment_bytes` so an append
-//! never changes `i_size`) was investigated and **deferred**: std-only
-//! `File::set_len` is `ftruncate(2)`, which creates a sparse file (holes) rather
-//! than reserved extents, so the first write into a hole still triggers the
-//! filesystem's delayed-allocation/extent-journal work and `fdatasync` does not
-//! become the cheap data-only barrier that `fallocate` would give. It was
-//! therefore dropped rather than adding a crate dependency or rewriting WAL
-//! recovery. `sync_durable` needs no pre-allocation flag: `fdatasync` is
-//! correct with or without one.
+//! Segment pre-allocation is implemented (B4 / U2-bis) via Linux `fallocate(2)`
+//! with the **`FALLOC_FL_KEEP_SIZE`** flag, driven by [`storage::prealloc::preallocate`]
+//! in `Segment::open_with_max_bytes` (see that module for the five `i_size`-
+//! based subsystems — recovery, tear detection, truncation, rollover, `log_bytes`
+//! — that stay byte-identical). Unlike a std-only `set_len` (which creates
+//! sparse holes), `FALLOC_FL_KEEP_SIZE` reserves real extents **without growing
+//! `i_size`**, so the first append writes into already-allocated space and the
+//! per-segment `fdatasync(2)` barrier degrades from "data + allocation +
+//! journal" to "data + inode". A failed `fallocate` is skipped (never fatal);
+//! `StorageStats::segment_prealloc_skips` counts those skips.
+//!
+//! `sync_durable` needs no pre-allocation flag: `fdatasync` is correct with or
+//! without one.
 //!
 //! # Metadata durability
 //!
