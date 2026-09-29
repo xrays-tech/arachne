@@ -11,13 +11,17 @@ Usage:
   python3 driver/bench.py --ports 8001,8002,8003            # from the host
   python3 bench.py --hosts node1,node2,node3 --ports 8001,8002,8003  # in-cluster
 
-Note: the M1 HTTP surface takes the value verbatim from the URL path (no body
-parsing yet), so the benchmark uses a tiny value ("v") — the durable cost is
-the fsync, not the payload.
+--json: emit a structured JSON report to stdout for stable parsing (the
+regression-gate script `scripts/check-perf-baseline.sh` consumes this). Human
+text lines are re-routed to stderr so stdout carries *only* the JSON object.
+Default (no --json) behaviour is unchanged: all output is the familiar text
+report on stdout.
 """
 
 import argparse
 import concurrent.futures as futures
+import http.client
+import json
 import statistics
 import sys
 import time
@@ -26,10 +30,40 @@ VALUE = "v"
 HOST = "127.0.0.1"
 HOSTS_BY_PORT = {}
 
+# --json mode: stdout holds the JSON report only; human text goes to stderr.
+_JSON_MODE = False
+RESULTS = []
+
+
+def log(msg):
+    """Human-facing line. stdout when text mode, stderr in --json mode."""
+    if _JSON_MODE:
+        print(msg, file=sys.stderr, flush=True)
+    else:
+        print(msg, flush=True)
+
+
+def record(name, tag, ops, workers, samples, n):
+    """Accumulate one benchmark's metrics for the JSON report."""
+    if not _JSON_MODE:
+        return
+    rps = len(samples) / (sum(samples) / 1e9) if samples else 0.0
+    RESULTS.append({
+        "name": name,
+        "tag": tag,
+        "ops": ops,
+        "workers": workers,
+        "rps": round(float(rps), 1),
+        "p50_ms": round(float(pct(samples, 0.5)), 3),
+        "p99_ms": round(float(pct(samples, 0.99)), 3),
+        "ok": len(samples),
+        "attempted": n,
+    })
+
 
 def req(method, port, path, timeout=15.0):
-    import http.client
-    conn = http.client.HTTPConnection(HOSTS_BY_PORT.get(port, HOST), port, timeout=timeout)
+    conn = http.client.HTTPConnection(
+        HOSTS_BY_PORT.get(port, HOST), port, timeout=timeout)
     t0 = time.perf_counter_ns()
     try:
         conn.request(method, path)
@@ -68,10 +102,14 @@ def report(tag, samples, n):
         rps = ops / (sum(samples) / 1e9)
     else:
         rps = 0.0
-    print(
+    # Preserve the existing human line verbatim (stdout by default).
+    line = (
         f"[bench] {tag}: {rps:.0f} ops/s  p50 {pct(samples, .5):.2f}ms "
         f"p99 {pct(samples, .99):.2f}ms  ({ops} ok / {n} attempted)"
     )
+    log(line)
+    if _JSON_MODE:
+        pass  # name/workers/ops are recorded by the callers for fidelity
     return rps
 
 
@@ -99,6 +137,9 @@ def run_put_benchmark(leader, workers, per_worker, tag):
         results = list(ex.map(job, range(workers)))
     samples = [d for r in results for d in r]
     report(f"put ({tag}, {workers}w)", samples, workers * per_worker)
+    if _JSON_MODE:
+        record(f"put-{tag}-{workers}w", f"put ({tag}, {workers}w)",
+               "put", workers, samples, workers * per_worker)
     return samples
 
 
@@ -118,6 +159,9 @@ def run_get_benchmark(port, key, stale, tag, n, workers=1):
             results = list(ex.map(job, range(workers)))
         samples = [d for r in results for d in r]
     report(f"get ({tag})", samples, n)
+    if _JSON_MODE:
+        mode = "stale" if stale else "linear"
+        record(f"get-{mode}-{workers}w", f"get ({tag})", "get", workers, samples, n)
     return samples
 
 
@@ -127,56 +171,90 @@ def main():
                     help="comma-separated HTTP ports")
     ap.add_argument("--hosts", default="127.0.0.1",
                     help="comma-separated node hosts (in-cluster: node1,node2,node3)")
+    ap.add_argument("--json", action="store_true",
+                    help="emit a structured JSON report to stdout (human text to stderr)")
+    ap.add_argument("--fast", action="store_true",
+                    help="run only the critical items (put 1-way + linear read 1-way)")
+    ap.add_argument("--n", type=int, default=100,
+                    help="op count for each critical benchmark (default 100 puts / 100 reads; "
+                         "used only when --fast)")
     args = ap.parse_args()
-    global HOST, HOSTS_BY_PORT
+    global HOST, HOSTS_BY_PORT, _JSON_MODE
+    _JSON_MODE = args.json
+    fast = args.fast
+    n = args.n
     host_list = [h for h in args.hosts.split(",") if h]
     ports = [int(x) for x in args.ports.split(",")]
     if len(host_list) == len(ports):
         HOSTS_BY_PORT = dict(zip(ports, host_list))
-        print(f"[bench] === arachne 3-node docker benchmark ===")
-        print(f"[bench] per-port hosts {HOSTS_BY_PORT}; value={VALUE!r} (path-encoded)")
+        log(f"=== arachne 3-node docker benchmark ===")
+        log(f"per-port hosts {HOSTS_BY_PORT}; value={VALUE!r} (path-encoded)")
     else:
         HOST = host_list[0]
-        print(f"[bench] === arachne 3-node docker benchmark ===")
-        print(f"[bench] host {HOST}; ports {ports}; value={VALUE!r} (path-encoded)")
+        log(f"=== arachne 3-node docker benchmark ===")
+        log(f"host {HOST}; ports {ports}; value={VALUE!r} (path-encoded)")
 
     leader, wait = discover_leader(ports)
-    print(f"[bench] leader found on port {leader} after {wait:.2f}s of polling")
+    log(f"leader found on port {leader} after {wait:.2f}s of polling")
 
     # Replication sanity: write one key, stale-read it on every node.
     seed = "seed"
     ok, st, body, _ = put(leader, seed)
     if not ok:
-        raise SystemExit(f"seed write failed: status {st} {body}")
+        log(f"seed write failed: status {st} {body}")
+        sys.exit(1)
     for p in ports:
         for _ in range(100):
             o2, _, b2, _ = get(p, seed, stale=True)
             if o2 and b2.strip().startswith(VALUE):
-                print(f"[bench] replication check: {seed!r} visible on port {p}")
+                log(f"replication check: {seed!r} visible on port {p}")
                 break
             time.sleep(0.2)
         else:
-            print(f"[bench] replication check FAILED: {seed!r} not visible on port {p}")
+            log(f"replication check FAILED: {seed!r} not visible on port {p}")
 
-    # Writes. Sequential first (the honest single-client ceiling), then a
-    # concurrent burst (does not beat the actor's serialized durability).
-    run_put_benchmark(leader, 1, 100, "seq")
-    run_put_benchmark(leader, 4, 30, "con4")
+    if fast:
+        # --fast: critical items only, controlled duration (put 1-way + linear
+        # read 1-way). Keeps the same single-client methodology as the full run.
+        run_put_benchmark(leader, 1, n, "seq")
+        for _ in range(400):
+            o, _, _, _ = get(leader, seed)
+            if o:
+                break
+            time.sleep(0.05)
+        run_get_benchmark(leader, seed, stale=False, tag="linear", n=n)
+    else:
+        # Writes. Sequential first (the honest single-client ceiling), then a
+        # concurrent burst (does not beat the actor's serialized durability).
+        run_put_benchmark(leader, 1, 100, "seq")
+        run_put_benchmark(leader, 4, 30, "con4")
 
-    # Reads on the leader: linearizable, then stale — single client and a
-    # 4-way burst (the single-client numbers include the HTTP server's ~20 ms
-    # idle-accept poll, so the burst shows the aggregate ceiling).
-    for _ in range(1200):
-        o, _, _, _ = get(leader, seed)
-        if o:
-            break
-        time.sleep(0.05)
-    run_get_benchmark(leader, seed, stale=False, tag="linear", n=400)
-    run_get_benchmark(leader, seed, stale=False, tag="linear-con4", n=400, workers=4)
-    run_get_benchmark(leader, seed, stale=True, tag="stale", n=400)
-    run_get_benchmark(leader, seed, stale=True, tag="stale-con4", n=400, workers=4)
+        # Reads on the leader: linearizable, then stale — single client and a
+        # 4-way burst (the single-client numbers include the HTTP server's ~20 ms
+        # idle-accept poll, so the burst shows the aggregate ceiling).
+        for _ in range(1200):
+            o, _, _, _ = get(leader, seed)
+            if o:
+                break
+            time.sleep(0.05)
+        run_get_benchmark(leader, seed, stale=False, tag="linear", n=400)
+        run_get_benchmark(leader, seed, stale=False, tag="linear-con4", n=400, workers=4)
+        run_get_benchmark(leader, seed, stale=True, tag="stale", n=400)
+        run_get_benchmark(leader, seed, stale=True, tag="stale-con4", n=400, workers=4)
 
-    print("[bench] === done ===")
+    log("=== done ===")
+
+    if _JSON_MODE:
+        payload = {
+            "cluster": "arachne",
+            "schema": 1,
+            "leader_port": leader,
+            "value": VALUE,
+            "results": RESULTS,
+        }
+        # stdout carries *only* the JSON object in --json mode.
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
