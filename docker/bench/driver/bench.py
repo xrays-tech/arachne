@@ -29,6 +29,17 @@ request behaviour so the gate and prior baselines are byte-identical.
 concurrency gradient (e.g. 1,2,4,8). Without the flag the historical
 layout is preserved (linear 1w/4w, stale 1w/4w); the puts are unchanged either
 way.
+
+--process: run the *read* workers as separate Python processes (via
+concurrent.futures.ProcessPoolExecutor, one process per worker) instead of
+threads. This fully isolates the GIL so the workers do not serialize on the
+single interpreter lock -- the way to tell whether the linear-read collapse at
+higher concurrency is driven by client-side GIL cost (A) or server-side
+serialization (B). Orthogonal to --keep-alive and --read-workers; keep-alive
+semantics are preserved (each worker process builds and reuses its own
+HTTPConnection). The job is a module-level, pickle-safe function that owns its
+connection(s), so no in-memory state needs to cross process boundaries.
+Default (no --process) keeps the existing thread behaviour byte-identical.
 """
 
 import argparse
@@ -121,6 +132,91 @@ def req_reuse(conn, method, path, timeout=15.0):
     return ok, status, body.decode("utf-8", "replace"), dt
 
 
+def _get_once(host, port, path, timeout=15.0):
+    """One fresh-connection GET on (host, port). Returns (ok, status, body, dt_ns).
+
+    Module-level and pickle-safe: used by the process-pool job so each worker
+    process can resolve its own host without relying on the inherited
+    ``HOSTS_BY_PORT`` mapping.
+    """
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    t0 = time.perf_counter_ns()
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        ok = resp.status == 200
+        status = resp.status
+    except Exception as e:  # reset / timeout
+        ok, status, body = False, 0, str(e).encode()
+    finally:
+        conn.close()
+    dt = time.perf_counter_ns() - t0
+    return ok, status, body, dt
+
+
+def _get_reuse(conn, path):
+    """GET on an ALREADY-OPEN connection, leaving it open. Returns
+    (ok, status, body, dt_ns). The caller owns the connection lifecycle."""
+    t0 = time.perf_counter_ns()
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        ok = resp.status == 200
+        status = resp.status
+    except Exception as e:  # reset / timeout / close-mid-request
+        ok, status, body = False, 0, str(e).encode()
+    dt = time.perf_counter_ns() - t0
+    return ok, status, body, dt
+
+
+def _proc_read_job(args):
+    """Module-level, pickle-safe job for ``futures.ProcessPoolExecutor``.
+
+    Each call runs in its OWN Python process (spawn on macOS, fork elsewhere),
+    which fully isolates the GIL so the workers do not serialize on the single
+    interpreter lock. The job builds and closes its own connection(s), so no
+    in-memory state from the parent is needed.
+
+    ``args`` = (host, port, key, stale, seed, n, workers, keep_alive):
+      - host: resolved node host for ``port`` (explicit, because the child
+        process re-imports the module and resets the global ``HOSTS_BY_PORT``)
+      - seed: this worker's starting index (0..workers)
+      - n, workers: total ops and count, giving the slice ``range(seed, n, workers)``
+      - keep_alive: one persistent conn per worker (reopened on a dead wire)
+      - stale: append ``?stale=1`` to the path
+    Returns the list of latency samples (ns) for this worker.
+    """
+    host, port, key, stale, seed, n, workers, keep_alive = args
+    path = f"/kv/{key}" + ("?stale=1" if stale else "")
+    out = []
+    if keep_alive:
+        conn = http.client.HTTPConnection(host, port, timeout=15.0)
+        try:
+            for i in range(seed, n, workers):
+                ok, status, _, dt = _get_reuse(conn, path)
+                if ok:
+                    out.append(dt)
+                if status == 0:  # wire connection died; reopen for the rest
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = http.client.HTTPConnection(host, port, timeout=15.0)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        for i in range(seed, n, workers):
+            ok, status, _, dt = _get_once(host, port, path)
+            if ok:
+                out.append(dt)
+    return out
+
+
 def put(port, key, value=VALUE, timeout=15.0):
     return req("PUT", port, f"/kv/{key}/{value}", timeout)
 
@@ -185,7 +281,8 @@ def run_put_benchmark(leader, workers, per_worker, tag):
     return samples
 
 
-def run_get_benchmark(port, key, stale, tag, n, workers=1, keep_alive=False):
+def run_get_benchmark(port, key, stale, tag, n, workers=1, keep_alive=False,
+                      use_process=False):
     """Run a read benchmark on ``port``.
 
     keep_alive=False (default): one *fresh* HTTP connection per request — the
@@ -194,6 +291,11 @@ def run_get_benchmark(port, key, stale, tag, n, workers=1, keep_alive=False):
     of that worker's requests (matches etcd's keep-alive client model: one
     ``HTTPConnection`` per worker, `request()`/`getresponse()` reused, re-opened
     on a broken conn).
+    use_process: when True and workers>1, run the read workers in separate
+    Python processes via ``futures.ProcessPoolExecutor`` (one process per
+    worker, fully GIL-isolated) instead of threads, so client-side GIL cost
+    can be separated from server-side cost. ``workers==1`` always runs
+    in-process (a single process is equivalent to a single thread).
     """
     path = f"/kv/{key}" + ("?stale=1" if stale else "")
 
@@ -228,10 +330,25 @@ def run_get_benchmark(port, key, stale, tag, n, workers=1, keep_alive=False):
             return out
 
     if workers == 1:
+        # single worker: run inline, exactly as before (a single process is
+        # equivalent to a single thread, so no pool needed).
         samples = job(0)
     else:
-        with futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            results = list(ex.map(job, range(workers)))
+        if use_process:
+            # Process-level workers: each is a fresh Python process (spawn on
+            # macOS, fork elsewhere), fully GIL-isolated. The job is a module-
+            # level pickle-safe function that owns its connection(s) and takes
+            # the resolved host explicitly (the child re-imports the module and
+            # resets globals, so the inherited HOSTS_BY_PORT mapping is not
+            # usable in the child).
+            host = HOSTS_BY_PORT.get(port, HOST)
+            args = [(host, port, key, stale, seed, n, workers, keep_alive)
+                    for seed in range(workers)]
+            with futures.ProcessPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(_proc_read_job, args))
+        else:
+            with futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(job, range(workers)))
         samples = [d for r in results for d in r]
 
     report(f"get ({tag})", samples, n)
@@ -264,12 +381,19 @@ def main():
                     help="comma-separated concurrency gradient for the reads, e.g. "
                          "'1,2,4,8'. Without it the historical read layout is kept "
                          "(linear 1w/4w, stale 1w/4w). Puts are unaffected.")
+    ap.add_argument("--process", action="store_true",
+                    help="run the read workers as separate Python processes via "
+                         "ProcessPoolExecutor (one process per worker, fully "
+                         "GIL-isolated) instead of threads. Orthogonal to "
+                         "--keep-alive and --read-workers. Use it to separate "
+                         "client-side GIL cost from server-side cost.")
     args = ap.parse_args()
     global HOST, HOSTS_BY_PORT, _JSON_MODE
     _JSON_MODE = args.json
     fast = args.fast
     n = args.n
     keep_alive = args.keep_alive
+    use_process = args.process
     raw_rw = args.read_workers
     if raw_rw:
         read_workers = [int(x) for x in raw_rw.split(",") if x.strip()]
@@ -314,7 +438,8 @@ def main():
             if o:
                 break
             time.sleep(0.05)
-        run_get_benchmark(leader, seed, stale=False, tag="linear", n=n)
+        run_get_benchmark(leader, seed, stale=False, tag="linear", n=n,
+                         use_process=use_process)
     else:
         # Writes. Sequential first (the honest single-client ceiling), then a
         # concurrent burst (does not beat the actor's serialized durability).
@@ -331,23 +456,29 @@ def main():
             time.sleep(0.05)
         if read_workers:
             # Concurrency gradient: linear read at each worker count, plus the
-            # historical stale 4-way shape (T3). Per-op scale is --n.
+            # historical stale 4-way shape (T3). Per-op scale is --n. --process
+            # (when set) runs each gradient worker as a separate process.
             for w in read_workers:
                 run_get_benchmark(leader, seed, stale=False, tag=f"linear {w}w",
-                                 n=n, workers=w, keep_alive=keep_alive)
+                                 n=n, workers=w, keep_alive=keep_alive,
+                                 use_process=use_process)
             run_get_benchmark(leader, seed, stale=True, tag="stale 4w", n=n,
-                             workers=4, keep_alive=keep_alive)
+                             workers=4, keep_alive=keep_alive,
+                             use_process=use_process)
         else:
-            # Historical read layout (backward-compatible default). keep_alive is
-            # False by default, so this is byte-identical to the prior driver.
+            # Historical read layout (backward-compatible default). keep_alive and
+            # use_process are False by default, so this is byte-identical to the
+            # prior driver.
             run_get_benchmark(leader, seed, stale=False, tag="linear", n=400,
-                             keep_alive=keep_alive)
-            run_get_benchmark(leader, seed, stale=False, tag="linear-con4", n=400,
-                             workers=4, keep_alive=keep_alive)
+                             keep_alive=keep_alive, use_process=use_process)
+            run_get_benchmark(leader, seed, stale=False, tag="linear-con4",
+                             n=400, workers=4, keep_alive=keep_alive,
+                             use_process=use_process)
             run_get_benchmark(leader, seed, stale=True, tag="stale", n=400,
-                             keep_alive=keep_alive)
+                             keep_alive=keep_alive, use_process=use_process)
             run_get_benchmark(leader, seed, stale=True, tag="stale-con4", n=400,
-                             workers=4, keep_alive=keep_alive)
+                             workers=4, keep_alive=keep_alive,
+                             use_process=use_process)
 
     log("=== done ===")
 
@@ -359,6 +490,7 @@ def main():
             "value": VALUE,
             "keep_alive": bool(keep_alive),
             "read_workers": read_workers,
+            "use_process": bool(use_process),
             "results": RESULTS,
         }
         # stdout carries *only* the JSON object in --json mode.

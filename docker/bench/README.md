@@ -107,8 +107,8 @@ a reduced op count.
 
 ## Concurrent read caliber (并发读口径)
 
-Two opt-in flags were added to `driver/bench.py` (both default OFF, so the gate's
-default path and all prior baselines are byte-identical):
+Three opt-in flags were added to `driver/bench.py` (all default OFF, so the
+gate's default path and all prior baselines are byte-identical):
 
 - **`--keep-alive`** — the read benchmarks reuse one persistent HTTP/1.1
   connection per worker (one `HTTPConnection` built outside the request loop,
@@ -121,11 +121,24 @@ default path and all prior baselines are byte-identical):
   gradient (plus the historical stale 4-way shape). `--n` sets the per-benchmark
   op count. Without the flag the historical read layout is kept; puts are
   unaffected either way.
+- **`--process`** — run the read workers as separate Python processes (via
+  `concurrent.futures.ProcessPoolExecutor`, one process per worker) instead of
+  threads. This fully isolates the GIL so the workers do not serialize on the
+  single interpreter lock; it is the way to tell whether the linear-read collapse
+  at higher concurrency is driven by client-side GIL cost (A) or server-side
+  serialization (B). Orthogonal to `--keep-alive` and `--read-workers`; keep-alive
+  semantics are preserved (each worker process builds and reuses its own
+  `HTTPConnection`). The job is a module-level, pickle-safe function that owns its
+  connection(s), so no in-memory state crosses process boundaries.
 
 ```bash
-# keep-alive, linear gradient + stale 4-way, 100 ops each
+# keep-alive, linear gradient + stale 4-way, 100 ops each (threads)
 docker compose run --rm driver --read-workers 1,2,4,8 --n 100 --keep-alive \
     --json --hosts node1,node2,node3
+
+# same gradient, but workers are separate GIL-isolated Python processes
+docker compose run --rm driver --read-workers 1,2,4,8 --n 100 --keep-alive \
+    --process --json --hosts node1,node2,node3
 ```
 
 ### A/B evidence (fresh 3-node cluster, n=100, linearizable reads on the leader)
