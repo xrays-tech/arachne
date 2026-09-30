@@ -560,7 +560,7 @@ where
 
         // Everything raft hands over in `advance` has to be read first: the
         // call moves the data into raft's own state.
-        let immediate: Vec<Message> = ready.messages().to_vec();
+        let mut immediate: Vec<Message> = ready.messages().to_vec();
         let persisted: Vec<Message> = ready.persisted_messages().to_vec();
         let committed: Vec<CommittedEntry> = ready
             .committed_entries()
@@ -626,9 +626,10 @@ where
         // ReadIndex round from queueing behind the device. A follower's
         // messages are all "persisted messages" and wait below.
         if offloaded {
-            for msg in &immediate {
-                self.deliver(msg).await;
-            }
+            // C1: deliver the fast-path immediate batch grouped by peer — in
+            // order within each peer, concurrently across peers. The batch is
+            // taken so the queued cycle below carries an empty `immediate`.
+            self.deliver_grouped(std::mem::take(&mut immediate)).await;
         }
         self.pending.push_back(PendingPersist {
             number,
@@ -636,7 +637,7 @@ where
                 PersistSubmit::Durable => None,
                 PersistSubmit::Offloaded(token) => Some(token),
             },
-            immediate: if offloaded { Vec::new() } else { immediate },
+            immediate,
             persisted,
             committed,
             read_states,
@@ -1135,6 +1136,39 @@ where
         }
     }
 
+    /// Deliver an immediate batch grouped by destination peer: **in order within
+    /// each peer** and **concurrently across peers** (C1 fix for the serialized
+    /// fast-path read delivery). Failed sends are added to `dropped_sends` with
+    /// the same semantics as a per-message [`deliver`] call.
+    ///
+    /// Peers are grouped by their `to` field via [`group_by_peer`] (first
+    /// appearance order, original order within a group). Each peer's messages
+    /// are sent sequentially (raft requires per-peer FIFO), while the different
+    /// peers' sends are polled together by [`futures_util::join_all`], so their
+    /// I/O overlaps instead of serializing.
+    async fn deliver_grouped(&mut self, messages: Vec<Message>) {
+        let self_id = self.raw.raft.id;
+        let transport = &self.transport;
+        let peers = &self.peers;
+        let groups = group_by_peer(&messages);
+        let dropped: u64 = futures_util::future::join_all(
+            groups
+                .into_iter()
+                .map(|(_peer, msgs)| async move {
+                    let mut local = 0u64;
+                    for msg in msgs {
+                        if send_one(transport, peers, self_id, &msg).await.is_err() {
+                            local += 1;
+                        }
+                    }
+                    local
+                })
+        )
+        .await
+        .into_iter()
+        .sum();
+        self.dropped_sends += dropped;
+    }
 }
 
 /// Encode and deliver a single raft message to its destination peer.
@@ -1166,6 +1200,31 @@ async fn send_one<T: Transport>(
         .send(node_id, TransportMessage::Raft(bytes))
         .await
         .map_err(NodeError::Transport)
+}
+
+/// Group messages by their destination peer, preserving:
+/// * the **order of first appearance** of each destination in the input (the
+///   order the peers are delivered to), and
+/// * the **original relative order** of messages within each destination's
+///   group.
+///
+/// The key is each message's `to` field — exactly what [`send_one`] routes on.
+/// This ordering is the per-peer FIFO the raft protocol relies on, so it is
+/// invariant to the cross-peer concurrency introduced by the deliver loop.
+fn group_by_peer(messages: &[Message]) -> Vec<(RaftId, Vec<Message>)> {
+    let mut groups: HashMap<RaftId, Vec<Message>> = HashMap::new();
+    let mut order: Vec<RaftId> = Vec::new();
+    for m in messages {
+        let to = m.get_to();
+        if !groups.contains_key(&to) {
+            order.push(to);
+        }
+        groups.entry(to).or_default().push(m.clone());
+    }
+    order
+        .into_iter()
+        .map(|to| (to, groups.remove(&to).unwrap_or_default()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1538,6 +1597,123 @@ mod tests {
             dropped > 0,
             "a failed send to the unknown peer must be counted; got {dropped}"
         );
+    }
+
+    /// Build a test `Message` with an identifying `to` peer and `index`.
+    fn test_msg(to: u64, index: u64) -> Message {
+        let mut m = Message::default();
+        m.set_msg_type(MessageType::MsgAppend);
+        m.set_to(to);
+        m.set_from(1);
+        m.set_term(1);
+        m.set_index(index);
+        m
+    }
+
+    #[test]
+    fn group_by_peer_preserves_order_and_groups() {
+        // Interleaved messages to three peers (2, 3, 4) — grouping and both
+        // ordering properties (first-appearance peer order, original in-group
+        // order) are exercised at once.
+        let msgs = vec![
+            test_msg(2, 1),
+            test_msg(3, 2),
+            test_msg(2, 3),
+            test_msg(4, 4),
+            test_msg(3, 5),
+            test_msg(2, 6),
+        ];
+        let grouped = group_by_peer(&msgs);
+
+        // Peers appear in first-seen order: 2, then 3, then 4.
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(
+            grouped.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        // Within each peer, messages keep their original relative order.
+        assert_eq!(
+            grouped[0].1.iter().map(|m| m.get_index()).collect::<Vec<_>>(),
+            vec![1, 3, 6]
+        );
+        assert_eq!(
+            grouped[1].1.iter().map(|m| m.get_index()).collect::<Vec<_>>(),
+            vec![2, 5]
+        );
+        assert_eq!(grouped[2].1.iter().map(|m| m.get_index()).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(grouped[0].0, 2);
+        assert_eq!(grouped[0].1.len(), 3);
+        assert_eq!(grouped[1].1.len(), 2);
+        assert_eq!(grouped[2].1.len(), 1);
+
+        // Edge cases: empty input, single message, single peer.
+        assert!(group_by_peer(&[]).is_empty());
+        let single = vec![test_msg(7, 1)];
+        let g = group_by_peer(&single);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].0, 7);
+        assert_eq!(g[0].1.len(), 1);
+        let only_one_peer = vec![test_msg(3, 1), test_msg(3, 2)];
+        let g1 = group_by_peer(&only_one_peer);
+        assert_eq!(g1.len(), 1);
+        assert_eq!(g1[0].0, 3);
+        assert_eq!(g1[0].1.iter().map(|m| m.get_index()).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// Pull the next queued message off a peer's rx and report its log index
+    /// (the identifying field stamped into each test message).
+    fn next_index(rx: &mut InMemoryRx) -> u64 {
+        let Some((_sender, TransportMessage::Raft(bytes))) = block_on(rx.recv()) else {
+            panic!("expected a queued message from a peer");
+        };
+        let mut m = Message::default();
+        m.merge_from_bytes(&bytes).expect("peer message must decode");
+        m.get_index()
+    }
+
+    #[test]
+    fn deliver_grouped_preserves_per_peer_order_and_delivers_to_all_peers() {
+        // Three in-memory nodes over a shared switch: 1 (the sender) and its two
+        // peers 2 and 3. Exercises the C1 grouped delivery end-to-end: sends
+        // are polled concurrently across peers, while per-peer FIFO order is
+        // preserved (the invariant a serialized deliver() also upheld).
+        let factory = InMemoryTransportFactory::new();
+        let me = NodeId::from("node-1");
+        let (tx, _rx) = factory.create(me);
+        let peer2 = NodeId::from("node-2");
+        let peer3 = NodeId::from("node-3");
+        // We only need each peer's receiving half; the factory owns the sending
+        // halves in its switch, so the peers' channels stay open while it is.
+        // Clone before moving into `create` so both peers stay usable for the
+        // membership map below.
+        let (_, mut rx2) = factory.create(peer2.clone());
+        let (_, mut rx3) = factory.create(peer3.clone());
+
+        let mut peers = HashMap::new();
+        peers.insert(2u64, peer2);
+        peers.insert(3u64, peer3);
+
+        let mut node = RaftNode::new(1, peers, MemStore::new(), tx, _rx, 0, &logger())
+            .expect("multi-peer node must construct");
+
+        // Four immediate messages, two to each peer, interleaved so that the
+        // grouping (2,3,2,3) and the per-peer ordering (1,3 for peer2; 2,4 for
+        // peer3) are both exercised.
+        let messages = vec![
+            test_msg(2, 1),
+            test_msg(3, 2),
+            test_msg(2, 3),
+            test_msg(3, 4),
+        ];
+
+        // Drive the concurrent grouped delivery (the C1 path).
+        block_on(node.deliver_grouped(messages));
+
+        // Per-peer FIFO: peer 2 got indices 1 then 3; peer 3 got 2 then 4.
+        assert_eq!(next_index(&mut rx2), 1, "peer-2 first message index");
+        assert_eq!(next_index(&mut rx2), 3, "peer-2 second message index");
+        assert_eq!(next_index(&mut rx3), 2, "peer-3 first message index");
+        assert_eq!(next_index(&mut rx3), 4, "peer-3 second message index");
     }
 
     #[test]

@@ -39,6 +39,10 @@ protobuf = "2"
 # `arachne-transport-tonic`/`arachne-node`), so this adds no new external crate.
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+# `join_all` is the cross-peer concurrency primitive for the fast-path deliver
+# loop. `futures-util` is already in the dependency tree (via
+# `tokio-util`/`tonic`), so listing it here adds no new external crate.
+futures-util = "0.3"
 
 # Optional: only compiled when the `transport-tonic` feature is enabled.
 # This is the sole edge from the core to a concrete transport, and it is the
