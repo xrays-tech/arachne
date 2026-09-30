@@ -7,12 +7,19 @@ Talks to etcd's gRPC-gateway JSON endpoints over HTTP/1.1:
 
 Two transport modes:
   * fresh  — one TCP connection per request (exactly what the arachne node's
-             HTTP server forces; this is the apples-to-apples comparison);
+              HTTP server forces; this is the apples-to-apples comparison);
   * keepalive — one connection reused (the realistic etcd-client pattern,
-             bonus context).
+              bonus context).
+
+--read-workers W1,W2,...: run the linearizable (keep-alive) read benchmark across
+a concurrency gradient, mirroring arachne's --keep-alive --read-workers
+(one persistent connection per worker). Default (no flag) preserves the historical
+1-way read layout.
 
 Usage:
   python3 etcdbench.py --hosts etcd1,etcd2,etcd3 --ports 2379,2380,2381
+  python3 etcdbench.py --hosts etcd1,etcd2,etcd3 --ports 2379,2380,2381 \
+      --read-workers 1,2,4,8
 """
 
 import argparse
@@ -130,15 +137,35 @@ def bench_put_concurrent(host, port, workers, per_worker):
     report(f"put fresh {workers}w", samples, workers * per_worker)
 
 
-def bench_range(host, port, key, linearizable, keepalive, n):
-    cli = Cli(host, port, keepalive)
-    samples = []
-    for _ in range(n):
-        ok, _, _, dt = cli.range(key, linearizable)
-        if ok:
-            samples.append(dt)
+def bench_range(host, port, key, linearizable, keepalive, n, workers=1):
+    """Read benchmark. workers=1 is the historical single-client 1w path (byte-
+    identical to before). workers>1: one keepalive connection per worker,
+    workers take strided chunks of n (same caliber as arachne driver's
+    --read-workers)."""
     kind = "linearizable" if linearizable else "serializable"
-    report(f"range({kind}) {'keepalive' if keepalive else 'fresh'} 1w",
+    if workers == 1:
+        # Single-client path (historical 1w): one connection, reused when
+        # keepalive=True.
+        cli = Cli(host, port, keepalive)
+        samples = []
+        for _ in range(n):
+            ok, _, _, dt = cli.range(key, linearizable)
+            if ok:
+                samples.append(dt)
+    else:
+        # Concurrent path: each worker owns one keepalive connection.
+        def job(w):
+            out = []
+            cli = Cli(host, port, keepalive)
+            for i in range(w, n, workers):
+                ok, _, _, dt = cli.range(key, linearizable)
+                if ok:
+                    out.append(dt)
+            return out
+        with futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(job, range(workers)))
+        samples = [d for r in results for d in r]
+    report(f"range({kind}) {'keepalive' if keepalive else 'fresh'} {workers}w",
            samples, n)
 
 
@@ -148,6 +175,10 @@ def main():
                     help="comma-separated member hosts")
     ap.add_argument("--ports", default="2379,2380,2381",
                     help="comma-separated client ports (one per host)")
+    ap.add_argument("--read-workers", default="",
+                    help="comma-separated linearizable-read concurrency gradient "
+                         "(keep-alive, one connection per worker), e.g. '1,2,4,8'. "
+                         "Default: preserve the historical 1-way read layout.")
     args = ap.parse_args()
     hosts = [h for h in args.hosts.split(",") if h]
     ports = [int(x) for x in args.ports.split(",")]
@@ -159,9 +190,18 @@ def main():
     bench_put_concurrent(host, port, workers=4, per_worker=30)
     bench_put_sequential(host, port, keepalive=True, n=100)
 
+    # Read benchmarks: serializable + linearizable, both fresh & keepalive (1w).
     bench_range(host, port, b"k0", linearizable=False, keepalive=False, n=400)
     bench_range(host, port, b"k0", linearizable=True, keepalive=False, n=400)
     bench_range(host, port, b"k0", linearizable=True, keepalive=True, n=400)
+
+    # Linearizable read concurrency gradient (keep-alive, one connection per
+    # worker), mirroring arachne driver's --keep-alive --read-workers. n stays
+    # at 400 (same as the historical reads).
+    if args.read_workers:
+        for w in (int(x) for x in args.read_workers.split(",") if x.strip()):
+            bench_range(host, port, b"k0", linearizable=True, keepalive=True,
+                        n=400, workers=w)
 
     print("[etcd-bench] === done ===")
 

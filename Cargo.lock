@@ -46,6 +46,7 @@ dependencies = [
  "arachne-seam",
  "arachne-testsupport",
  "arachne-transport-tonic",
+ "futures-util",
  "libc",
  "protobuf",
  "raft",
