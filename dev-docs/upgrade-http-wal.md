@@ -10,7 +10,7 @@
 | put | 40 ops/s，p50 25.1ms | 821 ops/s，p50 1.13ms | HTTP 20ms 空转轮询 + 一连接一请求 + `sync_all` 整设备刷 |
 | 线性读 | 44 ops/s，p50 22.3ms | 1531 ops/s，p50 0.58ms | 主要是 HTTP 轮询（核心 ReadIndex 并发下 0.96ms） |
 | 弱读 4 并发 | **44 ops/s（平顶）** | 1388 ops/s | 外层 HTTP+`get_stale` 路径问题 |
-| 线性读 4 并发 | 767 ops/s，p50 0.96ms | 未测（等 1b 补测；2514 为 etcd **单连接** keep-alive 读数） | 并发 ReadIndex 形态（见 1b 结论） |
+| 线性读 4 并发 | 767 ops/s，p50 0.96ms | **2053 ops/s / p50 0.45ms**（1b 实测，keep-alive 同口径；etcd 亦反扩展 −68%，见 2） | 双方线性读 4 并发均反扩展；etcd 反扩展较轻（4w 1.37×）；主因待 Lane 2 GIL A/B 定 |
 
 ## 2. 效率目标与验证矩阵
 
