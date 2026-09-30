@@ -386,8 +386,7 @@ T2a 已落地的部分：`RaftStorage::streamed_snapshots(bool)` + 元数据快�
 **输入**：handoff §1.35 的 docker 3 节点**同配置对比**——单连接 put/读被钉在 ~40–45 ops/s / ~20–25ms，
 etcd 同拓扑 821–1531 ops/s / 0.6–1.2ms（差距 ~20–35×）。归因有二：① `arachne-node/src/http.rs`
 单线程阻塞 accept + WouldBlock→`sleep(20ms)` 空转轮询 + 一连接一请求（无 keep-alive）；② 每次提交做整设备
-`sync_all`（本机 ~10ms 级）。**并发线性读差距已收窄到 2–3×（767 vs ~2.5k ops/s）** ⇒ 核心读路径有竞争力，
-修复重点是 HTTP 面与持久化原语，不是共识核心。
+`sync_all`（本机 ~10ms 级）。**并发线性读：etcd 侧无 4 并发实测（`etcdbench.py` 读全为 1w；"~2.5k" 是 etcd 单连接 keep-alive 读数，误引）**；arachne 4 并发 767 ops/s / p50 0.96ms（自身反扩展，见 upgrade-http-wal §2 观察项与 C1）。单连接才是同口径对标：一股差距 20–35×，B4 后 arachne 单连接反超（见 rev W）；**共识核心读路径有竞争力，单连接崩盘主要是 HTTP 层**。
 
 **（研究结论，2026-09）**：hyper 1.x + tokio 是业界事实标准且是正确升级方向（axum/reqwest 均立于其上，
 hyper 1.11 活跃维护）；io_uring runtime 系（monoio/glommio/tokio-uring）已停更或实验态、对**网络路径**
@@ -516,8 +515,9 @@ arachne --no-default-features | grep libc` ≥1（零树增长，libc 已在树�
 **对拍结论（orchestrator，2026-09，docker/bench 同 n=100 口径）**：B4 落地后较 B3：
 put 单连接 **703 ops/s / p50 1.13ms**（B3：~445 / ~2.0ms → **吞吐 +58%、p50 −44%**），
 线性读单连接 2859–3503 / p50 ~0.3ms（B3：~1560），弱读 4 并发 ~2200（B3：~1500）。
-收益**远超**本 rev 预期的 10–15%。etcd 同配置对照（put 821/1.13ms、线性读 1531/0.58ms）：
-**put/线性读/弱读 4 并发均已达或反超 etcd**。验收目标（put p50 ≤1.8ms、吞吐 +5%）
+收益**远超**本 rev 预期的 10–15%。etcd 同配置对照：put 单连接 821/1.13ms（arachne 703/1.13 已达）；
+线性读单连接 1531/0.58ms（arachne 2859–3503/0.3ms **反超**）；弱读 4 并发 1388（arachne ~2200 **反超**）；
+**线性读 4 并发：etcd 侧未测（`etcdbench.py` 读全为 1w），"~2500" 为误引的单连接 keep-alive 读数**——该维度不构成对标；arachne 4 并发读自身反扩展（并发 < 单连接）为待修复缺陷（见 C1/1b）。验收目标（put p50 ≤1.8ms、吞吐 +5%）
 全面达成，B4 采纳成立。
 Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 **后续**：`docker/bench` 复测写 p99（Linux 上预期更平/更快 —— append 不再触发延迟

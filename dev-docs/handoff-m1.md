@@ -611,7 +611,10 @@ put 单连接 **821 ops/s / p50 1.13ms**（keep-alive 1154）；4 并发 375 ops
    单客户端吞吐被钉 ~45 ops/s。etcd 用 Go `net/http`（多路复用、keep-alive、无轮询）。
 2. **WAL 持久化原语**：arachne 每次提交做整设备 `sync_all`（本机 ~10ms 级）；etcd 在 Linux overlayfs
    上对 WAL 用 `fdatasync`（亚毫秒）。同为"提交前落盘"，原语 + 文件系统不同 ⇒ 写路径差距显著。
-3. **并发下核心差距收窄到 2–3×**：arachne 线性读并发 767 ops/s / p50 0.96ms vs etcd ~2.5k ——
+3. **并发读归因（2026-09 修正标注）**：上文 "etcd ~2.5k" 实为 **etcd 单连接 keep-alive** 读数（2514），
+   **etcd 的 `etcdbench.py` 读基准全为 1w、无 4 并发读实测**——该对标原先被误引为 "4 并发"。
+   arachne 线性读 4 并发 767 ops/s / p50 0.96ms（M1 期）为 **自身并发反扩展**（并发 < 单连接），
+   与 etcd 无直接对标；真实对拍以单连接为准（B4 后 arachne 反超，见 upgrade-http-wal §2）。
    **共识核心读路径有竞争力**，单连接崩盘主要是 HTTP 层；库级进程内基准（§1.34）弱读 p50 6µs。
 4. **弱读经 HTTP 4–8 并发下 ~44 ops/s 平顶**（16 并发才 162/s）：node 外层 HTTP+`get_stale` 路径
    的部署特征（归因未定），etcd 可串行读单连接即 1388/s ⇒ 属 HTTP 面问题而非核心。
