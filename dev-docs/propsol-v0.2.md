@@ -519,6 +519,29 @@ put 单连接 **703 ops/s / p50 1.13ms**（B3：~445 / ~2.0ms → **吞吐 +58%�
 线性读单连接 1531/0.58ms（arachne 2859–3503/0.3ms **反超**）；弱读 4 并发 1388（arachne ~2200 **反超**）；
 **线性读 4 并发（1b 实测修正）：etcd 真实 ≈2053 ops/s / p50 0.45ms（keep-alive 同口径；"~2500" 为误引的单连接读数）**，etcd 1w→8w 反扩展 −68%（3752→1213）；arachne 4w ~1493 / p50 0.67ms、1w→8w −81%（4105→798）——**双方线性读并发反扩展、arachne 更显著（4w 1.37× 落后）**，主因待 Lane 2 GIL A/B 定；1 w 维度 arachne（4105）已超 etcd（3752）。验收目标（put p50 ≤1.8ms、吞吐 +5%）
 全面达成，B4 采纳成立。
+
+### X. v0.2.21：线性读并发反扩展归因与 C3 读合并落地（E-rev，实现）
+
+线性读 4 并发反扩展（M1 767 → B4 ~1500 keep-alive，1w→8w −81%）经三步定案：
+1. **对标修正（Lane 1a）**："etcd 线性读 4 并发 ~2500" 系误引——etcd `etcdbench.py` 读基准全为 1w，
+   2514 是单连接 keep-alive 读数；etcd 本就无并发读实测。
+2. **etcd 并发读重做（Lane 1b，同口径）**：etcd 真实 4 并发 ≈2053/0.45ms、1w→8w 反扩展 −68%；
+   arachne 4w ~1500、−81%——**双方都反扩展**，etcd 反扩展较轻（4w 1.37×）。
+3. **GIL A/B（Lane 2，排除客户端）**：`--process` 剥离 Python GIL 后线性读 4w/8w 不升反降
+   （4w 1495→1361、8w 833→611），而**非共识 stale 读**进程版 4w 415→6890（1.56×）受益——
+   **只有共识线性读不受 GIL 剥离影响 ⇒ 瓶颈在 server 端线性读（ReadIndex）串行段**。
+
+**C3 落地（0d99cb3）**：同一 drive_cycle 内全部线性读共享一个单调 batch ctx，只发**一次**
+`node.read_index`（一次 quorum 轮）；共享同一 `read_index` 下界（对每读都是合法下界，一致性纪律
+不变），按 `read_index <= applied` 逐读 resolve；重试用新 token（raft 对重复 ctx 去重）。
+新增 `Metrics.read_index_rounds_total`（轮数 = server 侧成本单位）。测试：
+`read_batch_shares_one_read_index_round`（4 读→1 轮→全 resolve）+ 集成 resolve 测试。
+
+**收益（进程版口径，n=400，两次）**：4w 1361→**1675–1792**、8w 611→**997–1040**；4w/1w 比例
+**32%→60–65%**（反扩展显著收窄）；p50 4w 0.66→0.48–0.51ms、8w 1.2→0.79–0.81ms。
+残留差距 = 每周期 read-index quorum 轮不可完全消除（etcd 调度更优，4w/1w −68% vs arachne −35~40%）。
+**验证全绿**：workspace 421 / fi 440 / node / read_latency 门 / l2 双跑 23 / 门禁 4/4。
+**bench 口径**：`--process` 成为 server 端调优标准口径（排除 GIL 噪声）；跨 run 方差 ~2× 须知。
 Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 **后续**：`docker/bench` 复测写 p99（Linux 上预期更平/更快 —— append 不再触发延迟
 分配 + extent-journal，每段一次 `fdatasync` 即 data-only 屏障，见 etcd `fileutil.Preallocate`）。
