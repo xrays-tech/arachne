@@ -22,6 +22,10 @@ pub struct Metrics {
     dropped_sends: AtomicU64,
     /// Total number of ReadIndex reads that timed out after one retry.
     read_index_timeout_total: AtomicU64,
+    /// Total number of ReadIndex quorum rounds issued. C3 coalesces every
+    /// linear read issued within a single drive cycle into one round, so a read
+    /// round is the unit of the server-side cost this counter tracks.
+    read_index_rounds_total: AtomicU64,
     /// Number of ReadIndex reads currently pending confirmation/apply.
     read_index_pending: AtomicU64,
     /// Bytes the durable WAL occupies on disk.
@@ -95,6 +99,18 @@ impl Metrics {
     /// single retry, propsol §5.4).
     pub fn inc_read_index_timeout(&self) {
         self.read_index_timeout_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the ReadIndex round counter. One quorum round was issued for
+    /// the batch(es) of linear reads in the current drive cycle (C3: one
+    /// round serves every read issued in that cycle).
+    pub fn inc_read_index_rounds(&self) {
+        self.read_index_rounds_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The number of ReadIndex quorum rounds issued so far.
+    pub fn read_index_rounds(&self) -> u64 {
+        self.read_index_rounds_total.load(Ordering::Relaxed)
     }
 
     /// Record the number of ReadIndex reads currently pending confirmation or
@@ -287,6 +303,13 @@ impl Metrics {
             "ReadIndex reads that timed out after one retry.",
             self.read_index_timeout_total.load(Ordering::Relaxed),
         );
+        counter(
+            &mut out,
+            "arachne_read_index_rounds_total",
+            "ReadIndex quorum rounds issued (C3: one round per drive cycle of
+            coalesced linear reads).",
+            self.read_index_rounds_total.load(Ordering::Relaxed),
+        );
         gauge(
             &mut out,
             "arachne_read_index_pending",
@@ -408,6 +431,9 @@ mod tests {
         m.set_dropped_sends(4);
         m.inc_read_index_timeout();
         m.inc_read_index_timeout();
+        m.inc_read_index_rounds();
+        m.inc_read_index_rounds();
+        m.inc_read_index_rounds();
         m.set_read_index_pending(5);
         m.set_wal_bytes(4096);
         m.set_snapshot_last(12, 1024);
@@ -427,6 +453,7 @@ mod tests {
             "arachne_is_leader",
             "arachne_dropped_sends",
             "arachne_read_index_timeout_total",
+            "arachne_read_index_rounds_total",
             "arachne_read_index_pending",
             "arachne_wal_bytes",
             "arachne_snapshot_last_duration_ms",
@@ -447,6 +474,8 @@ mod tests {
         assert!(text.contains("arachne_dropped_sends 4"));
         assert!(text.contains("# TYPE arachne_read_index_timeout_total counter"));
         assert!(text.contains("arachne_read_index_timeout_total 2"));
+        assert!(text.contains("# TYPE arachne_read_index_rounds_total counter"));
+        assert!(text.contains("arachne_read_index_rounds_total 3"));
         assert!(text.contains("# TYPE arachne_read_index_pending gauge"));
         assert!(text.contains("arachne_read_index_pending 5"));
         assert!(text.contains("# TYPE arachne_wal_bytes gauge"));

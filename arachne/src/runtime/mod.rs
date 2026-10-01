@@ -201,6 +201,12 @@ struct PendingRead {
     read_index: Option<LogIndex>,
     /// How many times this read has been issued (`1` initially; one retry allowed).
     attempts: u8,
+    /// Whether the ReadIndex round for this read has been fired (C3 coalescing).
+    /// A read is registered with `false` and sits in `pending_reads` until the
+    /// next `drive_cycle` stamps a shared batch token and issues the round; the
+    /// round is confirmed when `read_index` is set below. A retry resets this
+    /// to `false` so the next cycle re-fires it with a fresh token.
+    read_index_issued: bool,
 }
 
 /// Upper bound on concurrent pending ReadIndex reads (propsol §4.1/§7: 4096).
@@ -821,7 +827,36 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         if !self.absorb_progress() || !self.poll_snapshot() {
             return false;
         }
-
+ 
+        // C3 coalescing: fire one ReadIndex round for every linear read still
+        // waiting on a quorum confirmation. All reads issued in the same cycle
+        // share a single `batch token` (one `node.read_index`, one quorum round)
+        // and a single `read_index` lower bound — the same bound any of them
+        // would have used alone — so the per-read consistency discipline is
+        // unchanged (the shared bound is a valid lower bound for each read).
+        //
+        // This runs **before** `node.step()` on purpose: `read_index` only
+        // *enqueues* the request in the node; the actual send happens in the
+        // upcoming `step()`. Pre-C3, `handle_command` fired it before `drive_cycle`,
+        // so it shipped in the same cycle. If it shipped *after* `step()` the
+        // request would sit un-sent until the next cycle — in the idle case the
+        // next cycle is the heartbeat tick (≈10ms), and a single read would
+        // pay that full interval (the exact bug the `read_latency` gate caught).
+        // Firing here keeps an idle linear read on the same event-driven path
+        // it was on before C3.
+        if self.pending_reads.iter().any(|r| !r.read_index_issued) {
+            let token = self.next_read_token;
+            self.next_read_token += 1;
+            self.metrics.inc_read_index_rounds();
+            for r in self.pending_reads.iter_mut() {
+                if !r.read_index_issued {
+                    r.token = token;
+                    r.read_index_issued = true;
+                }
+            }
+            self.node.read_index(token.to_be_bytes().to_vec());
+        }
+ 
         let outcome = match self.node.step().await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -830,30 +865,34 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                 return false;
             }
         };
-
+ 
         // Hand committed work to the apply task, in log order: normal entries
         // go to the state machine, ConfChange entries are applied here on the
         // actor, and nothing behind a not-yet-applied ConfChange is dispatched
         // (rev S S1b).
-        if !self.stage_committed(outcome.snapshot, outcome.committed) {
-            self.metrics.set_is_leader(false);
-            return false;
-        }
-
-        // Quorum-confirmed read states (propsol §5.4 step 2): record the read
-        // index and open the wait-for-apply window. The ctx is the 8-byte
-        // big-endian token issued by the `Read` command; unknown tokens (already
-        // resolved or dropped) are ignored.
-        for (ctx, index) in &outcome.read_states {
-            let Ok(token_bytes) = ctx.as_slice().try_into() else {
-                continue;
-            };
-            let token = u64::from_be_bytes(token_bytes);
-            if let Some(r) = self.pending_reads.iter_mut().find(|r| r.token == token) {
-                r.read_index = Some(*index);
-                r.deadline = Instant::now() + self.read_index_timeout;
-            }
-        }
+         if !self.stage_committed(outcome.snapshot, outcome.committed) {
+             self.metrics.set_is_leader(false);
+             return false;
+          }
+  
+          // Quorum-confirmed read states (propsol §5.4 step 2): record the read
+         // index and open the wait-for-apply window. The ctx is the 8-byte
+         // big-endian token issued by the batch commit; C3: one token names an
+         // *entire* batch, so every matching pending read gets the bound (pre-
+         // C3 one token named one read).
+         for (ctx, index) in &outcome.read_states {
+             let Ok(token_bytes) = ctx.as_slice().try_into() else {
+                 continue;
+             };
+             let token = u64::from_be_bytes(token_bytes);
+             let now = Instant::now();
+             for r in self.pending_reads.iter_mut() {
+                 if r.token == token {
+                     r.read_index = Some(*index);
+                     r.deadline = now + self.read_index_timeout;
+                 }
+             }
+         }
 
         self.resolve_transfers();
         self.resolve_reads();
@@ -1486,19 +1525,20 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                     let _ = ack.send(Err(ArachneError::Busy));
                     return;
                 }
-                // Register a ReadIndex round. The token is the 8-byte big-endian
-                // `ctx` raft echoes back in `StepOutcome::read_states`.
-                let token = self.next_read_token;
-                self.next_read_token += 1;
+                // C3 coalescing: register the read *without* firing a ReadIndex
+                // round. The next `drive_cycle` stamps a shared batch token on
+                // every read still waiting in this cycle and issues one quorum
+                // round for them (one `node.read_index` per cycle, not one per
+                // read). `token` is a placeholder until that commit.
                 self.pending_reads.push(PendingRead {
-                    token,
+                    token: 0,
                     key,
                     ack: Some(ack),
                     deadline: Instant::now() + self.read_index_timeout,
                     read_index: None,
                     attempts: 1,
+                    read_index_issued: false,
                 });
-                self.node.read_index(token.to_be_bytes().to_vec());
             }
             Command::LeaderHint { ack } => {
                 let _ = ack.send(self.hint());
@@ -1657,23 +1697,24 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
                 continue;
             }
 
-            if now >= r.deadline {
-                if r.attempts <= 1 {
-                    // One retry: re-issue the ReadIndex round with a fresh token.
-                    r.attempts += 1;
-                    r.read_index = None;
-                    r.deadline = now + self.read_index_timeout;
-                    let new_token = self.next_read_token;
-                    self.next_read_token += 1;
-                    r.token = new_token;
-                    self.node.read_index(new_token.to_be_bytes().to_vec());
-                    still.push(r);
-                } else {
-                    self.metrics.inc_read_index_timeout();
-                    let _ = r.ack.take().map(|ack| ack.send(Err(ArachneError::Timeout)));
-                }
-                continue;
+        if now >= r.deadline {
+            if r.attempts <= 1 {
+                // One retry: mark the read for re-issue. The next `drive_cycle`
+                // batch commit stamps it with a fresh batch token and fires a
+                // new ReadIndex round (C3: retries ride the same cycle-level
+                // coalescing as fresh reads).
+                r.attempts += 1;
+                r.read_index = None;
+                r.token = 0;
+                r.deadline = now + self.read_index_timeout;
+                r.read_index_issued = false;
+                still.push(r);
+            } else {
+                self.metrics.inc_read_index_timeout();
+                let _ = r.ack.take().map(|ack| ack.send(Err(ArachneError::Timeout)));
             }
+            continue;
+        }
 
             still.push(r);
         }
