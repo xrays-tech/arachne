@@ -108,6 +108,7 @@ pub(crate) fn skips() -> u64 {
 mod tests {
     use super::*;
     use std::fs::{OpenOptions, remove_file};
+    use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
