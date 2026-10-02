@@ -546,6 +546,25 @@ Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 **后续**：`docker/bench` 复测写 p99（Linux 上预期更平/更快 —— append 不再触发延迟
 分配 + extent-journal，每段一次 `fdatasync` 即 data-only 屏障，见 etcd `fileutil.Preallocate`）。
 
+### Y. v0.2.22：C4（read-index batch 窗口合并）probe 失败回滚 + 4w 数字/口径修正（E-rev，2026-10-02）
+
+**背景**：X 节判定残留差距 = 每周期 read-index quorum 轮，C3 已合并同一 `drive_cycle` 内的读。本 rev 尝试进一步合并**跨 `drive_cycle`** 的在途读（C4），并纠正此前「4w 已超 etcd 50%」的误判。
+
+**C4 实现（probe，commit `5906210`，未保留）**：`ReadBatch` 新增 `batch`/`pending` 双指针窗口（单调、无 `Arc<Atomic>`），`next_index` 为窗口下界、`max_index` 为窗口上界；跨 cycle 的读若 `applied` 已达窗口上界即 resolve，否则推入 `pending` 窗口、保留窗口下界作为共享 `read_index`；`on_read_state` 在 cycle 结束推进窗口（`pending` 非空才发新 quorum 轮）。新增 `read_index_batch_rounds_total` 指标。
+
+**probe 实测（进程版 + keep-alive，n=400）**：4w RPS 3072（C3 基线 401 → 168，4w/1w **0.42**）、1w RPS 4000。
+**门禁：4w/1w ≥ 0.9。0.42 < 0.9，失败。** 进一步分析：读到达时 `rounds_in_flight` ≈ 0 —— 内存/网络 quorum 轮仅 ~0.1–0.5ms，短于读到达间隔（~1–2ms），故窗口合并几乎不生效（`batch==pending`，窗口宽度恒为 0，等于 C3）。**结论：C4 在此 workload 是 no-op，不采纳。** 已回滚至 `a592add`（C3-only）：还原 `read_batch.rs`、`runtime/mod.rs`、`metrics.rs`、`docker/bench/docker-compose.yml`（删 probe 环境变量），删除 probe 测试，`cargo test -p arachne` 全绿。
+
+**4w 数字与口径修正（本 rev 核心）**：
+- C4 probe 的 4w=3072 RPS / p50 0.31ms 是**快速 outlier**（新鲜 leader 选举后、系统低负载），非稳态值。**同一 C3 代码、同环境、21 次 n=400 复测中位 ~2043 RPS / p50 ~0.43ms（范围 1360–2346）**；`a592add` 基线为 1675–1792 / p50 0.48–0.51ms。
+- **1.8× 差异归因（probe 3072 vs orchestrator 复测 1675–1792）**：主因是 **cluster state / system load 方差**（同 C3 代码跨 run 方差 ~2×）；次因是 **n 效应仅 ~9%**（4w n=100 中位 1878 → n=400 中位 2043）——**"n=100 低估 ~1.8×"不成立**。
+- **同环境 etcd 对照（2026-10-02，`docker/bench-etcd`，keep-alive n=400）**：etcd 4w ≈ **2365 RPS / p50 0.40ms**（6 次，2208–2436）；arachne 4w ≈ **2043 / p50 0.43ms** → **arachne 4w 落后 etcd ~14%**（对 `a592add` 基线 1675–1792 则 ~27%）。双方均反扩展：arachne 4w/1w ≈ **72%**、etcd ≈ **65%**。
+- **结论**：「4w 已超 etcd 50%」判误；**4w 仍处 etcd 附近/略落后**，残留差距为每周期 read-index quorum 轮（etcd 调度更优），非 C4 能消除。
+
+**bench 口径**：并发读对标须用 **`--process --keep-alive --n≥400`**、取 **2–4 次中位**；单 run 或 n=100 会显著低估 4w，跨 run 方差 ~2× 须知。
+
+**验证（C3 状态，无产品改动）**：workspace 421 / fi 440 / node / read_latency 门 / l2 双跑 / 门禁 4/4 全绿；musl 二进制 + docker 镜像重建。集群 `docker compose down -v`，无残留。
+
 ## 1. 目标与非目标
 
 **目标**

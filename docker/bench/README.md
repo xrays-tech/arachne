@@ -128,8 +128,13 @@ gate's default path and all prior baselines are byte-identical):
   at higher concurrency is driven by client-side GIL cost (A) or server-side
   serialization (B). Orthogonal to `--keep-alive` and `--read-workers`; keep-alive
   semantics are preserved (each worker process builds and reuses its own
-  `HTTPConnection`). The job is a module-level, pickle-safe function that owns its
-  connection(s), so no in-memory state crosses process boundaries.
+   `HTTPConnection`). The job is a module-level, pickle-safe function that owns its
+   connection(s), so no in-memory state crosses process boundaries.
+- **`--n ≥ 400` for fair 4-way read comparisons** — the driver's default `--n` is
+  100 (25 ops/worker at 4w), which underestimates 4-way throughput/p50. For
+  comparing 4-way linear reads to etcd use `--n ≥ 400` (100 ops/worker at 4w)
+  and take the median of 2–4 runs; single-run or `n=100` figures are not
+  comparable to the multi-run medians (see `dev-docs/propsol-v0.2.md` rev Y).
 
 ```bash
 # keep-alive, linear gradient + stale 4-way, 100 ops each (threads)
