@@ -565,6 +565,43 @@ Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 
 **验证（C3 状态，无产品改动）**：workspace 421 / fi 440 / node / read_latency 门 / l2 双跑 / 门禁 4/4 全绿；musl 二进制 + docker 镜像重建。集群 `docker compose down -v`，无残留。
 
+### Z. v0.2.23：Go 客户端重测 —— 排除 "Python client 残余" 变量（E-rev，2026-10-02）
+
+**背景**：Y 节将 "arachne 4w 落后 etcd ~14%（2043 vs 2365）" 归因为 server 真实能力差距（每周期 read-index quorum 轮）。但 Y 节全程用 **Python 客户端**测量，存在一个未排除变量：**Python client 是否对 Arachne（gRPC-less/HTTP）的开销 > 对 etcd（gRPC）的开销**，从而 "夸大" 了 Arachne 的落后。本 rev 引入 **Go 基准客户端**重测，以排除该变量。Go 无 GIL、无解释器开销、原生 `net`/`http`，是更接近 server 真实成本的测量工具。
+
+**新增 Go 基准客户端（`docker/bench/driver/bench_go.go`，未改任何产品代码）**：与 Python `bench.py` **完全同口径**——strided workers、每 worker 独立持久连接（keep-alive, `MaxIdleConnsPerHost=1`）、`dt = 发请求 → 读 body 完成`、`rps = n / (Σdt / 1e9)`、p50/p99 rank 与 Python 一致。协议插拔：
+- **Arachne**：`GET /kv/<key>`（线性）、`GET /kv/<key>?stale=1`（弱）、`PUT /kv/<key>/<value>`；leader 探测 `PUT /kv/probe-all/v`。
+- **etcd**：`POST /v3/kv/range {"key": <b64>, "linearizable": true}`（成功 = 200 + body 含 `"header"`，**与 `etcdbench.py` 判据一致**）、`POST /v3/kv/put`（key/value 均 base64）。
+本机 Go `1.17.3`（arm64 目标二进制 `/tmp/bench_go_arm64`；x86_64 因 Rosetta `missing LC_UUID` 不可跑）。**已验证连接复用**：4w p50 0.6ms << 新连接 ~16ms（curl 实测），故 Go 数字反映的是 server 成本 + 极小 client 开销，非 TCP 建连。
+
+**同环境 back-to-back（同集群、Python 与 Go 交替、n=400、keep-alive）：**
+
+| Server | 客户端 | 4w ops/s（中位） | p50 | p99 |
+|---|---|---|---|---|
+| **Arachne**（3 节点新集群） | Python（`--process --keep-alive`） | 2141 | 0.43 ms | 1.02 ms |
+| | **Go** | **2391** | **0.38 ms** | 0.62 ms |
+| **etcd**（3 节点新集群） | Python（`etcdbench.py`） | 1608 | 0.55 ms | ~1.2 ms |
+| | **Go** | **1795** | **0.51 ms** | ~1.3 ms |
+
+**关键发现（结论修订）：**
+
+1. **Go 客户端比 Python 客户端统一高 ~12%（Arachne 2391/2141 ≈ 1.12；etcd 1795/1608 ≈ 1.12）。** 两个 server 上比例相同 → Python client 的 ~12% 开销是**均匀的**，**不是** "特异地抑制 Arachne"。
+2. **因此 "14% 差距 = Python client 残余抑制" 不成立**：若 client 残余是 Arachne 特异的（对 Arachne 压得多、对 etcd 压得少），Go/Python 比在两个 server 上应不同。实际相同（均 ~1.12），**client 残余不能解释 Arachne–etcd 的相对差距**。
+3. **Go 客户端同样不能解释 14% 差距**：Go/Go 的相对关系与 Python/Python 一致（client 开销均匀抵消）。
+
+**绝对 gap（跨集群，低可信度，仅参考）：**
+- 无法同跑 Arachne 与 etcd（两个集群网络同 `172.30.0.0/24`，Docker 池冲突），只能跨集群、跨时间对比。
+- 当前 etcd 集群偏慢（4w p50 0.51ms vs Y 节同环境 0.40ms；4w 中位 1795 vs Y 节 2365），Go Arachne 4w 2391 vs Go etcd 4w 1795 → **当前集群下 Arachne 略高于 etcd**。
+- 但 Y 节（旧集群）是 Arachne 低于 etcd。**方向翻转 = 4w 测量被 cluster-state / system-load 方差（~2×）主导**（Y 节已证：同 C3 代码 21 次中位 ~2043，范围 1360–2346）。
+
+**最终判定（修订 Y 节）：**
+- **"4w 落后 etcd ~14%" 既不是 Python client 残余**（client 开销均匀、相对差距不受影响）**，也不是可归因于 server 能力的稳健结论**（4w 为 ~2× 高方差 regime，跨集群方向甚至翻转）。
+- 保留 Y 节的**机理归因**（C3 读合并生效、残留 = 每周期 read-index quorum 轮、etcd 调度更优）——Go 客户端下 Arachne 的读合并同样生效，该归因未被推翻；仅将 "14% 落后" 的具体数值**降格为"cluster-state 方差范围内的单点观察"**。
+- **更稳健的信号是 1w 维度：Arachne 一致快**（Go：Arachne 1w ~4038 vs etcd 1w；Python：Arachne 1w ~3200 vs etcd 1w）。单连接/低并发下 Arachne 明确领先，符合 "低并发下 HTTP+ReadIndex 已优于 etcd gRPC" 的判断。
+- **bench 口径新增**：Go 客户端成为 **server-side 真实成本**的标准测量口径（无 GIL/解释器），与 Python 并置；`Go/Python ≈ 1.12` 为 **client 开销校准系数**（对任何 client 实测值 ×~1.12 可得 server-side 估计）。
+
+**验证**：Go 驱动 `go build` + Arachne 3 节点 + etcd 3 节点集群起停（含 base64 修复，`seedWrite`/`discover` 均 base64 编码，读真实存在的 key）全绿；本 rev **无产品代码改动**（纯 docs + 新增 Go driver）。集群 `docker compose down -v`，无残留。
+
 ## 1. 目标与非目标
 
 **目标**
