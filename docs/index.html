@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Arachne — transport-agnostic, linearizable key-value engine for Rust programs. 文档站：Quick Start、Tutorial、API Reference。">
+<title>Arachne · 文档</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Karla:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/site.js" defer></script>
+<noscript><style>.sidebar{display:none}.code-copy{display:none}</style></noscript>
+</head>
+<body data-page="index">
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="index.html">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="2.2"/>
+          <path d="M12 9.8V4M12 14.2V20M9.8 12H4M14.2 12H20M7 7l3.7 3.7M17 17l-3.7-3.7M17 7l-3.7 3.7M7 17l3.7-3.7"/>
+        </svg>
+      </span>
+      Arachne <span class="version-tag">docs</span>
+    </a>
+    <nav class="nav-links" aria-label="主导航">
+      <a data-nav="quick-start" href="quick-start.html"><span>Quick&nbsp;Start</span></a>
+      <a data-nav="tutorial" href="tutorial.html"><span>Tutorial</span></a>
+      <a data-nav="api-reference" href="api-reference.html"><span>API&nbsp;Reference</span></a>
+    </nav>
+  </div>
+</header>
+
+<main class="animate">
+  <section class="hero">
+    <p class="page-kicker">Documentation</p>
+    <h1>Arachne —— 为 Rust 程序打造的<br><span class="accent-word">可线性化</span>键值引擎</h1>
+    <p class="lede">
+      A transport-agnostic, linearizable key-value engine for Rust programs, built on the
+      <code>raft</code> consensus algorithm。先是一个<strong>库</strong>：把它嵌进你自己的进程，给它存储后端与传输层，
+      就能得到一个具备 raft 一致性的 <code>Handle</code> 用于读写；工作区也附带了把存储 + 传输 + HTTP 接好的参考节点
+      二进制 <code>arachne-node</code>。
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="quick-start.html">一分钟跑起来 →</a>
+      <a class="btn btn-ghost" href="api-reference.html">API Reference</a>
+    </div>
+  </section>
+
+  <section class="trait-strip">
+    <div class="card-grid">
+      <a class="card card-link" href="quick-start.html">
+        <span class="card-tag">5 分钟 · 嵌入</span>
+        <h3>Quick Start</h3>
+        <p>添加依赖、用 <code>server::Arachne</code> facade 写入/读取最小程序、<code>cargo run --example facade</code>，以及可选地构建并运行 <code>arachne-node</code> 参考节点并 curl 它的 HTTP 接口。</p>
+      </a>
+      <a class="card card-link" href="tutorial.html">
+        <span class="card-tag">渐进式 · 概念</span>
+        <h3>Tutorial</h3>
+        <p>从 facade 的生命周期（new → 等选主 → 读写 → shutdown）走到多节点与底层装配：一致性语义、ReadIndex、成员增删、HTTP 运维，再到 <code>RaftNode</code> + <code>WalStorage</code> + <code>KvStateMachine</code> 的裸装配。</p>
+      </a>
+      <a class="card card-link" href="api-reference.html">
+        <span class="card-tag">索引 · 权威</span>
+        <h3>API Reference</h3>
+        <p>结构化列出 <code>server::Arachne</code> 全部方法、<code>client::Handle</code> 全客户端 API、<code>WalConfig</code> 字段、<code>ArachneError</code> 全部 16 个变体，以及参考节点的 HTTP 路由与错误状态码映射。</p>
+      </a>
+    </div>
+  </section>
+
+  <section class="trait-strip">
+    <h3 style="font-family:var(--font-display);font-size:20px;margin:0 0 6px;">核心是传输无关的</h3>
+    <p style="color:var(--muted);margin:0 0 16px;max-width:70ch;">
+      共识、WAL 与 KV 状态机构成 <code>arachne</code> 核心。它只面向 <em>seam</em> 特征编程，核心内没有具体的时钟、
+      RNG、网络代码或文件 I/O；<code>--no-default-features</code> 时以零外部 crate 编译为精简核心。
+    </p>
+    <div class="trait-grid">
+      <div class="trait"><div class="trait-name">Transport</div><div class="trait-desc">传输层的出站半边，发送 raft 消息</div></div>
+      <div class="trait"><div class="trait-name">TransportRx</div><div class="trait-desc">传输层的入站半边，接收消息</div></div>
+      <div class="trait"><div class="trait-name">Storage</div><div class="trait-desc">持久化：WAL、段、同步</div></div>
+      <div class="trait"><div class="trait-name">StateMachine</div><div class="trait-desc">KV 状态机（Put / Delete）</div></div>
+      <div class="trait"><div class="trait-name">Clock / Rng</div><div class="trait-desc">tick 计时与随机（调用方注入）</div></div>
+      <div class="trait"><div class="trait-name">FsyncObserver</div><div class="trait-desc">每次真实 fsync 后的回调（测试账本）</div></div>
+    </div>
+  </section>
+
+  <section class="trait-strip">
+    <h3 style="font-family:var(--font-display);font-size:20px;margin:0 0 6px;">一致性语义一瞥</h3>
+    <div class="fact-grid">
+      <div class="card">
+        <span class="card-tag">线性化写</span>
+        <p><code>put</code> / <code>delete</code> —— 追加到 raft 日志，仲裁持久化后提交，应用于状态机后应答。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">线性化读</span>
+        <p><code>get</code> —— 默认经 <strong>ReadIndex</strong> 服务；非 leader 节点会重定向或返回 <code>NotLeader</code>。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">本地读</span>
+        <p><code>get_stale</code> —— 直接读本地状态机；跨调用<strong>不保证单调</strong>，仲裁丢失时依然可用。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">CP 语义</span>
+        <p>任何时刻至多一个 leader；失去仲裁时所有线性化操作失败（<code>QuorumUnavailable</code>），绝不降级为多数派读或脑裂。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="trait-strip">
+    <h3 style="font-family:var(--font-display);font-size:20px;margin:0 0 6px;">工作区布局</h3>
+    <div class="fact-grid">
+      <div class="card">
+        <span class="card-tag">可嵌入核心</span>
+        <p><code>arachne</code> —— <code>src/consensus</code>、<code>src/storage</code>、<code>src/runtime</code>、<code>src/client</code>、<code>src/state_machine</code>、<code>src/profile</code> 与 seam 特征。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">叶子 crate</span>
+        <p><code>arachne-seam</code> —— seam 特征与共享值类型，自身无任何依赖。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">传输实现</span>
+        <p><code>arachne-transport-tonic</code> —— tonic / rustls 传输，由 <code>transport-tonic</code> 特性启用。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">参考节点</span>
+        <p><code>arachne-node</code> —— HTTP 服务器、配置加载、成员管理运维面。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">测试支撑</span>
+        <p><code>arachne-testsupport</code>、<code>arachne-sim</code> —— 测试与仿真支撑；<code>l2/</code>、<code>l4/</code>、<code>fuzz/</code>、<code>model-check/</code> 为独立确定性测试框架。</p>
+      </div>
+      <div class="card">
+        <span class="card-tag">设计记录</span>
+        <p><code>dev-docs/</code> —— 设计文档（<code>propsol-v0.2.md</code> 为现行设计权威，逐版注释演进）。</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <span><strong>Arachne</strong> · transport-agnostic, linearizable key-value engine for Rust。</span>
+    <span>MIT OR Apache-2.0</span>
+  </div>
+</footer>
+
+</body>
+</html>

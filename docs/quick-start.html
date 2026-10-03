@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Arachne Quick Start —— 一分钟跑起来：添加依赖、facade 最小程序、运行示例、参考节点 + curl。">
+<title>Quick Start · Arachne 文档</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Karla:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/site.js" defer></script>
+<noscript><style>.sidebar{display:none}.code-copy{display:none}</style></noscript>
+</head>
+<body data-page="quick-start">
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="index.html">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="2.2"/>
+          <path d="M12 9.8V4M12 14.2V20M9.8 12H4M14.2 12H20M7 7l3.7 3.7M17 17l-3.7-3.7M17 7l-3.7 3.7M7 17l3.7-3.7"/>
+        </svg>
+      </span>
+      Arachne <span class="version-tag">docs</span>
+    </a>
+    <nav class="nav-links" aria-label="主导航">
+      <a data-nav="quick-start" href="quick-start.html"><span>Quick&nbsp;Start</span></a>
+      <a data-nav="tutorial" href="tutorial.html"><span>Tutorial</span></a>
+      <a data-nav="api-reference" href="api-reference.html"><span>API&nbsp;Reference</span></a>
+    </nav>
+  </div>
+</header>
+
+<button class="mobile-toc-toggle" id="toc-toggle" aria-expanded="false">显示本页目录</button>
+
+<div class="doc-wrap">
+  <aside class="sidebar" id="sidebar">
+    <p class="sidebar-title">本页目录</p>
+    <ul class="toc-list" id="toc-list"></ul>
+    <p class="sidebar-title">文档</p>
+    <ul class="toc-list">
+      <li><a class="toc-link is-h2" href="quick-start.html">Quick Start</a></li>
+      <li><a class="toc-link is-h2" href="tutorial.html">Tutorial</a></li>
+      <li><a class="toc-link is-h2" href="api-reference.html">API Reference</a></li>
+    </ul>
+  </aside>
+
+  <main class="content animate">
+    <article>
+      <p class="page-kicker">Quick Start</p>
+      <h1>一分钟跑起来</h1>
+      <p class="lede">
+        把 Arachne 作为库嵌进你的 Rust 程序：加一行依赖，用
+        <code>arachne::server</code> 的 facade 就能得到可线性化的写入与读取。
+        本节与你自己的 <code>Cargo.toml</code> 同步推进。
+      </p>
+
+      <h2>1. 添加依赖</h2>
+      <p>
+        默认开启 <code>transport-tonic</code> 特性，会拉取 tonic 传输；不想要任何网络依赖时，
+        用 <code>default-features = false</code> 得到一个<span class="nowrap">零外部 crate</span>
+        （可离线构建）的精简核心。
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">Cargo.toml</span></div>
+<pre><code data-lang="toml">[dependencies]
+arachne = { path = "…/arachne" }            # default: pulls tonic transport
+# or a transport-free build:
+# arachne = { path = "…/arachne", default-features = false }
+</code></pre>
+      </div>
+      <p>
+        一个进程内单节点时，<code>arachne::server</code> 提供最小 facade —— 不需要 tokio
+        runtime 轮询，不需要任何 <code>Runtime</code> / <code>Handle</code> 装配。facade
+        自己持有独立线程的 runtime。
+      </p>
+
+      <h2>2. 最小程序：new → 等选主 → 读写 → shutdown</h2>
+      <p>
+        下面是一个<strong>完整可运行</strong>的最小程序（源自
+        <code>arachne/examples/facade.rs</code>，注释稍作精简，签名与调用与原例一致）：
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">use std::time::{Duration, Instant};
+use arachne::server::{Arachne, ArachneError, WalConfig};
+
+fn main() {
+    let dir = std::env::temp_dir().join(format!(
+        "arachne-facade-example-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+
+    let output = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async {
+            // (1) One node per process — the facade keeps a single global node.
+            Arachne::new(1, &dir, WalConfig::default())?;
+
+            // (2) Wait until the node has elected itself leader. Pre-election
+            //     reads fail fast (fast non-leader redirect); once leader the
+            //     same read resolves to `None` (key not yet set).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match Arachne::get(b"hello").await {
+                    Ok(v) =&gt; {
+                        assert!(v.is_none(), "unexpected value before write");
+                        break;
+                    }
+                    Err(ArachneError::NotLeader { .. })
+                    | Err(ArachneError::QuorumUnavailable) =&gt; {
+                        if Instant::now() &gt;= deadline {
+                            panic!("node never became ready within 5s");
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) =&gt; panic!("unexpected read error: {e}"),
+                }
+            }
+
+            // (3) A linearizable write, then a linearizable + local read.
+            Arachne::set(b"hello", b"world").await?;
+            let value = Arachne::get(b"hello").await?;
+            assert_eq!(value, Some(b"world".to_vec()));
+            let stale = Arachne::get_stale(b"hello").await?;
+            assert_eq!(stale, Some(b"world".to_vec()));
+
+            // (4) Delete and confirm absence.
+            Arachne::delete(b"hello").await?;
+            assert_eq!(Arachne::get(b"hello").await, Ok(None));
+
+            // (5) Shut down: frees the static slot and releases the WAL lock.
+            Arachne::shutdown()?;
+            Ok(())
+        });
+
+    match output {
+        Ok(()) =&gt; println!("facade lifecycle complete"),
+        Err(e) =&gt; eprintln!("example failed: {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+</code></pre>
+      </div>
+
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          单实例、单节点是默认：第二次 <code>Arachne::new</code> 返回
+          <code>AlreadyInitialized</code>；<code>new</code> 之前（或 <code>shutdown</code>
+          之后）的静态读取返回 <code>NotInitialized</code>。多节点集群或成员管理请改用
+          <code>Runtime</code> / <code>Handle</code>（见 Tutorial）。
+        </p>
+      </div>
+
+      <h2>3. 运行示例</h2>
+      <p>仓库自带上面这个完整示例，直接运行：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">console</span></div>
+<pre><code data-lang="console">$ cargo run --example facade
+get(b"hello")          -&gt; Some(b"world")
+get_stale(b"hello")    -&gt; Some(b"world")
+get(b"hello") after del -&gt; None
+facade lifecycle complete
+</code></pre>
+      </div>
+      <p>
+        示例源码在 <code>arachne/examples/facade.rs</code>；想要更底层的裸装配，
+        看 <code>arachne/examples/single_node.rs</code>（Tutorial 有讲解）。
+      </p>
+
+      <h2>4. 可选：构建并运行参考节点</h2>
+      <p>
+        不想写任何胶水代码？工作区带了 <code>arachne-node</code> 二进制：它把库与 tonic 传输、
+        Hyper HTTP/1.1 服务器接在一起，是可运行的真实集群节点，也是嵌入 Arachne 的工作示例。
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">console</span></div>
+<pre><code data-lang="console">$ cargo build --release -p arachne-node
+$ arachne-node --config path/to/node.toml
+</code></pre>
+      </div>
+      <p>配置是一个 TOML 文件（字段与 <code>docker/bench/configs/n1.toml</code> 一致）：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">node.toml</span></div>
+<pre><code data-lang="toml">cluster_id = "arachne-bench"
+node_id = "n1"
+listen = "172.30.0.11:7001"        # raft peer port
+data_dir = "/data"
+http_listen = "0.0.0.0:8001"        # HTTP client port
+initial_cluster = [
+  "n1=172.30.0.11:7001",
+  "n2=172.30.0.12:7002",
+  "n3=172.30.0.13:7003",
+]
+profile = "lan"                     # "lan" or "wan"
+</code></pre>
+      </div>
+      <div class="callout warn">
+        <span class="callout-ico">!</span>
+        <p>
+          节点在 <code>initial_cluster</code> 里的<span class="nowrap">自身条目必须等于</span>
+          <code>listen</code>；配置 schema 目前只接受 IP 字面量。单机体验可以用本机地址写一份
+          <code>initial_cluster = ["n1=127.0.0.1:7001", …]</code> 的配置。
+        </p>
+      </div>
+
+      <h3>curl 接口速览</h3>
+      <p>节点起来后，KV 读写与运维接口都是纯 HTTP（详见 API Reference 的接口表）：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">console</span></div>
+<pre><code data-lang="console">$ curl -X PUT 'http://127.0.0.1:8001/kv/hello/world'   # -&gt; ok        (线性写)
+$ curl 'http://127.0.0.1:8001/kv/hello'                # -&gt; world     (ReadIndex 线性读)
+$ curl 'http://127.0.0.1:8001/kv/hello?stale=1'        # -&gt; world     (本地读)
+$ curl -X DELETE 'http://127.0.0.1:8001/kv/hello'      # -&gt; ok        (线性删)
+$ curl 'http://127.0.0.1:8001/readyz'                  # -&gt; ready
+$ curl 'http://127.0.0.1:8001/metrics'                 # Prometheus 文本格式
+</code></pre>
+      </div>
+
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          多进程部署下，非 leader 节点的 KV 写/读会返回 <strong>409 Conflict</strong>，body 带
+          leader 提示（如 <code>not leader; leader=n1 addr=172.30.0.11:7001</code>）；
+          <strong>503</strong> 表示当前无法服务（仲裁不可用 / 超时 / 忙），请求不会挂起。
+        </p>
+      </div>
+
+      <h2>5. 下一步</h2>
+      <div class="card-grid">
+        <a class="card card-link" href="tutorial.html">
+          <span class="card-tag">继续</span>
+          <h3>Tutorial</h3>
+          <p>理解一致性语义（ReadIndex / get_stale / CP）、facade 生命周期、多节点装配与成员管理。</p>
+        </a>
+        <a class="card card-link" href="api-reference.html">
+          <span class="card-tag">查阅</span>
+          <h3>API Reference</h3>
+          <p>全部方法签名、错误变体、配置字段与 HTTP 路由的权威索引。</p>
+        </a>
+      </div>
+
+      <nav class="page-nav" aria-label="分页">
+        <a href="index.html"><span class="pn-label">← 上一页</span><span class="pn-title">文档首页</span></a>
+        <a class="next" href="tutorial.html"><span class="pn-label">下一页 →</span><span class="pn-title">Tutorial</span></a>
+      </nav>
+    </article>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <span><strong>Arachne</strong> · transport-agnostic, linearizable key-value engine for Rust。</span>
+    <span><a href="quick-start.html">Quick Start</a></span>
+    <span><a href="tutorial.html">Tutorial</a></span>
+    <span><a href="api-reference.html">API Reference</a></span>
+    <span><a href="index.html">文档首页</a></span>
+    <span>内容源自仓库 <code>README.md</code> 与 <code>arachne*/src</code> 真实代码。</span>
+  </div>
+</footer>
+
+</body>
+</html>

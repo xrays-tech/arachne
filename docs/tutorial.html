@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Arachne Tutorial —— 渐进式教程：一致性语义、facade 生命周期、多节点装配、成员管理、底层 RaftNode 装配。">
+<title>Tutorial · Arachne 文档</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Karla:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/site.js" defer></script>
+<noscript><style>.sidebar{display:none}.code-copy{display:none}</style></noscript>
+</head>
+<body data-page="tutorial">
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="index.html">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="2.2"/>
+          <path d="M12 9.8V4M12 14.2V20M9.8 12H4M14.2 12H20M7 7l3.7 3.7M17 17l-3.7-3.7M17 7l-3.7 3.7M7 17l3.7-3.7"/>
+        </svg>
+      </span>
+      Arachne <span class="version-tag">docs</span>
+    </a>
+    <nav class="nav-links" aria-label="主导航">
+      <a data-nav="quick-start" href="quick-start.html"><span>Quick&nbsp;Start</span></a>
+      <a data-nav="tutorial" href="tutorial.html"><span>Tutorial</span></a>
+      <a data-nav="api-reference" href="api-reference.html"><span>API&nbsp;Reference</span></a>
+    </nav>
+  </div>
+</header>
+
+<button class="mobile-toc-toggle" id="toc-toggle" aria-expanded="false">显示本页目录</button>
+
+<div class="doc-wrap">
+  <aside class="sidebar" id="sidebar">
+    <p class="sidebar-title">本页目录</p>
+    <ul class="toc-list" id="toc-list"></ul>
+    <p class="sidebar-title">文档</p>
+    <ul class="toc-list">
+      <li><a class="toc-link is-h2" href="quick-start.html">Quick Start</a></li>
+      <li><a class="toc-link is-h2" href="tutorial.html">Tutorial</a></li>
+      <li><a class="toc-link is-h2" href="api-reference.html">API Reference</a></li>
+    </ul>
+  </aside>
+
+  <main class="content animate">
+    <article>
+      <p class="page-kicker">Tutorial</p>
+      <h1>从嵌入到多节点：渐进式上手</h1>
+      <p class="lede">
+        这一节从“为什么这样设计”讲起：先建立一致性直觉（ReadIndex、get_stale、CP），再走一遍
+        <code>server::Arachne</code> 的完整生命周期，最后拆开参考节点，看
+        <code>RaftNode</code> + <code>WalStorage</code> + <code>Runtime</code> + <code>Handle</code>
+        是怎么真实装配起来的。
+      </p>
+
+      <h2>1. 它由什么组成</h2>
+      <p>
+        Arachne 首先是一个<strong>库</strong>。共识、WAL 和 KV 状态机构成 <code>arachne</code> 核心；
+        核心只面向 <em>seam</em> 特征（<code>Transport</code>、<code>Storage</code>、
+        <code>StateMachine</code>、<code>Clock</code>、<code>Rng</code>、
+        <code>FsyncObserver</code>……）编程，核心内没有任何具体时钟、RNG、网络代码或文件 I/O。
+        具象的传输由嵌入方插进来——生产环境用 <code>arachne-transport-tonic</code>，测试用内存传输。
+      </p>
+      <div class="card-grid">
+        <div class="card">
+          <span class="card-tag">嵌入方</span>
+          <h3>你的进程</h3>
+          <p>创建节点、持有 <code>Handle</code>、发起读写与成员操作；嵌入方只与库的公开 API 交互。</p>
+        </div>
+        <div class="card">
+          <span class="card-tag">核心</span>
+          <h3>arachne</h3>
+          <p>raft 共识 + WAL + KV 状态机。传输无关，<code>--no-default-features</code> 时零外部 crate。</p>
+        </div>
+        <div class="card">
+          <span class="card-tag">传输</span>
+          <h3>arachne-transport-tonic</h3>
+          <p>tonic / HTTP-2 / rustls。由 <code>transport-tonic</code> 特性启用的具象传输。</p>
+        </div>
+        <div class="card">
+          <span class="card-tag">参考节点</span>
+          <h3>arachne-node</h3>
+          <p>把存储 + 传输 + HTTP 接好的二进制：跑真实集群、当嵌入范例，两用。</p>
+        </div>
+      </div>
+
+      <h2>2. 一致性语义：先说清楚再写代码</h2>
+      <p>操作集刻意保持小而明确；下表与 <code>arachne/src/client/mod.rs</code> / README 完全一致：</p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>Operation</th><th>语义</th><th>实现</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>put</code> / <code>delete</code></td>
+              <td><span class="badge badge-teal">线性化写</span></td>
+              <td>追加到 raft 日志，仲裁持久化后提交，应用于状态机后应答。</td>
+            </tr>
+            <tr>
+              <td><code>get</code></td>
+              <td><span class="badge badge-teal">线性化读（默认）</span></td>
+              <td><strong>ReadIndex</strong>：leader 上经仲裁确认的读，在 <code>applied &ge; read_index</code> 后服务；非 leader 返回 <code>NotLeader</code> 并被重定向。</td>
+            </tr>
+            <tr>
+              <td><code>get_stale</code></td>
+              <td><span class="badge badge-amber">允许任意陈旧</span></td>
+              <td>直接读本地状态机；跨调用<strong>不保证单调</strong>。</td>
+            </tr>
+            <tr>
+              <td>失去仲裁</td>
+              <td><span class="badge badge-red">写/线性读 → 失败</span></td>
+              <td>CheckQuorum + leader 主动退位：<code>get</code>/<code>put</code> 返回 <code>QuorumUnavailable</code>，<code>get_stale</code> 继续可用。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>ReadIndex 线性读</h3>
+      <p>
+        线性化读<strong>不依赖</strong> leader lease 或时钟漂移边界。请求被路由到当前 leader
+        （非 leader 返回 <code>NotLeader</code> 并带 leader 提示），leader 先以一轮仲裁心跳
+        确认自己仍居主导地位，等读索引应用到状态机后再返回值。整个操作被一个有界 deadline
+        约束（超时为 <code>Timeout</code>）。
+      </p>
+
+      <h3>get_stale 的“陈旧”是怎么回事</h3>
+      <p>
+        <code>get_stale</code> 直接读本节点的已应用状态机：任何节点都能答（无需重定向），
+        可以陈旧，而且文档明确写为<strong>不保证单调</strong>——连续两次调用可能看到乱序的值。
+        它的价值在于即使失去仲裁也能读，是 CP 系统的“可降级读性”出口。
+      </p>
+
+      <h3>CP：宁可失败，不裂脑</h3>
+      <p>
+        Arachne 是 <strong>CP</strong> 系统：任何时刻至多一个 leader；写与线性读都需要仲裁；
+        失去仲裁时每个线性化操作都失败（<code>QuorumUnavailable</code>），而不是退化为
+        读多写少或分裂脑。错误是显式、带类型的（详见第 8 节与 API Reference）。
+      </p>
+
+      <h2>3. 嵌入：facade 生命周期</h2>
+      <p>
+        <code>arachne::server</code> 提供一个“零 tokio、单实例”的 facade：进程内一个节点，
+        挂在全局静态槽上。完整程序在 Quick Start，这里拆开生命周期讲每一步的<strong>为什么</strong>。
+      </p>
+
+      <h3>① new —— 引导单节点</h3>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">// One node per process. 同步调用：绑定即装配完成。
+Arachne::new(1, &amp;dir, WalConfig::default())?;
+</code></pre>
+      </div>
+      <p>
+        <code>data_dir</code> 按需创建；WAL 的数据目录锁被获取并持有到节点生命周期结束。
+        节点运行在自己的独立线程（current-thread tokio runtime）上，调用方从不轮询 runtime。
+        以 <code>{self}</code> 作为唯一投票集（raft 的 <code>is_singleton</code> 路径），
+        所以节点第一个 tick 就自选为 leader，线性读免去仲裁轮。
+      </p>
+
+      <h3>② 等选主 —— 一个有界轮询</h3>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">// Pre-election reads fail fast (fast non-leader redirect). Poll until Ok.
+let deadline = Instant::now() + Duration::from_secs(5);
+loop {
+    match Arachne::get(b"hello").await {
+        Ok(v) =&gt; break,                       // 成为 leader，读到 None（键未设置）
+        Err(ArachneError::NotLeader { .. })
+        | Err(ArachneError::QuorumUnavailable) =&gt; {
+            if Instant::now() &gt;= deadline { panic!("node never became ready within 5s"); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(e) =&gt; panic!("unexpected read error: {e}"),
+    }
+}
+</code></pre>
+      </div>
+      <p>
+        为什么会有这步？<code>get</code> 需要 leader。<code>new</code> 是同步的，但选主是
+        异步发生的；等第一个线性读成功，节点才算真正就绪。这正是 Quick Start 示例
+        <code>facade.rs</code> 的处理。
+      </p>
+
+      <h3>③ 读写 —— set / get / get_stale / delete</h3>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">Arachne::set(b"hello", b"world").await?;          // 线性化写
+let value = Arachne::get(b"hello").await?;          // ReadIndex 线性化读
+let stale = Arachne::get_stale(b"hello").await?;    // 本地（弱）读
+Arachne::delete(b"hello").await?;                   // 线性化删除
+assert_eq!(Arachne::get(b"hello").await, Ok(None));
+</code></pre>
+      </div>
+
+      <h3>④ shutdown —— 显式收尾</h3>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">// Frees the static slot and releases the WAL lock. 再次调用返回 NotInitialized。
+Arachne::shutdown()?;
+</code></pre>
+      </div>
+      <p>
+        节点<span class="nowrap">不会</span>随 <code>Arachne</code> 标记对象丢弃而关闭——该标记只是
+        装饰性的；必须显式 <code>shutdown()</code> 来释放数据目录锁并 join 线程。
+      </p>
+
+      <h2>4. Handle：完整的客户端表面</h2>
+      <p>
+        facade 的五个静态方法背后其实都是一个 <code>Handle</code>。需要更多能力时，用
+        <code>Arachne::handle()</code> 逃逸出口拿一个克隆（共享 actor 通道，clone 只是引用计数加一）：
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">let handle: Handle = Arachne::handle().await?;
+handle.put(b"k", b"v").await?;
+let (voters, learners) = handle.membership().await?;
+</code></pre>
+      </div>
+      <h3>重定向 / 重试策略</h3>
+      <p>
+        一次操作若返回 <code>NotLeader</code> 且带提示，<code>Handle</code> 会针对提示的进程内
+        对端（或在确定顺序中的下一个已知对端）重试：最多跟随
+        <code>Handle::MAX_REDIRECTS</code>（3）次重定向，整个尝试限定在一个选举超时的总
+        deadline 内，超时返回 <code>Timeout</code>；不知道 leader / 失去仲裁返回
+        <code>QuorumUnavailable</code>。客户端与节点共享进程，重定向是客户端侧的（节点保持无状态）。
+      </p>
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          <code>Handle::without_redirect()</code> 得到一个单发克隆，跳过整个重定向策略，
+          原样返回 <code>NotLeader{hint}</code>。参考节点的 HTTP 面用的正是它——多进程部署里
+          follower 应回答 <code>409 + leader 提示</code>，而不是塌缩成 <code>QuorumUnavailable</code>。
+        </p>
+      </div>
+
+      <h2>5. 多节点：参考节点怎么装配</h2>
+      <p>
+        多节点集群就不再用 facade，而是直接用 <code>Runtime</code> / <code>Handle</code>。
+        参考节点 <code>arachne-node</code> 的 <code>node.rs</code> 是权威装配示例，核心接线如下
+        （省略调优参数）：WAL → tonic 传输 → <code>Runtime</code> actor → 线程。
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">// 1) 打开 WAL（数据目录锁取在节点生命周期）
+let wal = WalStorage::open(
+    &amp;config.data_dir,
+    WalOptions {
+        cluster_id: config.cluster_id.clone(),
+        node_id: config.node_id.as_str().to_string(),
+        config: WalConfig {
+            fsync_policy: profile.fsync_policy,
+            segment_bytes: profile.wal_segment_bytes,
+        },
+        created_at_millis: now_millis(),
+        fsync_observer: None,
+    },
+)?;
+
+// 2) tonic 传输：factory 拥有集群身份与地址表，只绑定本进程自己的 listener
+let factory = TonicTransportFactory::new(
+    config.cluster_id.clone(), 1, 0, Vec::new(), config.addresses.clone(),
+);
+factory.start_with_bind(config.node_id.clone(), config.listen).await?;
+let (tx, rx) = factory.create(config.node_id.clone());
+
+// 3) 运行时配置：其他成员的 raft id = initial_cluster 中的 1 基下标
+let runtime_config = RuntimeConfig {
+    self_raft_id: config.raft_id,
+    self_node_id: config.node_id.clone(),
+    peers,
+    addresses: config.addresses.clone(),
+    raft: RaftNodeConfig::from_profile(profile),
+    profile: profile.clone(),
+    metrics: Arc::clone(&amp;metrics),
+};
+
+// 4) 装配 actor 并拿到客户端 Handle；actor 做阻塞式 fsync，独占一条 OS 线程
+let (runtime, handle) = Runtime::new(runtime_config, wal, tx, rx, &amp;logger)?;
+let _thread = runtime.spawn_dedicated()?;
+</code></pre>
+      </div>
+      <p>HTTP 面则用一个单发 handle 挂在 Hyper HTTP/1.1 服务后面：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">let handler = Arc::new(NodeHttp {
+    metrics: Arc::clone(&amp;metrics),
+    kv: node.handle().without_redirect(),   // follower 回答 409 + leader 提示
+});
+// tokio::net::TcpListener::bind(config.http_listen).await?;
+// http::serve(listener, handler, shutdown).await?;
+</code></pre>
+      </div>
+      <p>
+        优雅关闭的顺序有讲究：先停 HTTP，再关 tonic factory（关闭入站流，结束 actor 的
+        <code>recv</code>），最后 join actor 线程（drop WAL、释放数据目录锁）。
+        另有一个 <code>force-recovery</code> 子命令实现手工单节点恢复
+        （<code>arachne-node force-recovery --help</code>）。
+      </p>
+
+      <h2>6. 成员管理</h2>
+      <p>
+        成员操作要走 leader（成员变更附加到日志、经仲裁持久化），所以客户端 API 与 HTTP / CLI
+        一一对应。一次成功的成员变更只在<strong>已应用</strong>（持久化）后应答，而不只是已提出——
+        所以 <code>200</code> 之后立刻读 <code>/members</code> 就能看到新配置。
+      </p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>操作</th><th>Handle 方法</th><th>HTTP</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>加 learner（不投票，只追日志）</td>
+              <td><code>add_learner(node_id)</code></td>
+              <td><code>POST /members/add-learner/&lt;id&gt;</code></td>
+            </tr>
+            <tr>
+              <td>把追平的 learner 提升为投票成员</td>
+              <td><code>promote_learner(node_id)</code></td>
+              <td><code>POST /members/promote/&lt;id&gt;</code></td>
+            </tr>
+            <tr>
+              <td>移除成员（leader 会先移交领导权）</td>
+              <td><code>remove_member(node_id)</code></td>
+              <td><code>POST /members/remove/&lt;id&gt;</code></td>
+            </tr>
+            <tr>
+              <td>移交领导权给指定成员</td>
+              <td><code>transfer_leader(node_id)</code></td>
+              <td><code>POST /members/transfer-leader/&lt;id&gt;</code></td>
+            </tr>
+            <tr>
+              <td>读当前成员（<code>(voters, learners)</code>）</td>
+              <td><code>membership()</code></td>
+              <td><code>GET /members</code> → <code>voters=1,2,3 learners=4</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>几条纪律值得记住：</p>
+      <ul>
+        <li><strong>单发事务</strong>：同一时刻至多一个成员变更在进行，第二个会被 <code>ConfChangePending</code> 拒绝；普通写不受影响。</li>
+        <li><strong>先追平再提升</strong>：learner 落后超过阈值（或从未应答 leader）时提升会被 <code>LearnerNotCaughtUp{behind, threshold}</code> 拒绝——把日志不完整的节点放进仲裁会破坏安全。</li>
+        <li><strong>移除 leader 是两步</strong>：自动先把领导权移交给其他投票者，再由新 leader 提出移除；无仲裁 / 无人可移交时移除失败且<strong>什么都没提出</strong>。</li>
+      </ul>
+      <p>CLI 子命令与这些操作一一对应（子命令在二进制名之后）：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">console</span></div>
+<pre><code data-lang="console">$ arachne-node add-learner --config node2.toml --id 4
+$ arachne-node promote --config node2.toml --id 4       # 等 4 追平再提升
+$ arachne-node members --config node2.toml              # 读回已应用成员
+$ arachne-node remove --config node2.toml --id 4
+$ arachne-node transfer-leader --config node3.toml --id 1
+# --http &lt;ip:port&gt; 可覆盖配置里的 http_listen（该端口为 0 时用）
+</code></pre>
+      </div>
+      <p>变更类子命令 <code>--id</code> 必填（读操作 <code>members</code> 不需要）；完整形态如下（子命令在二进制名之后）：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">console</span></div>
+<pre><code data-lang="console">arachne-node add-learner|promote|remove|transfer-leader|members --config &lt;path.toml&gt; [--id &lt;raft-id&gt;] [--http &lt;ip:port&gt;]
+</code></pre>
+      </div>
+      <p>
+        这些运维命令不跟随 leader 提示——<code>409</code> body 里会告诉你该指哪个节点。
+        <code>transfer-leader</code> 须在领导权<strong>真正移交后</strong>才应答。
+      </p>
+
+      <h2>7. 底层单节点：RaftNode + WalStorage + KvStateMachine</h2>
+      <p>
+        想知道“核心”长什么样？<code>single_node.rs</code> 展示了最小完整嵌入：打开真实
+        <code>WalStorage</code>，在无对端的内联传输上装配 <code>RaftNode</code>，自己驱动
+        Ready 循环直到选主并提交一条 <code>Put</code>。没有测试脚手架、没有异步 runtime。
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">rust</span></div>
+<pre><code data-lang="rust">use arachne::consensus::RaftNode;
+use arachne::state_machine::KvStateMachine;
+use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne::{StateMachine, Transport, TransportRx};
+
+type Node = RaftNode&lt;WalStorage, NullTx, NullRx&gt;;
+
+fn wal_opts() -&gt; WalOptions {
+    WalOptions {
+        cluster_id: "example".into(),
+        node_id: "n1".into(),
+        config: WalConfig {
+            fsync_policy: FsyncPolicy::Always,
+            segment_bytes: 1 &lt;&lt; 20,
+        },
+        created_at_millis: 1_700_000_000_000,
+        fsync_observer: None,
+    }
+}
+
+let wal = WalStorage::open(&amp;dir, wal_opts()).expect("WAL must open");
+let mut node = RaftNode::new(
+    1,
+    HashMap::new(),        // single node: the bootstrap voter set is {self}
+    wal,
+    NullTx,
+    NullRx,
+    0,                     // applied: 0 for a fresh node
+    &amp;Logger::root(slog::Discard.fuse(), o!()),
+)
+.expect("node must assemble");
+let mut sm = KvStateMachine::new();
+
+// One Ready cycle: tick, step, apply committed entries, advance apply.
+fn drive(node: &amp;mut Node, sm: &amp;mut KvStateMachine) {
+    node.tick();
+    let entries = block_on(node.step())
+        .expect("Ready cycle must succeed")
+        .committed;
+    for (index, _kind, data) in entries {
+        sm.apply(index, &amp;data).expect("applying a committed entry must succeed");
+    }
+    node.advance_apply();
+}
+
+// 自选为 leader（单节点：前几个周期内就能选上）
+for _ in 0..500 {
+    drive(&amp;mut node, &amp;mut sm);
+    if node.leader_id() == 1 { break; }
+}
+
+// 提议一条 Put（状态机编码），驱动到提交并应用
+let cmd = KvStateMachine::encode_put(1, 1, b"key", b"value");
+node.propose(&amp;cmd).expect("propose must succeed on the leader");
+for _ in 0..500 {
+    drive(&amp;mut node, &amp;mut sm);
+    if sm.get(b"key").expect("read must succeed") == Some(b"value".to_vec()) { break; }
+}
+</code></pre>
+      </div>
+      <p>
+        注意这里的传输是两个自定义 half：<code>NullTx</code>（每个 <code>send</code> 立即失败，
+        因为没有对端）与 <code>NullRx</code>（<code>recv</code> 永不返回）。真实部署时它们换成
+        tonic 的 <code>TonicTransport</code> / <code>TonicRx</code>。嵌入方也可以只驱动
+        <code>Runtime</code> actor（第 5 节）而完全不用自己管 Ready 循环。
+      </p>
+
+      <h2>8. 错误类型</h2>
+      <p>
+        所有操作都是 <code>Result&lt;_, ArachneError&gt;</code>，错误显式且带类型。最常用的：
+      </p>
+      <ul>
+        <li><code>NotLeader { leader_hint }</code> —— 非 leader；提示（可能过期）给出 leader 及其地址，客户端应重定向。</li>
+        <li><code>QuorumUnavailable</code> —— 失去仲裁：leader 已退位、无已知 leader，或 ReadIndex 仲裁轮失败。</li>
+        <li><code>Timeout</code> —— 有界等待耗尽，<strong>结果未知</strong>：写可能落也可能没落。</li>
+        <li><code>Busy</code> —— 背压：提议队列或读等待队列满，重试即可，非致命。</li>
+        <li><code>SessionTableFull</code> / <code>SessionExpired</code> —— 写会话表机制。</li>
+        <li><code>ShuttingDown</code> / <code>Unrecoverable</code> —— 节点关停 / 致命存储错误（进程应 fail-stop）。</li>
+      </ul>
+      <p>完整 16 个变体、各字段与 HTTP 状态码映射见 <a href="api-reference.html">API Reference</a>。</p>
+
+      <h2>9. 下一步</h2>
+      <div class="card-grid">
+        <a class="card card-link" href="quick-start.html">
+          <span class="card-tag">回到</span>
+          <h3>Quick Start</h3>
+          <p>完整最小程序与参考节点 curl 速览。</p>
+        </a>
+        <a class="card card-link" href="api-reference.html">
+          <span class="card-tag">查阅</span>
+          <h3>API Reference</h3>
+          <p>全部方法签名、错误变体、配置字段与 HTTP 路由。</p>
+        </a>
+      </div>
+
+      <nav class="page-nav" aria-label="分页">
+        <a href="quick-start.html"><span class="pn-label">← 上一页</span><span class="pn-title">Quick Start</span></a>
+        <a class="next" href="api-reference.html"><span class="pn-label">下一页 →</span><span class="pn-title">API Reference</span></a>
+      </nav>
+    </article>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <span><strong>Arachne</strong> · transport-agnostic, linearizable key-value engine for Rust。</span>
+    <span><a href="quick-start.html">Quick Start</a></span>
+    <span><a href="tutorial.html">Tutorial</a></span>
+    <span><a href="api-reference.html">API Reference</a></span>
+    <span><a href="index.html">文档首页</a></span>
+    <span>内容源自仓库 <code>README.md</code> 与 <code>arachne*/src</code> 真实代码。</span>
+  </div>
+</footer>
+
+</body>
+</html>

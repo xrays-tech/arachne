@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Arachne API Reference —— server::Arachne 全方法、client::Handle 全客户端 API、WalConfig、ArachneError 16 变体、HTTP 接口表。">
+<title>API Reference · Arachne 文档</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Karla:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/site.js" defer></script>
+<noscript><style>.sidebar{display:none}.code-copy{display:none}</style></noscript>
+</head>
+<body data-page="api-reference">
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="index.html">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="2.2"/>
+          <path d="M12 9.8V4M12 14.2V20M9.8 12H4M14.2 12H20M7 7l3.7 3.7M17 17l-3.7-3.7M17 7l-3.7 3.7M7 17l3.7-3.7"/>
+        </svg>
+      </span>
+      Arachne <span class="version-tag">docs</span>
+    </a>
+    <nav class="nav-links" aria-label="主导航">
+      <a data-nav="quick-start" href="quick-start.html"><span>Quick&nbsp;Start</span></a>
+      <a data-nav="tutorial" href="tutorial.html"><span>Tutorial</span></a>
+      <a data-nav="api-reference" href="api-reference.html"><span>API&nbsp;Reference</span></a>
+    </nav>
+  </div>
+</header>
+
+<button class="mobile-toc-toggle" id="toc-toggle" aria-expanded="false">显示本页目录</button>
+
+<div class="doc-wrap">
+  <aside class="sidebar" id="sidebar">
+    <p class="sidebar-title">本页目录</p>
+    <ul class="toc-list" id="toc-list"></ul>
+    <p class="sidebar-title">文档</p>
+    <ul class="toc-list">
+      <li><a class="toc-link is-h2" href="quick-start.html">Quick Start</a></li>
+      <li><a class="toc-link is-h2" href="tutorial.html">Tutorial</a></li>
+      <li><a class="toc-link is-h2" href="api-reference.html">API Reference</a></li>
+    </ul>
+  </aside>
+
+  <main class="content animate">
+    <article>
+      <p class="page-kicker">API Reference</p>
+      <h1>API 参考</h1>
+      <p class="lede">
+        结构化、权威的真实 API 索引。所有签名、字段名与路由都来自 <code>arachne*/src</code>
+        源码与 <code>README.md</code>；标注 <code>async</code> 的方法返回 Rust <code>Future</code>。
+      </p>
+
+      <h2>1. crate 与模块地图</h2>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>crate / 模块</th><th>职责</th><th>本页覆盖</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>arachne::server</code></td><td>进程内嵌入 facade（零 tokio、单实例）</td><td>第 2 节：<code>Arachne</code></td></tr>
+            <tr><td><code>arachne::client</code></td><td>客户端 API 层：错误模型与 <code>Handle</code></td><td>第 3 节 <code>Handle</code>、第 5 节 <code>ArachneError</code></td></tr>
+            <tr><td><code>arachne::storage</code></td><td>WAL、段、同步、CRC</td><td>第 4 节：<code>WalConfig</code> / <code>WalOptions</code></td></tr>
+            <tr><td><code>arachne::consensus</code></td><td>raft 节点（<code>RaftNode</code>）与节点配置</td><td>教程第 7 节</td></tr>
+            <tr><td><code>arachne::state_machine</code></td><td>KV 状态机（<code>KvStateMachine</code>）</td><td>教程第 7 节</td></tr>
+            <tr><td><code>arachne::runtime</code></td><td>actor + 客户端 <code>Handle</code> 的宿主</td><td>教程第 5 节</td></tr>
+            <tr><td><code>arachne-node</code></td><td>参考节点二进制：HTTP、配置、成员运维面</td><td>第 6 节：HTTP 接口</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>2. server::Arachne —— 嵌入 facade</h2>
+      <p>
+        每个方法都是单节点、单实例语义：被调用的静态槽为空时返回 <code>NotInitialized</code>，
+        重复 <code>new</code> 返回 <code>AlreadyInitialized</code>。除 <code>new</code> 与
+        <code>shutdown</code> 外均为 <code>async</code>。模块同时重导出
+        <code>ArachneError</code>、<code>Handle</code>、<code>WalConfig</code>。
+      </p>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub fn new(node_id: u64, data_dir: &amp;Path, wal: WalConfig) -&gt; Result&lt;Arachne, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">同步</span></span>
+        </div>
+        <div class="desc">
+          <p>引导进程内单节点。<code>data_dir</code> 按需创建；WAL 数据目录锁被获取并持有到节点生命周期结束。第二次调用返回 <code>ArachneError::AlreadyInitialized</code>。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn set(key: &amp;[u8], value: &amp;[u8]) -&gt; Result&lt;(), ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span></span>
+        </div>
+        <div class="desc">
+          <p>提议一个线性化写（单节点上没有仲裁轮，因此很快）。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn get(key: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-mono">ReadIndex</span></span>
+        </div>
+        <div class="desc">
+          <p>线性化点读。需要 leader：仅在节点自选完成后服务（选主前返回 <code>NotLeader</code> / <code>QuorumUnavailable</code>，调用方轮询至 <code>Ok</code>）。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn get_stale(key: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-amber">本地读</span></span>
+        </div>
+        <div class="desc">
+          <p>本地（弱）读：直接读节点自身提交状态；在单节点上即使 ReadIndex 轮未完成也可用。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn delete(key: &amp;[u8]) -&gt; Result&lt;(), ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span></span>
+        </div>
+        <div class="desc">
+          <p>删除一个键（提议一个空值）。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn handle() -&gt; Result&lt;Handle, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-mono">转义出口</span></span>
+        </div>
+        <div class="desc">
+          <p>返回本地 <code>Handle</code> 的一个克隆，让嵌入代码能使用完整客户端 API（读、提议、成员变更……）。克隆廉价（共享 actor 通道），节点必须已初始化。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub fn shutdown() -&gt; Result&lt;(), ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">同步</span></span>
+        </div>
+        <div class="desc">
+          <p>把状态移出静态槽（先释放 facade 锁再 join，因为 join 会阻塞到 actor 丢弃 WAL 数据目录锁），随后停止并 join actor 线程。无可关闭对象时返回 <code>NotInitialized</code>；第二次调用仍返回 <code>NotInitialized</code>。</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          <code>new</code> 返回的 <code>Arachne</code> 是零字段标记：丢弃它是空操作（节点<strong>不会</strong>因此关闭），
+          与显式 <code>shutdown()</code> 刻意区分。
+        </p>
+      </div>
+
+      <h2>3. client::Handle —— 全客户端 API</h2>
+      <p>
+        <code>Handle</code> 是连接一个节点运行时 actor 的客户端入口，<code>Clone</code> 廉价
+        （包裹 <code>Arc</code>）。一次操作返回 <code>NotLeader</code> 时按提示重定向，
+        最多 <code>MAX_REDIRECTS</code>（3）次，总 deadline 为一个选举超时，超时返回
+        <code>Timeout</code>。正常情况下通过 <code>Runtime::new</code> 的返回值或
+        <code>Arachne::handle()</code> 获得。
+      </p>
+
+      <h3>读写操作（async）</h3>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>方法（签名）</th><th>语义</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>put(&amp;self, key: &amp;[u8], value: &amp;[u8]) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>线性化写。提议前按 profile 限制校验键/值（fail-stop：非法输入绝无机会进日志），然后等待提交 + 应用（有界 → <code>Timeout</code>）。</td>
+            </tr>
+            <tr>
+              <td><code>delete(&amp;self, key: &amp;[u8]) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>线性化删除，语义同 <code>put</code>。</td>
+            </tr>
+            <tr>
+              <td><code>get(&amp;self, key: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, ArachneError&gt;</code></td>
+              <td>线性化读。<strong>ReadIndex</strong>：重定向到当前 leader，leader 以一轮仲裁心跳确认仍居主导后，在读索引应用后服务。不依赖 lease 或时钟漂移。</td>
+            </tr>
+            <tr>
+              <td><code>get_stale(&amp;self, key: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, ArachneError&gt;</code></td>
+              <td>任意陈旧读：直接读本节点已应用状态机。任何节点可答（无重定向），可能陈旧，且<strong>不保证单调</strong>。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>成员操作（async）</h3>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>方法（签名）</th><th>语义</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>add_learner(&amp;self, node_id: RaftId) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>把 <code>node_id</code> 作为 <strong>learner</strong> 加入（收日志但不投票，不影响仲裁）。提升是单独的显式步骤。</td>
+            </tr>
+            <tr>
+              <td><code>promote_learner(&amp;self, node_id: RaftId) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>把已追平的 learner 提升为投票成员；落后或失联时返回 <code>LearnerNotCaughtUp</code>。</td>
+            </tr>
+            <tr>
+              <td><code>remove_member(&amp;self, node_id: RaftId) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>移除成员。移除<strong>当前 leader</strong> 会自动先移交领导权，再由新 leader 提出移除；移除失败时<strong>没有提出任何东西</strong>。</td>
+            </tr>
+            <tr>
+              <td><code>membership(&amp;self) -&gt; Result&lt;(Vec&lt;RaftId&gt;, Vec&lt;RaftId&gt;), ArachneError&gt;</code></td>
+              <td>返回已应用的成员关系 <code>(voters, learners)</code>。本地态读取：任何节点（含非 leader）都能答，仲裁丢失时也不会挂起。</td>
+            </tr>
+            <tr>
+              <td><code>transfer_leader(&amp;self, node_id: RaftId) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>把领导权移交给 <code>node_id</code>；在领导权<strong>真正移动</strong>（而非 raft 接受请求）后才返回。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p style="margin-top:14px;">成员变更的单发纪律：同一时刻至多一个成员变更在进行，第二个被 <code>ConfChangePending</code> 拒绝；普通写不受影响。</p>
+
+      <h3>重定向与元信息</h3>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>方法 / 常量</th><th>语义</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>without_redirect(&amp;self) -&gt; Handle</code></td>
+              <td>返回一个<strong>单发</strong>克隆：跳过整个重定向策略，原样返回 <code>NotLeader{hint}</code>。参考节点 HTTP 面用它把 leader 提示透传给外部调用者。</td>
+            </tr>
+            <tr>
+              <td><code>register_peer(&amp;self, peer: Handle)</code></td>
+              <td>注册一个进程内对端 handle，启用向它的客户端侧重定向。等所有 handle 构造完后再为每个对端调用。</td>
+            </tr>
+            <tr>
+              <td><code>node_id(&amp;self) -&gt; &amp;NodeId</code></td>
+              <td>该 handle 绑定的 <code>NodeId</code>。</td>
+            </tr>
+            <tr>
+              <td><code>leader_hint(&amp;self) -&gt; Option&lt;(NodeId, SocketAddr)&gt;</code></td>
+              <td>报告节点当前的 leader 提示：已知 leader 时返回其 <code>(NodeId, SocketAddr)</code>，否则 <code>None</code>（无 leader / 失仲裁）。受操作 deadline 约束。</td>
+            </tr>
+            <tr>
+              <td><code>const MAX_REDIRECTS: u32</code></td>
+              <td>单次操作跟随的最大重定向次数（当前为 3）。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>仅测试（<code>fault-injection</code> 特性）</h3>
+      <div class="callout warn">
+        <span class="callout-ico">!</span>
+        <p>
+          以下方法仅在启用 <code>fault-injection</code> 特性时编译，用于会话幂等与路由/门控测试，
+          <strong>不属于正常运行 API</strong>，发布构建不含它们。
+        </p>
+      </div>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>方法（签名）</th><th>用途</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>propose_raw(&amp;self, cmd: Vec&lt;u8&gt;, client_id: u64, seq_no: u64) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>在显式会话下提议一条原始状态机命令。<code>put</code>/<code>delete</code> 每次调用都会铸造新的 <code>seq_no</code>，无法复现“重试”这个幂等场景，此方法专供会话 TTL 测试。</td>
+            </tr>
+            <tr>
+              <td><code>propose_conf_change_raw(&amp;self, change_type: ConfChangeType, node_id: RaftId) -&gt; Result&lt;(), ArachneError&gt;</code></td>
+              <td>以低于公开 API 的层级驱动单步成员变更（例如在另一变更进行中时触发一个），走真实重定向循环。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>4. 存储配置：WalConfig / FsyncPolicy / WalOptions</h2>
+      <p><code>WalConfig</code> 是 facade（<code>Arachne::new</code>）与底层 <code>WalStorage::open</code> 共用的存储配置：</p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>fsync_policy</code></td>
+              <td><code>FsyncPolicy</code></td>
+              <td>条目（日志）记录的 fsync 策略。HardState 无论何种策略都<strong>总是</strong> fsync（不变式 I1）。</td>
+            </tr>
+            <tr>
+              <td><code>segment_bytes</code></td>
+              <td><code>u64</code></td>
+              <td>单个段文件在滚动前的最大字节数。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>FsyncPolicy</code> 有两个变体：</p>
+      <ul>
+        <li><code>FsyncPolicy::Always</code> —— 每次 <code>sync_entries</code> 都执行真实 <code>fsync</code>（默认）。</li>
+        <li><code>FsyncPolicy::BatchMs(u64)</code> —— 仅当自上次真实 fsync 以来出现新的（未同步）条目时才执行真实 fsync；<code>ms</code> 参数当前是<strong>建议性</strong>的，<code>sync_entries</code> 仍是同步持久化屏障。</li>
+      </ul>
+      <p><code>WalConfig::default()</code> 为 <code>FsyncPolicy::Always</code> + 默认段大小。底层 <code>WalStorage::open</code> 需要的完整选项结构是 <code>WalOptions</code>（教程第 5 / 7 节都有实例）：</p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>cluster_id</code></td><td><code>String</code></td><td>集群标识符。</td></tr>
+            <tr><td><code>node_id</code></td><td><code>String</code></td><td>节点标识符。</td></tr>
+            <tr><td><code>config</code></td><td><code>WalConfig</code></td><td>存储配置。</td></tr>
+            <tr><td><code>created_at_millis</code></td><td><code>u64</code></td><td>创建时间戳（自 Unix 纪元毫秒），由调用方提供——存储核心不读系统时钟。</td></tr>
+            <tr><td><code>fsync_observer</code></td><td><code>Option&lt;Arc&lt;dyn FsyncObserver&gt;&gt;</code></td><td>可选观察者：每次段真实 fsync 后被通知。默认 <code>None</code>（零开销）。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>5. ArachneError —— 全部 16 个变体</h2>
+      <p>
+        每个客户端操作（<code>put</code> / <code>delete</code> / <code>get</code> /
+        <code>get_stale</code>）都解析为一个值或其中一种错误。下表按用途分组，附真实
+        <code>Display</code> 文案与参考节点 HTTP 面映射。
+      </p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>变体</th><th>出现时机</th><th>HTTP 映射</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>NotLeader { leader_hint: Option&lt;(NodeId, SocketAddr)&gt; }</code></td><td>本节点不是 leader；提示（可能过期）指向当前 leader。客户端应重定向。</td><td><span class="nowrap">409 Conflict</span> + leader body</td></tr>
+            <tr><td><code>QuorumUnavailable</code></td><td>失去仲裁：leader 退位、无已知 leader，或 ReadIndex 仲裁轮失败。</td><td><span class="nowrap">503 Service Unavailable</span></td></tr>
+            <tr><td><code>Timeout</code></td><td>有界等待耗尽，<strong>结果未知</strong>（写可能已落）。</td><td><span class="nowrap">503</span></td></tr>
+            <tr><td><code>Busy</code></td><td>背压：提议队列或读等待队列满。非致命，稍后重试。</td><td><span class="nowrap">503</span></td></tr>
+            <tr><td><code>InvalidArgument(String)</code></td><td>键/值超限等。提议<strong>前</strong>拒绝，绝不进日志。</td><td><span class="nowrap">400 Bad Request</span></td></tr>
+            <tr><td><code>SessionExpired</code></td><td>会话过期或缓存结果被逐出，结果未知。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>SessionTableFull</code></td><td>会话表满，拒绝新会话（已有会话不受影响）。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>ConfChangePending</code></td><td>已有成员变更在飞行（单步 ConfChange 纪律）。重试<strong>同一请求</strong>即可。</td><td><span class="nowrap">409 Conflict</span></td></tr>
+            <tr><td><code>LeaderRemovalRequiresTransfer</code></td><td>移除当前 leader 需要先移交领导权，未获授权。</td><td><span class="nowrap">409 Conflict</span></td></tr>
+            <tr><td><code>LearnerNotCaughtUp { behind: u64, threshold: u64 }</code></td><td>learner 落后超过 <code>threshold</code> 或从未应答，提升被拒（防不完整日志入仲裁）。</td><td><span class="nowrap">412 Precondition Failed</span></td></tr>
+            <tr><td><code>ClusterIdMismatch</code></td><td>传输握手时对端 <code>cluster_id</code> 不匹配。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>ShuttingDown</code></td><td>节点正在关闭。</td><td><span class="nowrap">503</span></td></tr>
+            <tr><td><code>DataDirLocked</code></td><td>数据目录被另一进程锁定。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>Unrecoverable(String)</code></td><td>致命条件（存储损坏、状态机不变式被破坏……）。进程应 fail-stop。</td><td><span class="nowrap">500 Internal Server Error</span></td></tr>
+            <tr><td><code>AlreadyInitialized</code></td><td>本进程内 facade 已被初始化，礼貌拒绝第二个 <code>Arachne::new</code>。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>NotInitialized</code></td><td>在 <code>new</code> 前或 <code>shutdown</code> 后调用 facade 静态方法。</td><td><span class="nowrap">—</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          以 <code>SessionTableFull</code> / <code>SessionExpired</code> 开头的若干变体标注为
+          “M3” 里程碑的能力；现在的运行路径尚未产生它们，但变体列表已完整保留。
+        </p>
+      </div>
+
+      <h2>6. HTTP 接口（arachne-node）</h2>
+      <p>参考节点把 KV 读写、成员管理与运维探测暴露为纯 HTTP；值从路径取用（URL 安全的 ASCII，body 解析尚未实现）。</p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>方法与路径</th><th>含义</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>PUT /kv/&lt;key&gt;/&lt;value&gt;</code></td><td>在 <code>key</code> 下写入 <code>value</code>（线性化）。</td></tr>
+            <tr><td><code>DELETE /kv/&lt;key&gt;</code></td><td>删除 <code>key</code>（线性化）。</td></tr>
+            <tr><td><code>GET /kv/&lt;key&gt;</code></td><td>经 ReadIndex 的线性化读。</td></tr>
+            <tr><td><code>GET /kv/&lt;key&gt;?stale=1</code></td><td>陈旧读（本地状态机，任何节点可答）。</td></tr>
+            <tr><td><code>GET /members</code></td><td>当前成员关系，如 <code>voters=1,2,3 learners=4</code>（本地态，任何节点可答）。</td></tr>
+            <tr><td><code>POST /members/add-learner/&lt;id&gt;</code></td><td>添加一个 learner。</td></tr>
+            <tr><td><code>POST /members/promote/&lt;id&gt;</code></td><td>提升一个已追平的 learner。</td></tr>
+            <tr><td><code>POST /members/remove/&lt;id&gt;</code></td><td>移除一个成员（leader 先移交领导权）。</td></tr>
+            <tr><td><code>POST /members/transfer-leader/&lt;id&gt;</code></td><td>移交领导权。</td></tr>
+            <tr><td><code>GET /readyz</code></td><td>就绪探测（<code>ready</code> / <code>not ready</code>）。</td></tr>
+            <tr><td><code>GET /metrics</code></td><td>Prometheus 格式计数/计量（raft、WAL、read-index）。</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>错误映射为 HTTP 状态码 + 纯文本 body：</p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>状态码</th><th>场景</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>409 Conflict</code></td><td><code>NotLeader</code>（body 带 <code>leader=… addr=…</code> 提示，进到 <code>NotLeader</code> 说明请求打到非 leader）/ <code>ConfChangePending</code> / <code>LeaderRemovalRequiresTransfer</code>。</td></tr>
+            <tr><td><code>503 Service Unavailable</code></td><td><code>QuorumUnavailable</code> / <code>Busy</code> / <code>Timeout</code> / <code>ShuttingDown</code> —— 此刻<strong>不是</strong>服务能力问题，请求不会挂起。</td></tr>
+            <tr><td><code>412 Precondition Failed</code></td><td><code>LearnerNotCaughtUp</code>（请求合法，重试原样无效）。</td></tr>
+            <tr><td><code>400 Bad Request</code></td><td><code>InvalidArgument</code>，以及路径形态错误（如 <code>PUT /kv/</code> 没有 <code>key/value</code>）。</td></tr>
+            <tr><td><code>500 Internal Server Error</code></td><td>其余未分类的存储/内部错误。</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        一次成功的成员变更只在<strong>已应用</strong>（持久化）后应答，因此 <code>200</code> 之后
+        读 <code>/members</code> 即可看到新配置。<code>GET /readyz</code>/<code>/metrics</code> 之外的
+        方法会得到 <code>405</code>；未知路径为 <code>404</code>。
+      </p>
+
+      <h2>7. 源码索引</h2>
+      <p>本页每一项都可以在仓库源码中直接核验：</p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>本节</th><th>权威来源</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>第 2 节 <code>server::Arachne</code></td><td><code>arachne/src/server.rs</code></td></tr>
+            <tr><td>第 3 节 <code>client::Handle</code></td><td><code>arachne/src/client/handle.rs</code></td></tr>
+            <tr><td>第 4 节 <code>WalConfig</code> / <code>WalOptions</code></td><td><code>arachne/src/storage/wal.rs</code></td></tr>
+            <tr><td>第 5 节 <code>ArachneError</code></td><td><code>arachne/src/client/mod.rs</code>；HTTP 映射见 <code>arachne-node/src/main.rs</code> 的 <code>map_error</code></td></tr>
+            <tr><td>第 6 节 HTTP 接口</td><td><code>arachne-node/src/main.rs</code> 的 <code>handle_kv</code> / <code>handle_members</code> / <code>/readyz</code> / <code>/metrics</code>；README「HTTP interface」表</td></tr>
+            <tr><td>示例</td><td><code>arachne/examples/facade.rs</code>、<code>arachne/examples/single_node.rs</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <nav class="page-nav" aria-label="分页">
+        <a href="tutorial.html"><span class="pn-label">← 上一页</span><span class="pn-title">Tutorial</span></a>
+        <a class="next" href="index.html"><span class="pn-label">文档首页 →</span><span class="pn-title">Index</span></a>
+      </nav>
+    </article>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <span><strong>Arachne</strong> · transport-agnostic, linearizable key-value engine for Rust。</span>
+    <span><a href="quick-start.html">Quick Start</a></span>
+    <span><a href="tutorial.html">Tutorial</a></span>
+    <span><a href="api-reference.html">API Reference</a></span>
+    <span><a href="index.html">文档首页</a></span>
+    <span>内容源自仓库 <code>README.md</code> 与 <code>arachne*/src</code> 真实代码。</span>
+  </div>
+</footer>
+
+</body>
+</html>
