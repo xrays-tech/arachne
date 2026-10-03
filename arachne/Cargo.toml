@@ -61,11 +61,20 @@ libc = "0.2"
 # for integration tests. This is a dev-dependency only (enforced by
 # scripts/check-deps.sh Gate A: production crates may only pull in
 # arachne-testsupport via [dev-dependencies]).
-arachne-testsupport = { workspace = true }
-# The client/runtime integration tests are async (`#[tokio::test]`) and await
-# commands against a running runtime actor; `tokio` is dev-only (the core itself
-# is runtime-agnostic).
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-# NOTE: integration tests (`tests/`) are part of this package and can therefore
-# use the normal `[dependencies]` directly (`slog`, `raft`, ...). No extra
-# dev-dependency entries are needed for those.
+        arachne-testsupport = { workspace = true }
+        # The client/runtime integration tests are async (`#[tokio::test]`) and await
+        # commands against a running runtime actor; `tokio` is dev-only (the core itself
+        # is runtime-agnostic).
+        tokio = { version = "1", features = ["rt", "macros", "time", "net", "rt-multi-thread", "signal"] }
+        # Dev-only: the `axum_http` example (examples/axum_http.rs) wraps the
+        # `arachne::server` facade in an axum HTTP service. axum is already in the
+        # lock (transitively via the tonic edge); listing it here adds no new
+        # external crate. It is dev-dependency-only, so the production
+        # `cargo tree -e normal` (check-deps Gates A/B/C) is unaffected. A plain
+        # `axum` is all that is required: the example uses axum's default body type
+        # (`axum::body::Body`), and axum 0.7's `Router` is generic over the
+        # *state* (here the default `()`, trivially `Clone`/`Send`), not the body.
+        axum = "0.7"
+        # NOTE: integration tests (`tests/`) are part of this package and can therefore
+        # use the normal `[dependencies]` directly (`slog`, `raft`, ...). No extra
+        # dev-dependency entries are needed for those.

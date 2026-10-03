@@ -17,7 +17,11 @@ gating (B1/B2/B3: hyper HTTP + WAL `fdatasync` + WAL group commit).
 - `configs/n{1,2,3}.toml` — per-node cluster config (node_id, listen, http_listen,
   initial_cluster, profile).
 - `driver/bench.py` — stdlib-only benchmark driver (leader discovery, 3-node
-  replication check, put / linear read / stale read throughput + p50/p99).
+   replication check, put / linear read / stale read throughput + p50/p99).
+- `driver/bench_go.go` — host-side **Go** client benchmark for the Lane 3 client
+  ablation (see §"Go driver"): goroutine concurrency + per-worker keep-alive,
+  same calibration as `bench.py` / `docker/bench-etcd/driver/etcdbench.py`. Not
+  part of the `check-perf-baseline.sh` gate, which uses `bench.py`.
 
 ## Two ways to run it
 
@@ -193,3 +197,45 @@ Continuation (batch-rate observation, server side — see task report):
 For same-caliber comparisons against etcd, use the keep-alive driver (etcd's
 linearizable 4-way ≈ 2500 ops/s still exceeds arachne's 4-way 1384 under
 keep-alive, confirming a remaining server-side deficit rather than a client one).
+
+### Go driver (Lane 3: client-language ablation)
+
+`driver/bench_go.go` answers the question *"is arachne's 4-way read gap real
+server-side capacity, or a residual of the Python client?"* by re-running the
+same concurrent reads with a **Go** client — goroutine concurrency, no GIL, and a
+per-worker keep-alive connection pool — against the same in-network or host-published
+ports. It is a research tool (used for the Lane 3 comparison), *not* part of the
+`check-perf-baseline.sh` gate (which uses `bench.py`).
+
+It runs on the **host** and connects to already-mapped ports — no container, no
+cross-arch build needed:
+
+```bash
+# arachne (linear reads hit the leader; leader is auto-discovered via a probe write)
+go run ./bench_go.go --protocol arachne --workers 1,2,4,8 --n 400 --mode linear
+# etcd (any member can write; linearizable range)
+go run ./bench_go.go --protocol etcd    --workers 1,2,4,8 --n 400 --mode linear
+# 1-way put
+go run ./bench_go.go --protocol arachne --workers 1 --n 400 --mode put
+# --key <k> overrides the read/write key (arachne default "seed", etcd default "k0")
+# --keep-alive=false switches to fresh (per-request) connections
+```
+
+Calibration matches the Python drivers (`bench.py` and `docker/bench-etcd/driver/etcdbench.py`),
+so the numbers are directly comparable:
+
+- **strided workers** — worker `w` handles `range(w, n, workers)` (same as Python);
+- **one persistent keep-alive connection per worker** (each worker gets its own
+  `http.Client`/connection pool; `--keep-alive=false` disables it, matching
+  Python's fresh model);
+- **`dt`** = wall-clock from request send to response-body-read (ns);
+- **rps** = ok / (Σdt / 1e9); **p50/p99** use the same `rank = max(1, round(q*(n-1)))`
+  formula as `bench.py`.
+
+Output is one line per (mode, workers), prefixed `[go-bench]`, in the same shape as
+the Python table:
+
+```
+[go-bench] linear 4w: 2400 ops/s  p50 0.41ms p99 1.20ms  (400 ok / 400 attempted)
+[go-bench] === done ===
+```

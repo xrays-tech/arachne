@@ -169,12 +169,34 @@ get(b"hello") after del -&gt; None
 facade lifecycle complete
 </code></pre>
       </div>
-      <p>
-        示例源码在 <code>arachne/examples/facade.rs</code>；想要更底层的裸装配，
-        看 <code>arachne/examples/single_node.rs</code>（Tutorial 有讲解）。
-      </p>
+       <p>
+         示例源码在 <code>arachne/examples/facade.rs</code>；想要更底层的裸装配，
+         看 <code>arachne/examples/single_node.rs</code>（Tutorial 有讲解）。
+       </p>
 
-      <h2>4. 可选：构建并运行参考节点</h2>
+       <h3>HTTP 端点：axum 包裹示例</h3>
+       <p>
+         想让嵌入方只需一个 <code>#[tokio::main]</code> 和 <code>curl</code>？仓库自带
+         <code>arachne/examples/axum_http.rs</code>：它用 axum 把 facade 的
+         <code>set</code>/<code>get</code>/<code>get_stale</code>/<code>delete</code>
+         包成 <code>PUT /kv/&lt;key&gt;/&lt;value&gt;</code>、<code>GET /kv/&lt;key&gt;</code>、
+         <code>GET /kv/&lt;key&gt;?stale=1</code>、<code>DELETE /kv/&lt;key&gt;</code>
+         与 <code>GET /readyz</code>。axum 仅在 dev 依赖，<strong>不进入生产依赖</strong>。
+       </p>
+       <div class="code-block">
+         <div class="code-head"><span class="code-lang">console</span></div>
+<pre><code data-lang="console">$ cargo run --example axum_http
+# 打印: arachne HTTP server (facade) listening on 127.0.0.1:XXXXX
+# 另开一个终端（把 XXXXX 换成上面打印的端口）:
+$ curl -X PUT   http://127.0.0.1:XXXXX/kv/hello/world    # -> ok
+$ curl       http://127.0.0.1:XXXXX/kv/hello               # -> world
+$ curl 'http://127.0.0.1:XXXXX/kv/hello?stale=1'           # -> world
+$ curl -X DELETE http://127.0.0.1:XXXXX/kv/hello           # -> ok
+$ curl       http://127.0.0.1:XXXXX/readyz                  # -> ready
+</code></pre>
+       </div>
+       
+       <h2>4. 可选：构建并运行参考节点</h2>
       <p>
         不想写任何胶水代码？工作区带了 <code>arachne-node</code> 二进制：它把库与 tonic 传输、
         Hyper HTTP/1.1 服务器接在一起，是可运行的真实集群节点，也是嵌入 Arachne 的工作示例。

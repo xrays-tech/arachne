@@ -205,12 +205,19 @@ assert_eq!(Arachne::get(b"hello").await, Ok(None));
 Arachne::shutdown()?;
 </code></pre>
       </div>
-      <p>
-        节点<span class="nowrap">不会</span>随 <code>Arachne</code> 标记对象丢弃而关闭——该标记只是
-        装饰性的；必须显式 <code>shutdown()</code> 来释放数据目录锁并 join 线程。
-      </p>
-
-      <h2>4. Handle：完整的客户端表面</h2>
+       <p>
+         节点<span class="nowrap">不会</span>随 <code>Arachne</code> 标记对象丢弃而关闭——该标记只是
+         装饰性的；必须显式 <code>shutdown()</code> 来释放数据目录锁并 join 线程。
+       </p>
+       <p>
+         如果想把 facade 暴露在 HTTP 端点（而非直接调用静态方法），可用一个 Web 框架
+         包裹它：仓库自带 <code>examples/axum_http.rs</code>，把
+         <code>set</code>/<code>get</code>/<code>get_stale</code>/<code>delete</code>
+         映射到 <code>PUT</code>/<code>GET</code>/<code>GET?stale=1</code>/<code>DELETE</code>，
+         嵌入方只需 <code>#[tokio::main]</code> + <code>curl</code>（详见 Quick Start §3）。
+       </p>
+       
+       <h2>4. Handle：完整的客户端表面</h2>
       <p>
         facade 的五个静态方法背后其实都是一个 <code>Handle</code>。需要更多能力时，用
         <code>Arachne::handle()</code> 拿一个克隆（共享 actor 通道，clone 只是引用计数加一）：
