@@ -122,6 +122,15 @@ pub enum ArachneError {
     /// this.
     #[error("unrecoverable: {0}")]
     Unrecoverable(String),
+    /// The [`crate::server`] embedding facade has already been initialized in
+    /// this process. A second `Arachne::new` is politely refused; the node is
+    /// not overwritten. (In-process single-instance semantics.)
+    #[error("the Arachne facade is already initialized; a single node is active per process")]
+    AlreadyInitialized,
+    /// A [`crate::server`] static method was called before `Arachne::new`, or
+    /// after `Arachne::shutdown`. (In-process single-instance semantics.)
+    #[error("the Arachne facade is not initialized; call Arachne::new first")]
+    NotInitialized,
 }
 
 #[cfg(test)]
@@ -154,6 +163,8 @@ mod tests {
             ArachneError::ShuttingDown,
             ArachneError::DataDirLocked,
             ArachneError::Unrecoverable("corrupt".into()),
+            ArachneError::AlreadyInitialized,
+            ArachneError::NotInitialized,
         ] {
             check(&e);
         }
@@ -161,7 +172,9 @@ mod tests {
 
     #[test]
     fn variant_names_are_distinct() {
-        // The full §3.2 variant list is present (13 variants).
+        // The full variant list is present (16 variants, exhaustive: every
+        // `ArachneError` variant is named here so an added variant cannot
+        // slip through without this test catching it).
         let variants = vec![
             ArachneError::NotLeader { leader_hint: None },
             ArachneError::QuorumUnavailable,
@@ -172,15 +185,18 @@ mod tests {
             ArachneError::SessionTableFull,
             ArachneError::ConfChangePending,
             ArachneError::LeaderRemovalRequiresTransfer,
+            ArachneError::LearnerNotCaughtUp { behind: 0, threshold: 0 },
             ArachneError::ClusterIdMismatch,
             ArachneError::ShuttingDown,
             ArachneError::DataDirLocked,
             ArachneError::Unrecoverable(String::new()),
+            ArachneError::AlreadyInitialized,
+            ArachneError::NotInitialized,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for v in &variants {
             assert!(seen.insert(format!("{v:?}")), "duplicate variant name");
         }
-        assert_eq!(seen.len(), 13, "the full §3.2 variant list must be present");
+        assert_eq!(seen.len(), 16, "the full variant list must be present");
     }
 }

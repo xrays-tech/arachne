@@ -602,6 +602,47 @@ Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 
 **验证**：Go 驱动 `go build` + Arachne 3 节点 + etcd 3 节点集群起停（含 base64 修复，`seedWrite`/`discover` 均 base64 编码，读真实存在的 key）全绿；本 rev **无产品代码改动**（纯 docs + 新增 Go driver）。集群 `docker compose down -v`，无残留。
 
+### AA. v0.2.24：`arachne::server` 单实例内嵌 façade（E-rev，2026-10-03）
+
+> 注：单字母 rev 序列 A–Z 已耗尽，本 rev 起以 `AA`、`BB`… 续列。
+
+**背景**：此前嵌入须手工装配 `Runtime::new(config, storage, tx, rx, logger) + spawn_dedicated()`（参考 `single_node.rs`、`node.rs`）。本 rev 按 ora-2 规格新增一个**最小、零-tokio、单实例**的内嵌 façade（`arachne::server`），让嵌入方无需持有 tokio runtime、无需装配 node 即可驱动单进程单节点读写：`Arachne::new(raft_id, &data_dir, WalConfig)` + 静态异步 `set`/`get`/`get_stale`/`delete`/`handle`，显式 `shutdown()`。
+
+**实现**：
+- 新模块 `arachne::server`（`lib.rs` 增 `pub mod server`；根 re-export `server::Arachne`）。
+- **单实例**：`static INSTANCE: Mutex<Option<FacadeState>>`。节点生命周期（`new`/`shutdown`）是**同步**（同步装配 / join，不 await），数据面（`set`/`get`/`get_stale`/`delete`/`handle`）是 async。`new` 同步锁 `INSTANCE`，已 `Some` → `AlreadyInitialized`；`shutdown` 同步取出 `FacadeState`、在锁作用域结束**前释放锁**、再 `RuntimeThread::shutdown()` join（**锁不跨 join**，join 前锁已释放，避免死锁/目录锁竞争）。`FacadeState = { handle: Handle, thread: RuntimeThread }`。
+- **隐藏 runtime**：`Runtime::new` 后 `spawn_dedicated()`，actor 跑在独立线程 current-thread tokio runtime；嵌入方仅 await façade 静态方法，不轮询任何 runtime。
+- **无网络安全 transport**：`PeerlessTx`（`send` → `std::future::ready(Ok(()))`）+ `PeerlessRx`（`recv` → `std::future::pending()`）；`PeerlessTx: Clone + Send + Sync + 'static`、`PeerlessSendError: Error + Send + Sync + 'static + Debug + Clone + PartialEq + Eq`。
+- **新增 `ArachneError` 变体**（`client/mod.rs`）：`AlreadyInitialized`、`NotInitialized`（均为单元变体，`#[derive(…PartialEq, Eq, thiserror::Error)]`，`Display` 非空）。
+- 静态方法经 `borrow()`：锁 `INSTANCE` → `handle.clone()`（`Arc<HandleInner>` refcount bump，共享 actor channel）→ 释放锁；**await 全在锁外**。
+- 参数为 `WalConfig`（仅 `fsync_policy`/`segment_bytes`），非 `WalOptions`；`cluster_id`/`node_id` 内部派生（`format!("arachne-{node_id}")` / `node_id.to_string()`），`created_at_millis = SystemTime::now()`（生产路径合法，Gate C 仅约束 sim/tests 路径）。
+- **单实例 + 单节点**：`peers`/`addresses` 为空 → 初始 voter 集合 `{self}` → 首 tick 自选举；线性读走 `is_singleton` quorum-free 路径。`get` 预选举期 fast-path 返回 `NotLeader{..}` / `QuorumUnavailable`（不阻塞至完整 deadline）。
+- 逃生口 `handle()`：返回 `Handle` 克隆，允许嵌入方走完整客户端 API。
+- 文档：`README` Embedding 节替换为极简 façade 示例（"单实例/单节点 by default；多节点用 `Runtime`/`Handle` 直接"）。
+
+**测试**：`arachne/tests/server_facade.rs` · `facade_lifecycle_end_to_end`（`#[tokio::test]`，tempdir，零新依赖）：
+1. 预 init 读 → `NotInitialized`；
+2. `new` → 成功；二次 `new` → `AlreadyInitialized`；
+3. 轮询 `get` 直至 Ok（选举窗口，fast-path 不阻塞）；
+4. `set→get=Ok(Some)→get_stale=Ok(Some)→delete→get=Ok(None)`；
+5. `shutdown` → 后续读 `NotInitialized`；`shutdown` 幂等 → `NotInitialized`。
+
+**示例**：`arachne/examples/facade.rs`（`cargo run --example facade`）：独立 current-thread runtime（`.enable_time()`）上 `block_on` 驱动单节点生命周期，输出写/读/删除。
+
+**验证**：
+- `cargo test -p arachne` 全绿（含新测试）；`cargo build --package arachne --examples --tests` 绿。
+- `cargo run --example facade`：`get(b"hello") -> Some([119, 111, 114, 108, 100])`、`get_stale -> Some(…)`、删除后 `None`、`facade lifecycle complete`。
+- 门禁：`check-deps.sh`（零新依赖）、`check-entropy.sh`、`check-profile-knobs.sh`、`check-release-features.sh`、`check-dedup.sh`、`cargo build --locked`、`cargo test --workspace`、`cargo test --workspace --features fault-injection`。
+
+**决策**：
+- façade 参数为 `WalConfig` 而非 `WalOptions`（仅 WAL 配置；cluster/node identity 派生，避免与 node 身份耦合）。
+- 单实例语义：进程内一个 node；`new` 幂等失败（`AlreadyInitialized`）、`shutdown` 幂等失败（`NotInitialized`）；`shutdown` 后可重绑定（重初始化）。
+- `handle()` 逃生口暴露完整 `Handle`（不破坏单实例，仅克隆）。
+- `PeerlessTx/Rx` 为 out-of-network 安全 transport（无 peer 时 `send` 立即 `Ok(())`、`recv` `pending()`）。
+- 锁纪律：锁仅护 `handle.clone()` / `take()`，**不跨 await / join**。
+
+**后续**：多节点 façade（peer 注册 + `ConfChange` 桥接）留待后续 rev；`shutdown` 后重绑定重入 WAL 恢复需后续门禁验证。
+
 ## 1. 目标与非目标
 
 **目标**

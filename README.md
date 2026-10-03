@@ -19,23 +19,27 @@ arachne = { path = "…/arachne" }            # default: pulls tonic transport
 # arachne = { path = "…/arachne", default-features = false }
 ```
 
-Assemble a node from the pieces the library exposes — a WAL-backed storage, a transport's `(tx, rx)` halves, and a runtime. `Runtime::new` returns a local client `Handle`:
+For a single in-process node, `arachne::server` gives you a minimal facade —
+no tokio runtime to poll, no `Runtime`/`Handle` plumbing:
 
 ```rust,ignore
-use arachne::runtime::{Runtime, RuntimeConfig};
-use arachne::storage::{WalStorage, WalOptions};
+use arachne::server::{Arachne, WalConfig, ArachneError};
 
-let storage = WalStorage::open(&data_dir, WalOptions { /* … */ })?;
-// TonicTransportFactory::bind + create() -> (tx, rx), or any Transport impl
-let (tx, rx) = factory.create(node_id);
-let (runtime, handle) = Runtime::new(runtime_config, storage, tx, rx, &logger)?;
-let _thread = runtime.spawn_dedicated()?;   // runs the actor on its own thread
+// One node per process; the marker is decorative, the node lives for the
+// process and is shut down explicitly.
+let _server = Arachne::new(1, &data_dir, WalConfig::default())?;
 
-// Linearizable writes and reads:
-handle.put(b"key", b"value").await?;
-let v = handle.get(b"key").await?;          // ReadIndex read
-let v = handle.get_stale(b"key").await?;    // stale, local read
+Arachne::set(b"key", b"value").await?;
+let v = Arachne::get(b"key").await?;          // ReadIndex linearizable read
+let v = Arachne::get_stale(b"key").await?;    // local (weak) read
+Arachne::delete(b"key").await?;
+Arachne::shutdown();
 ```
+
+Single-instance, single-node by default: a second `Arachne::new` returns
+`AlreadyInitialized`; static reads before `new` (or after `shutdown`) return
+`NotInitialized`. For multi-node clusters or membership control, use `Runtime`
+/ `Handle` directly.
 
 `Handle` is the full client surface: `put` / `get` / `get_stale` / `delete`, membership operations (`add_learner`, `promote_learner`, `remove_member`, `transfer_leader`, `membership`), raw proposal hooks, and `leader_hint` for redirects. The complete assembly — including how to wire the tonic transport and an HTTP front-end — is the `arachne-node` binary's `node.rs`, which serves as the reference integration.
 

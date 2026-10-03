@@ -61,12 +61,14 @@ pub mod fault_injection;
 pub mod metrics;
 pub mod profile;
 pub mod runtime;
+pub mod server;
 pub mod state_machine;
 pub mod storage;
 
 pub use client::ArachneError;
 pub use metrics::Metrics;
 pub use runtime::{Command, Runtime, RuntimeConfig, RuntimeThread};
+pub use server::Arachne;
 
 pub use arachne_seam::seam;
 pub use arachne_seam::types;
