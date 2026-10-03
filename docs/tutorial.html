@@ -85,12 +85,12 @@
         <div class="card">
           <span class="card-tag">参考节点</span>
           <h3>arachne-node</h3>
-          <p>把存储 + 传输 + HTTP 接好的二进制：跑真实集群、当嵌入范例，两用。</p>
+          <p>把存储 + 传输 + HTTP 接好的二进制：既能跑真实集群，也可当作嵌入库的装配范例。</p>
         </div>
       </div>
 
       <h2>2. 一致性语义：先说清楚再写代码</h2>
-      <p>操作集刻意保持小而明确；下表与 <code>arachne/src/client/mod.rs</code> / README 完全一致：</p>
+      <p>操作集保持小而明确；下表与 <code>arachne/src/client/mod.rs</code> / README 完全一致：</p>
       <div class="table-wrap">
         <table class="doc-table">
           <thead>
@@ -133,10 +133,10 @@
       <p>
         <code>get_stale</code> 直接读本节点的已应用状态机：任何节点都能答（无需重定向），
         可以陈旧，而且文档明确写为<strong>不保证单调</strong>——连续两次调用可能看到乱序的值。
-        它的价值在于即使失去仲裁也能读，是 CP 系统的“可降级读性”出口。
+        它的价值在于失去仲裁时仍可读——这是 CP 系统在一致性与可用性之间的取舍。
       </p>
 
-      <h3>CP：宁可失败，不裂脑</h3>
+      <h3>CP 语义：失去仲裁时宁可失败</h3>
       <p>
         Arachne 是 <strong>CP</strong> 系统：任何时刻至多一个 leader；写与线性读都需要仲裁；
         失去仲裁时每个线性化操作都失败（<code>QuorumUnavailable</code>），而不是退化为
@@ -182,9 +182,9 @@ loop {
 </code></pre>
       </div>
       <p>
-        为什么会有这步？<code>get</code> 需要 leader。<code>new</code> 是同步的，但选主是
-        异步发生的；等第一个线性读成功，节点才算真正就绪。这正是 Quick Start 示例
-        <code>facade.rs</code> 的处理。
+        为什么需要这一步？<code>get</code> 需要 leader。<code>new</code> 是同步的，但选主是
+        异步发生的；等第一个线性读成功，节点才算真正就绪。Quick Start 的示例
+        <code>facade.rs</code> 也是这样处理的。
       </p>
 
       <h3>③ 读写 —— set / get / get_stale / delete</h3>
@@ -213,7 +213,7 @@ Arachne::shutdown()?;
       <h2>4. Handle：完整的客户端表面</h2>
       <p>
         facade 的五个静态方法背后其实都是一个 <code>Handle</code>。需要更多能力时，用
-        <code>Arachne::handle()</code> 逃逸出口拿一个克隆（共享 actor 通道，clone 只是引用计数加一）：
+        <code>Arachne::handle()</code> 拿一个克隆（共享 actor 通道，clone 只是引用计数加一）：
       </p>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">rust</span></div>
@@ -242,7 +242,7 @@ let (voters, learners) = handle.membership().await?;
       <h2>5. 多节点：参考节点怎么装配</h2>
       <p>
         多节点集群就不再用 facade，而是直接用 <code>Runtime</code> / <code>Handle</code>。
-        参考节点 <code>arachne-node</code> 的 <code>node.rs</code> 是权威装配示例，核心接线如下
+        参考节点 <code>arachne-node</code> 的 <code>node.rs</code> 是现成的装配示例，核心接线如下
         （省略调优参数）：WAL → tonic 传输 → <code>Runtime</code> actor → 线程。
       </p>
       <div class="code-block">

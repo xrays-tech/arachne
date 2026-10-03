@@ -36,12 +36,11 @@
 <main class="animate">
   <section class="hero">
     <p class="page-kicker">Documentation</p>
-    <h1>Arachne —— 为 Rust 程序打造的<br><span class="accent-word">可线性化</span>键值引擎</h1>
+    <h1>Arachne —— 分布式<br><span class="accent-word">可线性化</span>键值引擎</h1>
     <p class="lede">
-      A transport-agnostic, linearizable key-value engine for Rust programs, built on the
-      <code>raft</code> consensus algorithm。先是一个<strong>库</strong>：把它嵌进你自己的进程，给它存储后端与传输层，
-      就能得到一个具备 raft 一致性的 <code>Handle</code> 用于读写；工作区也附带了把存储 + 传输 + HTTP 接好的参考节点
-      二进制 <code>arachne-node</code>。
+      Arachne 是一个基于 <code>raft</code> 共识算法的分布式可线性化键值引擎，以库的形式交付。
+      把它嵌进你自己的进程，接上存储与传输层，就能获得一个具备 raft 一致性的 <code>Handle</code> 用于读写。
+      工作区还附带一个接好存储、传输与 HTTP 的参考节点 <code>arachne-node</code>，可直接跑真实集群。
     </p>
     <div class="hero-actions">
       <a class="btn btn-primary" href="quick-start.html">一分钟跑起来 →</a>
