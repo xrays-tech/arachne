@@ -76,19 +76,22 @@
 
       <h2>2. server::Arachne —— 嵌入 facade</h2>
       <p>
-        每个方法都是单节点、单实例语义：被调用的静态槽为空时返回 <code>NotInitialized</code>，
-        重复 <code>new</code> 返回 <code>AlreadyInitialized</code>。除 <code>new</code> 与
+        <code>Arachne::start(ClusterConfig)</code> 是唯一入口：Arachne 是分布式引擎，
+        单节点也以 <code>ClusterConfig::single_node</code>（N=1 集群）表达，真实集群用
+        <code>ClusterConfig::member</code>。每进程至多一个节点：静态槽为空时返回
+        <code>NotInitialized</code>，重复 <code>start</code> 返回
+        <code>AlreadyInitialized</code>。除 <code>start</code> 与
         <code>shutdown</code> 外均为 <code>async</code>。模块同时重导出
         <code>ArachneError</code>、<code>Handle</code>、<code>WalConfig</code>。
       </p>
 
       <div class="api-method">
         <div class="sig">
-          <code>pub fn new(node_id: u64, data_dir: &amp;Path, wal: WalConfig) -&gt; Result&lt;Arachne, ArachneError&gt;</code>
+          <code>pub fn start(config: ClusterConfig) -&gt; Result&lt;Arachne, ArachneError&gt;</code>
           <span class="badges"><span class="badge badge-teal">同步</span></span>
         </div>
         <div class="desc">
-          <p>引导进程内单节点。<code>data_dir</code> 按需创建；WAL 数据目录锁被获取并持有到节点生命周期结束。第二次调用返回 <code>ArachneError::AlreadyInitialized</code>。</p>
+          <p>唯一入口，按 <code>ClusterConfig</code> 引导节点：<code>single_node</code> 为 N=1 集群（peerless，自选主、免仲裁轮），<code>member</code> 加入真实集群（tonic 传输，专用多线程 runtime）。<code>data_dir</code> 按需创建；WAL 数据目录锁被获取并持有到节点生命周期结束。第二次调用返回 <code>ArachneError::AlreadyInitialized</code>。</p>
         </div>
       </div>
 

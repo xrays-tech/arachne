@@ -149,7 +149,7 @@
         挂在全局静态槽上。完整程序在 Quick Start，这里拆开生命周期讲每一步的<strong>为什么</strong>。
       </p>
 
-      <h3>① new —— 引导单节点</h3>
+      <h3>① start —— 引导节点（single_node = N=1 集群）</h3>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">rust</span></div>
 <pre><code data-lang="rust">// One node per process. 同步调用：绑定即装配完成。
@@ -248,7 +248,9 @@ let (voters, learners) = handle.membership().await?;
 
       <h2>5. 多节点：参考节点怎么装配</h2>
       <p>
-        多节点集群就不再用 facade，而是直接用 <code>Runtime</code> / <code>Handle</code>。
+        多节点集群也可以直接走 facade：<code>Arachne::start(ClusterConfig::member(..))</code>
+        每进程一个节点即可组集群（见 Quick Start）。本节展示底层 <code>Runtime</code> /
+        <code>Handle</code> 装配——需要完全程序化控制时用这一层；
         参考节点 <code>arachne-node</code> 的 <code>node.rs</code> 是现成的装配示例，核心接线如下
         （省略调优参数）：WAL → tonic 传输 → <code>Runtime</code> actor → 线程。
       </p>
