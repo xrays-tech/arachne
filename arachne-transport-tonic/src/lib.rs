@@ -54,6 +54,19 @@ pub use rx::TonicRx;
 pub use snapshot::{SnapshotProvider, SnapshotReader};
 pub use transport::TonicTransport;
 
+/// Wire-protocol **major** version this node speaks in the transport handshake.
+///
+/// A peer whose major differs is rejected (propsol §5.6). Kept in this crate —
+/// the only one that knows the wire protocol — so the node and the embedding
+/// facade share the single source of truth.
+pub const PROTOCOL_MAJOR: u32 = 1;
+
+/// Wire-protocol **minor** version this node speaks in the transport handshake.
+///
+/// A peer whose minor is *newer* than ours is rejected; equal or older is
+/// accepted. `0` is the first (and current) revision of the M1 wire protocol.
+pub const PROTOCOL_MINOR: u32 = 0;
+
 /// Recover a `Mutex` guard even from a poisoned lock.
 ///
 /// A poisoned lock means a prior thread panicked while holding it. The guarded

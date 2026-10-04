@@ -37,7 +37,12 @@ protobuf = "2"
 # builds without the tonic transport (check-deps Gate B is unaffected). Both
 # `tokio` and `tokio-util` are already in the dependency tree (via
 # `arachne-transport-tonic`/`arachne-node`), so this adds no new external crate.
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# `rt-multi-thread` is also enabled because the multi-node embedding facade
+# (`Arachne::start`) drives the tonic gRPC server on a private *multithread*
+# tokio runtime (`Builder::new_multi_thread`); the actor thread itself still
+# uses a current-thread runtime, so this only adds the multithread executor
+# and remains transport-independent.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 # `join_all` is the cross-peer concurrency primitive for the fast-path deliver
 # loop. `futures-util` is already in the dependency tree (via

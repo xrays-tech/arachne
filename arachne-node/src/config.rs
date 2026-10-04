@@ -48,7 +48,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use arachne::NodeId;
-use arachne::{Profile, ProfileConfig};
+use arachne::{Profile, ProfileConfig, server::ClusterConfig};
+use arachne::storage::WalConfig;
 use serde::Deserialize;
 
 /// The parsed and validated node configuration.
@@ -306,6 +307,28 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
         election_timeout_ms: profile_config.election_timeout_ms,
         profile_config,
     })
+}
+
+impl Config {
+    /// Convert this validated node config into the embedded-facade
+    /// [`ClusterConfig`]. Field-for-field mapping; the WAL tuning is derived
+    /// from the validated [`ProfileConfig`] so the embedded node uses the same
+    /// fsync policy / segment size the node binary would have used.
+    pub fn to_cluster_config(&self) -> ClusterConfig {
+        ClusterConfig {
+            cluster_id: self.cluster_id.clone(),
+            node_id: self.node_id.clone(),
+            listen: self.listen,
+            data_dir: self.data_dir.clone(),
+            initial_cluster: self.initial_cluster.clone(),
+            addresses: self.addresses.clone(),
+            profile: self.profile,
+            wal: WalConfig {
+                fsync_policy: self.profile_config.fsync_policy,
+                segment_bytes: self.profile_config.wal_segment_bytes,
+            },
+        }
+    }
 }
 
 /// Parse a single `initial_cluster` entry into `(node_id, optional address)`.

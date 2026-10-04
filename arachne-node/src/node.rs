@@ -21,25 +21,16 @@ use arachne::consensus::RaftNodeConfig;
 use arachne::runtime::{Runtime, RuntimeConfig};
 use arachne::storage::{WalConfig, WalOptions, WalStorage};
 use arachne::{Metrics, RaftId, StorageError, TransportFactory};
-use arachne_transport_tonic::{TonicRx, TonicTransport, TonicTransportFactory, TransportError};
+use arachne_transport_tonic::{
+    TonicRx, TonicTransport, TonicTransportFactory, TransportError, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
+};
 use slog::Logger;
 
 use crate::config::Config;
 
 /// The node runtime type for the real tonic transport.
 pub type NodeRuntime = Runtime<TonicTransport, TonicRx>;
-
-/// Wire-protocol major version this node speaks in the transport handshake.
-///
-/// A peer whose major differs is rejected (propsol §5.6). Kept in sync with the
-/// `arachne-transport-tonic` factory defaults so a same-cluster handshake always
-/// matches.
-const PROTOCOL_MAJOR: u32 = 1;
-/// Wire-protocol minor version this node speaks in the transport handshake.
-///
-/// A peer whose minor is *newer* than ours is rejected; equal or older is
-/// accepted. `0` is the first (and current) revision of the M1 wire protocol.
-const PROTOCOL_MINOR: u32 = 0;
 
 /// Errors from assembling the node.
 #[derive(Debug)]

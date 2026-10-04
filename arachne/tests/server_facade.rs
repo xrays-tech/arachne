@@ -4,8 +4,15 @@
 //! The façade is a *global* single instance (exactly one node per process,
 //! held in a `static`). `cargo test` runs tests concurrently in one process,
 //! so multiple tests that touch the façade would race on the shared instance
-//! and corrupt each other. This suite is therefore a **single** lifecycle test
-//! that owns the instance from start to finish, exercising every transition:
+//! and corrupt each other. Each test in this suite therefore acquires a
+//! process-level lock ([`FACADE_LOCK`]) that serializes instance ownership.
+//!
+//! There are two lifecycle tests:
+//! * [`facade_lifecycle_end_to_end`] — drives the peerless path via
+//!   `Arachne::new` (which internally builds a peerless `ClusterConfig` and
+//!   calls `Arachne::start`);
+//! * [`facade_single_node_still_works_via_start`] — drives the same peerless
+//!   path via the unified entry `Arachne::start(ClusterConfig::single_node)`.
 //!
 //!   1. pre-init: `get`/`get_stale`/`handle` all fail with `NotInitialized`;
 //!   2. `new` succeeds once; a second call fails with `AlreadyInitialized`;
@@ -28,12 +35,19 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use arachne::server::{Arachne, ArachneError, WalConfig};
+use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 // Unique per-process sequence so that `process::id()` (shared across all tests
 // in one binary) is disambiguated without reaching for real time.
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// Serializes the façade tests against each other: `cargo test` runs them
+// concurrently in one process, and both touch the single-instance
+// `INSTANCE` static. Holding this guard for the whole test body guarantees
+// exactly one test owns the instance at a time.
+static FACADE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A fresh, unique temp dir for a single test, built from the process ID and
 /// a process-local counter (no real time involved).
@@ -73,6 +87,9 @@ async fn wait_for_leader() -> bool {
 
 #[tokio::test]
 async fn facade_lifecycle_end_to_end() {
+    // Serialize against the other façade test: both own the single-instance
+    // static, so exactly one may do so at a time.
+    let _guard = FACADE_LOCK.lock().unwrap();
     let dir = unique_tempdir();
 
     // ---- pre-init: every op fails with NotInitialized (no runtime yet) ----
@@ -201,5 +218,116 @@ async fn facade_lifecycle_end_to_end() {
     }
 
     // Best-effort cleanup of the temp dir.
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The unified entry `Arachne::start(ClusterConfig::single_node)` must build the
+/// same peerless node as the legacy `Arachne::new` and serve the full data
+/// plane (set → get/get_stale round-trip → delete), then shut down cleanly.
+///
+/// This is the in-process analogue of the cluster test's single-node member:
+/// a `ClusterConfig::single_node` config has no peers and no listeners, so it
+/// takes the peerless path in `Arachne::start` (synchronous assembly).
+#[tokio::test]
+async fn facade_single_node_still_works_via_start() {
+    // Serialize against [`facade_lifecycle_end_to_end`].
+    let _guard = FACADE_LOCK.lock().unwrap();
+    let dir = unique_tempdir();
+
+    // Pre-start: no node yet.
+    match Arachne::get(b"hello").await {
+        Err(ArachneError::NotInitialized) => {}
+        Err(e) => panic!("pre-start get: expected NotInitialized, got {e}"),
+        Ok(_) => panic!("pre-start get: expected error, got Ok"),
+    }
+
+    // Start the peerless node via the unified entry. `start` is synchronous.
+    Arachne::start(ClusterConfig::single_node(1, &dir, WalConfig::default()))
+        .expect("start(ClusterConfig::single_node)");
+
+    // A second start must fail with AlreadyInitialized.
+    match Arachne::start(ClusterConfig::single_node(2, &dir, WalConfig::default())) {
+        Err(ArachneError::AlreadyInitialized) => {}
+        Err(e) => panic!("second start: expected AlreadyInitialized, got {e}"),
+        Ok(_) => panic!("second start: expected AlreadyInitialized, got Ok"),
+    }
+
+    // Wait for self-election, then round-trip through the static façade.
+    assert!(
+        wait_for_leader().await,
+        "singleton should self-elect within {MAX_ATTEMPTS} poll attempts"
+    );
+
+    Arachne::set(b"hello", b"world").await.expect("set via start-based node");
+
+    // Linear-read back (poll until the value is observed).
+    let mut got: Option<Vec<u8>> = None;
+    let mut last_err = String::new();
+    for _ in 0..MAX_ATTEMPTS {
+        match Arachne::get(b"hello").await {
+            Ok(Some(v)) => {
+                got = Some(v);
+                break;
+            }
+            _ => last_err = "not Some(b\"world\") yet".into(),
+        }
+        poll().await;
+    }
+    assert!(
+        got.is_some(),
+        "get after set should succeed within {MAX_ATTEMPTS} polls; last: {last_err}"
+    );
+    assert_eq!(got.unwrap(), b"world".to_vec());
+
+    // Stale-read also sees it.
+    let mut got_stale: Option<Vec<u8>> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        if let Ok(Some(v)) = Arachne::get_stale(b"hello").await {
+            got_stale = Some(v);
+            break;
+        }
+        poll().await;
+    }
+    assert_eq!(
+        got_stale.as_deref(),
+        Some(b"world".as_slice()),
+        "get_stale after set should return the written value"
+    );
+
+    // Delete → linear-read returns None.
+    Arachne::delete(b"hello").await.expect("delete via start-based node");
+    let mut saw_none = false;
+    let mut last_err = String::new();
+    for _ in 0..MAX_ATTEMPTS {
+        match Arachne::get(b"hello").await {
+            Ok(None) => {
+                saw_none = true;
+                break;
+            }
+            Err(e) => last_err = format!("{e:?}"),
+            Ok(Some(_)) => last_err = "still Some after delete".into(),
+        }
+        poll().await;
+    }
+    assert!(
+        saw_none,
+        "get after delete should return None within {MAX_ATTEMPTS} polls; last: {last_err}"
+    );
+
+    // Handle access works on a start-based node.
+    match Arachne::handle().await {
+        Ok(_h) => {}
+        Err(e) => panic!("handle after start: expected Ok, got {e}"),
+    }
+
+    // Shutdown → post-shutdown ops fail with NotInitialized.
+    Arachne::shutdown().expect("shutdown start-based node");
+    match Arachne::get(b"hello").await {
+        Err(ArachneError::NotInitialized) => {}
+        Err(e) => panic!("post-shutdown get: expected NotInitialized, got {e}"),
+        Ok(_) => panic!("post-shutdown get: expected error, got Ok"),
+    }
+
+    // Cleanup.
     let _ = fs::remove_dir_all(&dir);
 }
