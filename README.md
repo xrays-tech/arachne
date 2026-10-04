@@ -23,7 +23,7 @@ For a single in-process node, `arachne::server` gives you a minimal facade —
 no tokio runtime to poll, no `Runtime`/`Handle` plumbing:
 
 ```rust,ignore
-use arachne::server::{Arachne, WalConfig, ArachneError};
+use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 // One node per process; the marker is decorative, the node lives for the
 // process and is shut down explicitly. single_node is an N=1 cluster.

@@ -56,7 +56,7 @@ use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 use axum::body::Body;
 use axum::extract::{Path, Request};
 use axum::http::{StatusCode, Response};
-use axum::{routing::{delete, get, post}, Router};
+use axum::{routing::{delete, get, put}, Router};
 use tokio::net::TcpListener;
 use tokio::signal::ctrl_c;
 use tokio::time::sleep;
@@ -70,7 +70,7 @@ struct Server {
 /// Build the HTTP router. Handlers route to the `Arachne` facade statics.
 fn build_router() -> Router {
     Router::new()
-        .route("/kv/:key/:value", post(handle_put))
+        .route("/kv/:key/:value", put(handle_put))
         .route("/kv/:key", get(handle_get))
         .route("/kv/:key", delete(handle_delete))
         .route("/readyz", get(handle_ready))

@@ -158,7 +158,7 @@
       <div class="callout">
         <span class="callout-ico">i</span>
         <p>
-          <code>new</code> 返回的 <code>Arachne</code> 是零字段标记：丢弃它是空操作（节点<strong>不会</strong>因此关闭），
+          <code>start</code> 返回的 <code>Arachne</code> 是零字段标记：丢弃它是空操作（节点<strong>不会</strong>因此关闭），
           与显式 <code>shutdown()</code> 刻意区分。
         </p>
       </div>
@@ -252,7 +252,7 @@
               <td>该 handle 绑定的 <code>NodeId</code>。</td>
             </tr>
             <tr>
-              <td><code>leader_hint(&amp;self) -&gt; Option&lt;(NodeId, SocketAddr)&gt;</code></td>
+              <td><code>leader_hint(&amp;self) -&gt; Option&lt;(NodeId, SocketAddr)&gt;</code>（async）</td>
               <td>报告节点当前的 leader 提示：已知 leader 时返回其 <code>(NodeId, SocketAddr)</code>，否则 <code>None</code>（无 leader / 失仲裁）。受操作 deadline 约束。</td>
             </tr>
             <tr>

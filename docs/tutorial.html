@@ -182,7 +182,7 @@ loop {
 </code></pre>
       </div>
       <p>
-        为什么需要这一步？<code>get</code> 需要 leader。<code>new</code> 是同步的，但选主是
+        为什么需要这一步？<code>get</code> 需要 leader。<code>start</code> 是同步的，但选主是
         异步发生的；等第一个线性读成功，节点才算真正就绪。Quick Start 的示例
         <code>facade.rs</code> 也是这样处理的。
       </p>

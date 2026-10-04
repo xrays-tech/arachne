@@ -87,7 +87,7 @@ arachne = { path = "…/arachne" }            # default: pulls tonic transport
       <div class="code-block">
         <div class="code-head"><span class="code-lang">rust</span></div>
 <pre><code data-lang="rust">use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
-use axum::{routing::{delete, get, post}, Router, extract::Path, http::StatusCode};
+use axum::{routing::{delete, get, put}, Router, extract::Path, http::StatusCode};
 
 #[tokio::main]
 async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
@@ -112,7 +112,7 @@ async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 
     // (3) 四个操作挂成 HTTP 路由。
     let app = Router::new()
-        .route("/kv/:key/:value", post(handle_put))   // PUT semantics via POST
+        .route("/kv/:key/:value", put(handle_put))
         .route("/kv/:key", get(handle_get))
         .route("/kv/:key", delete(handle_delete))
         .route("/readyz", get(handle_ready));
@@ -155,7 +155,7 @@ async fn handle_ready() -&gt; &amp;'static str {
       <div class="code-block">
         <div class="code-head"><span class="code-lang">console</span></div>
 <pre><code data-lang="console">$ cargo run --example axum_http
-# 打印: listening on 127.0.0.1:XXXXX
+# 打印: arachne HTTP server (facade) listening on 127.0.0.1:XXXXX
 # 另开一个终端（把 XXXXX 换成上面打印的端口）:
 $ curl -X PUT 'http://127.0.0.1:XXXXX/kv/hello/world'   # -&gt; ok   (线性写)
 $ curl     'http://127.0.0.1:XXXXX/kv/hello'            # -&gt; world (ReadIndex 线性读)

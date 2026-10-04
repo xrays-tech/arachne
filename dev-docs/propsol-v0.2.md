@@ -1,11 +1,11 @@
-# Arachne 设计文档（v0.2.10 RFC）
+# Arachne 设计文档（v0.2.24 运行中）
 
 > 上游文档：`propsol.md`（v0.1）。本文件在其基础上做需求/设计精化，**不包含实现代码**。
 > 设计基线不变：复用成熟共识内核（`tikv/raft-rs`，备选 `openraft`）、CP 语义、不自研共识、失去多数派不自动接管、不基于 ACK 超时自动剔除节点。
 
 ---
 
-## 变更日志（v0.1 → v0.2.10）
+## 变更日志（v0.1 → v0.2.24）
 
 ### A. 三项待决策项已决议（见 §11）
 
@@ -737,6 +737,8 @@ grace 区: Map<ClientId, GraceEntry{ expired_at }>  // 过期后再保留 grace_
 ## 3. API
 
 ### 3.1 构造与引导参数
+
+> 注（rev AA/v0.2.24）：本 API 草图已被 `arachne::server` 单实例 facade 取代——`Arachne::start(ClusterConfig)` 为唯一入口，配静态 `set/get/get_stale/delete/handle` 与同步 `shutdown`；多节点嵌入用 `Runtime`/`Handle`（见 rev AA）。旧草图留档。
 
 ```rust
 let node = Arachne::builder()
