@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use arachne::server::{Arachne, ArachneError, WalConfig};
+use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 fn main() {
     let dir = std::env::temp_dir().join(format!(
@@ -24,8 +24,8 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime")
         .block_on(async {
-            // (1) One node per process — the facade keeps a single global node.
-            Arachne::new(1, &dir, WalConfig::default())?;
+            // (1) One node per process — start an N=1 cluster (single_node).
+            Arachne::start(ClusterConfig::single_node(1, &dir, WalConfig::default()))?;
 
             // (2) Wait until the node has elected itself leader. Pre-election
             //     reads fail fast (fast non-leader redirect); once the node is

@@ -86,17 +86,13 @@ arachne = { path = "…/arachne" }            # default: pulls tonic transport
       </p>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">rust</span></div>
-<pre><code data-lang="rust">use arachne::server::{Arachne, ArachneError, WalConfig};
+<pre><code data-lang="rust">use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 use axum::{routing::{delete, get, post}, Router, extract::Path, http::StatusCode};
 
 #[tokio::main]
 async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
-    // (1) One node per process — the facade keeps a single global node.
-    let dir = std::env::temp_dir().join(format!(
-        "arachne-axum-example-{}", std::process::id()
-    ));
-    std::fs::create_dir_all(&amp;dir)?;
-    Arachne::new(1, &amp;dir, WalConfig::default())?;
+    // (1) Start an N=1 cluster (single_node): one node per process.
+    Arachne::start(ClusterConfig::single_node(1, &amp;dir, WalConfig::default()))?;
 
     // (2) 轮询到节点自选为 leader（单例免仲裁轮）。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -181,8 +177,8 @@ $ curl     'http://127.0.0.1:XXXXX/readyz'              # -&gt; ready
       <div class="callout">
         <span class="callout-ico">i</span>
         <p>
-          单实例、单节点是默认：第二次 <code>Arachne::new</code> 返回
-          <code>AlreadyInitialized</code>；<code>new</code> 之前（或 <code>shutdown</code>
+          每进程一个节点：第二次 <code>Arachne::start</code> 返回
+          <code>AlreadyInitialized</code>；<code>start</code> 之前（或 <code>shutdown</code>
           之后）的静态读取返回 <code>NotInitialized</code>。多节点集群或成员管理请改用
           <code>Runtime</code> / <code>Handle</code>（见 Tutorial）。
         </p>

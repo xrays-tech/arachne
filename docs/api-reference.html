@@ -287,7 +287,7 @@
       </div>
 
       <h2>4. 存储配置：WalConfig / FsyncPolicy / WalOptions</h2>
-      <p><code>WalConfig</code> 是 facade（<code>Arachne::new</code>）与底层 <code>WalStorage::open</code> 共用的存储配置：</p>
+      <p><code>WalConfig</code> 是 facade（<code>Arachne::start</code>）与底层 <code>WalStorage::open</code> 共用的存储配置：</p>
       <div class="table-wrap">
         <table class="doc-table">
           <thead>
@@ -354,8 +354,8 @@
             <tr><td><code>ShuttingDown</code></td><td>节点正在关闭。</td><td><span class="nowrap">503</span></td></tr>
             <tr><td><code>DataDirLocked</code></td><td>数据目录被另一进程锁定。</td><td><span class="nowrap">—</span></td></tr>
             <tr><td><code>Unrecoverable(String)</code></td><td>致命条件（存储损坏、状态机不变式被破坏……）。进程应 fail-stop。</td><td><span class="nowrap">500 Internal Server Error</span></td></tr>
-            <tr><td><code>AlreadyInitialized</code></td><td>本进程内 facade 已被初始化，礼貌拒绝第二个 <code>Arachne::new</code>。</td><td><span class="nowrap">—</span></td></tr>
-            <tr><td><code>NotInitialized</code></td><td>在 <code>new</code> 前或 <code>shutdown</code> 后调用 facade 静态方法。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>AlreadyInitialized</code></td><td>本进程内 facade 已被初始化，礼貌拒绝第二个 <code>Arachne::start</code>。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>NotInitialized</code></td><td>在 <code>start</code> 前或 <code>shutdown</code> 后调用 facade 静态方法。</td><td><span class="nowrap">—</span></td></tr>
           </tbody>
         </table>
       </div>

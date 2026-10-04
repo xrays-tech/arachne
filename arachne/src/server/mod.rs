@@ -2,19 +2,19 @@
 //!
 //! This module exposes a single-instance API that lets an embedding process
 //! create one in-process Arachne node per process and call linearizable
-//! writes/reads without ever polling a runtime. Two entry points share one
+//! writes/reads without ever polling a runtime. One entry point, one
 //! code path:
 //!
-//! * [`Arachne::new`] — the zero-tokio, **peerless** (singleton) node.
-//!   A second call returns `ArachneError::AlreadyInitialized`.
-//! * [`Arachne::start`] — the unified entry; for a multi-node cluster it
-//!   installs a `TonicTransportFactory`-driven node (`ClusterConfig::member`)
-//!   whose gRPC server runs on a private multithread tokio runtime that lives
-//!   for as long as the facade state is alive.
+//! * [`Arachne::start`] — the unified entry, driven by a [`ClusterConfig`].
+//!   A real cluster passes [`ClusterConfig::member`] (a
+//!   `TonicTransportFactory`-driven node whose gRPC server runs on a private
+//!   multithread tokio runtime that lives for as long as the facade state is
+//!   alive). A one-node cluster passes [`ClusterConfig::single_node`] (the
+//!   zero-tokio, **peerless** path: one node, no peers, no listeners).
 //!
 //! * **Single instance.** The facade keeps exactly one node per process in a
-//!   global [`std::sync::Mutex<Option<_>>`]. A second `Arachne::new`/
-//!   `Arachne::start` returns `ArachneError::AlreadyInitialized`; static
+//!   global [`std::sync::Mutex<Option<_>>`]. A second `Arachne::start`
+//!   returns `ArachneError::AlreadyInitialized`; static
 //!   methods called before init or after `shutdown` return
 //!   `ArachneError::NotInitialized`.
 //! * **Hidden runtime.** The node runs on its own dedicated OS thread with a
@@ -136,7 +136,7 @@ impl TransportRx for PeerlessRx {
 /// Zero-field marker for the embedded node.
 ///
 /// The node itself lives in a global static; the marker exists only so that
-/// `Arachne::new` has an owned return type and so the process can hold an
+/// `Arachne::start` has an owned return type and so the process can hold an
 /// explicit "handle" that documents the binding. Dropping it is a no-op (the
 /// node is *not* shut down) and is deliberately distinct from the explicit
 /// [`Arachne::shutdown`].
@@ -144,20 +144,13 @@ impl TransportRx for PeerlessRx {
 pub struct Arachne;
 
 impl Arachne {
-    /// Bootstrap the single in-process node.
+    /// Bootstrap one in-process node from a [`ClusterConfig`].
     ///
-    /// `data_dir` is created on demand; the WAL's data-dir lock is acquired and
-    /// held for the node's lifetime. A second call returns
-    /// [`ArachneError::AlreadyInitialized`]. This is the **peerless** (singleton)
-    /// path: exactly one node, no peers, no listeners.
-    pub fn new(node_id: u64, data_dir: &Path, wal: WalConfig) -> Result<Arachne, ArachneError> {
-        // `single_node` derives the peerless `ClusterConfig`; `start` is the
-        // unified entry (it detects the peerless path via `is_peerless`).
-        let cfg = ClusterConfig::single_node(node_id, data_dir, wal);
-        Self::start(cfg)
-    }
-
-    /// Bootstrap the single in-process node from a full [`ClusterConfig`].
+    /// Arachne is a **distributed** engine: every entry point assembles a
+    /// clustered node. A one-node cluster is expressed as
+    /// [`ClusterConfig::single_node`] (`initial_cluster = [self]`, self-elects,
+    /// linear reads are quorum-free); a real cluster uses
+    /// [`ClusterConfig::member`].
     ///
     /// * Peerless (`ClusterConfig::single_node`): synchronous, on-caller-thread
     ///   assembly (no transport, no listeners).

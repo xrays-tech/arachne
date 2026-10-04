@@ -8,14 +8,14 @@
 //! process-level lock ([`FACADE_LOCK`]) that serializes instance ownership.
 //!
 //! There are two lifecycle tests:
-//! * [`facade_lifecycle_end_to_end`] — drives the peerless path via
-//!   `Arachne::new` (which internally builds a peerless `ClusterConfig` and
-//!   calls `Arachne::start`);
-//! * [`facade_single_node_still_works_via_start`] — drives the same peerless
+//! * [`facade_lifecycle_end_to_end`] — drives the facade via
+//!   `Arachne::start(ClusterConfig::single_node)` (an N=1 cluster:
+//!   `initial_cluster = [self]`, self-elects, linear reads are quorum-free);
+//! * [`facade_single_node_still_works_via_start`] — drives the same single-node
 //!   path via the unified entry `Arachne::start(ClusterConfig::single_node)`.
 //!
 //!   1. pre-init: `get`/`get_stale`/`handle` all fail with `NotInitialized`;
-//!   2. `new` succeeds once; a second call fails with `AlreadyInitialized`;
+//!   2. `start` succeeds once; a second call fails with `AlreadyInitialized`;
 //!   3. the singleton self-elects (pre-election reads fast-path to
 //!      `NotLeader`/`QuorumUnavailable`, then become `Ok`);
 //!   4. `set` → `get`/`get_stale` round-trip (only possible once elected);
@@ -109,15 +109,16 @@ async fn facade_lifecycle_end_to_end() {
         Ok(_) => panic!("pre-init handle: expected error, got Ok"),
     }
 
-    // ---- 2. Initialize once — succeeds. `new` is synchronous (synchronous
+    // ---- 2. Initialize once — succeeds. `start` is synchronous (synchronous
     //        assembly: create dir, open WAL, spawn the actor thread). ----
-    Arachne::new(1, &dir, WalConfig::default()).expect("first new");
+    Arachne::start(ClusterConfig::single_node(1, &dir, WalConfig::default()))
+        .expect("first start");
 
     // ---- 3. A second init in the same process must fail with AlreadyInitialized. ----
-    match Arachne::new(2, &dir, WalConfig::default()) {
+    match Arachne::start(ClusterConfig::single_node(2, &dir, WalConfig::default())) {
         Err(ArachneError::AlreadyInitialized) => {}
-        Err(e) => panic!("second new: expected AlreadyInitialized, got {e}"),
-        Ok(_) => panic!("second new: expected AlreadyInitialized, got Ok"),
+        Err(e) => panic!("second start: expected AlreadyInitialized, got {e}"),
+        Ok(_) => panic!("second start: expected AlreadyInitialized, got Ok"),
     }
 
     // ---- 4. Wait for the singleton to self-elect. Writes require leadership,
@@ -221,8 +222,8 @@ async fn facade_lifecycle_end_to_end() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The unified entry `Arachne::start(ClusterConfig::single_node)` must build the
-/// same peerless node as the legacy `Arachne::new` and serve the full data
+/// The unified entry `Arachne::start(ClusterConfig::single_node)` must build
+/// the same single-node cluster and serve the full data
 /// plane (set → get/get_stale round-trip → delete), then shut down cleanly.
 ///
 /// This is the in-process analogue of the cluster test's single-node member:

@@ -51,7 +51,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use arachne::server::{Arachne, ArachneError, WalConfig};
+use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 use axum::body::Body;
 use axum::extract::{Path, Request};
@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     std::fs::create_dir_all(&dir)?;
 
-    Arachne::new(1, &dir, WalConfig::default())?;
+    Arachne::start(ClusterConfig::single_node(1, &dir, WalConfig::default()))?;
 
     // (2) Wait until the node has elected itself leader.
     wait_for_leader().await?;

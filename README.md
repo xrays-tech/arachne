@@ -26,8 +26,8 @@ no tokio runtime to poll, no `Runtime`/`Handle` plumbing:
 use arachne::server::{Arachne, WalConfig, ArachneError};
 
 // One node per process; the marker is decorative, the node lives for the
-// process and is shut down explicitly.
-let _server = Arachne::new(1, &data_dir, WalConfig::default())?;
+// process and is shut down explicitly. single_node is an N=1 cluster.
+let _server = Arachne::start(ClusterConfig::single_node(1, &data_dir, WalConfig::default()))?;
 
 Arachne::set(b"key", b"value").await?;
 let v = Arachne::get(b"key").await?;          // ReadIndex linearizable read
@@ -36,8 +36,12 @@ Arachne::delete(b"key").await?;
 Arachne::shutdown();
 ```
 
-Single-instance, single-node by default: a second `Arachne::new` returns
-`AlreadyInitialized`; static reads before `new` (or after `shutdown`) return
+`Arachne::start(ClusterConfig)` is the one entry point — Arachne is a
+distributed engine, so even a single node is expressed as an N=1 cluster
+(`ClusterConfig::single_node`); use `ClusterConfig::member` to join a real
+cluster. Each process holds at most one node: a second `Arachne::start`
+returns `AlreadyInitialized`; static reads before `start` (or after
+`shutdown`) return
 `NotInitialized`. For multi-node clusters or membership control, use `Runtime`
 / `Handle` directly.
 

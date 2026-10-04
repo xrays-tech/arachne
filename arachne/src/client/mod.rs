@@ -123,13 +123,13 @@ pub enum ArachneError {
     #[error("unrecoverable: {0}")]
     Unrecoverable(String),
     /// The [`crate::server`] embedding facade has already been initialized in
-    /// this process. A second `Arachne::new` is politely refused; the node is
+    /// this process. A second `Arachne::start` is politely refused; the node is
     /// not overwritten. (In-process single-instance semantics.)
     #[error("the Arachne facade is already initialized; a single node is active per process")]
     AlreadyInitialized,
-    /// A [`crate::server`] static method was called before `Arachne::new`, or
+    /// A [`crate::server`] static method was called before `Arachne::start`, or
     /// after `Arachne::shutdown`. (In-process single-instance semantics.)
-    #[error("the Arachne facade is not initialized; call Arachne::new first")]
+    #[error("the Arachne facade is not initialized; call Arachne::start first")]
     NotInitialized,
 }
 
