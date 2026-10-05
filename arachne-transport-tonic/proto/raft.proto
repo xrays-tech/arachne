@@ -25,6 +25,19 @@ service RaftTransport {
   // follower still learns *that* it needs a snapshot from raft itself; this RPC
   // only carries the bytes, in chunks, without a whole-message size bound.
   rpc FetchSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
+
+  // Forward a client command to the leader (propsol v0.2.19).
+  //
+  // In a multi-process deployment a follower's client command that it cannot
+  // serve locally (a non-leader answers `NotLeader`) has no in-process peer to
+  // hop to. It is forwarded over the wire to the leader, which runs it against
+  // its own runtime and replies with the outcome. The sender's identity comes
+  // from the handshake (`hello`), and the session envelope (`client_id` /
+  // `seq_no`) is carried through so the leader reissues the command with the
+  // *original* session id — idempotent, propsol INV5. If the forwarded target
+  // is itself a follower, it answers `not_leader` with a fresh leader hint so
+  // the client can re-redirect.
+  rpc Forward(ForwardRequest) returns (ForwardReply);
 }
 
 // One message in transit: the opaque raft payload plus its handshake.
@@ -87,4 +100,41 @@ message SendReply {
   // Empty on success; otherwise a stable error code
   // (`cluster_id_mismatch` / `protocol_mismatch` / …).
   string error_code = 2;
+}
+
+// A forwarded client command (propsol v0.2.19).
+message ForwardRequest {
+  // The operation: 0 = propose (write), 1 = read (ReadIndex), 2 = stale read.
+  //
+  // `kind` is a 0-based discriminant (proto3 leaves 0 as the default): a
+  // `Default(ForwardRequest)` would read as an empty propose and is rejected
+  // by the handshake / payload validation below, so no separate "kind must
+  // be set" check is needed.
+  uint32 kind = 1;
+  // The encoded state-machine command (for a propose).
+  bytes cmd = 2;
+  // The key (for a read / stale read).
+  bytes key = 3;
+  // The sender's session client id. Carried through to the leader for
+  // idempotent dedup (propsol INV5) — never minted fresh by the leader.
+  uint64 client_id = 4;
+  // The sender's session sequence number (propsol INV5).
+  uint64 seq_no = 5;
+  // The sender's handshake. Validated before the command runs, exactly as
+  // for `Send` (propsol §5.6). Its `node_id` is the sender of the command.
+  Hello hello = 6;
+}
+
+// The server's verdict on a forwarded command (propsol v0.2.19).
+message ForwardReply {
+  // `true` when the command ran to completion (write applied, read served).
+  bool ok = 1;
+  // Empty on success; otherwise a stable error code.
+  string error_code = 2;
+  // The read's value; absent for a successful write or any failure.
+  bytes value = 3;
+  // Leader hint, present only on a `not_leader` answer: the node to try next
+  // (the hint the forwarded node itself would have answered with locally).
+  string leader_node_id = 4;
+  string leader_addr = 5;
 }

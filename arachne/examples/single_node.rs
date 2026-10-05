@@ -19,6 +19,7 @@ use arachne_kv::consensus::RaftNode;
 use arachne_kv::state_machine::KvStateMachine;
 use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne_kv::{NodeId, StateMachine, Transport, TransportMessage, TransportRx};
+use arachne_kv::ForwardTransport;
 use slog::{o, Drain, Logger};
 
 type Node = RaftNode<WalStorage, NullTx, NullRx>;
@@ -52,6 +53,9 @@ impl Transport for NullTx {
         std::future::ready(Err(NoPeer))
     }
 }
+
+// A null transport has no peers and no forwarding capability.
+impl ForwardTransport for NullTx {}
 
 /// Inbound half: never yields (there are no peers).
 #[derive(Debug, Default)]

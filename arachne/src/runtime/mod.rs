@@ -34,12 +34,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
 use slog::Logger;
 use tokio::sync::{mpsc, oneshot, watch};
+use std::future::Future;
 
 use crate::client::{ArachneError, Handle};
 use crate::consensus::{
@@ -54,6 +56,103 @@ use crate::types::Timestamp;
 use crate::{
     Clock, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx,
 };
+use arachne_kv_seam::seam::{CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport};
+
+/// A [`CommandSink`] backed by this node's runtime actor: forwarded client
+/// commands are run against the local runtime and the answer is sent back to
+/// the leader's `Forward` RPC caller.
+pub struct ForwardCommandSink {
+    tx: mpsc::Sender<Command>,
+}
+
+impl ForwardCommandSink {
+    pub fn new(tx: mpsc::Sender<Command>) -> Self {
+        Self { tx }
+    }
+}
+
+impl CommandSink for ForwardCommandSink {
+    fn sink(
+        &self,
+        cmd: ForwardCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<ForwardOutcome, String>> + Send + '_>> {
+        Box::pin(async move {
+            match cmd {
+                ForwardCommand::Propose { cmd, client_id, seq_no } => {
+                    let (ack_tx, ack_rx) = oneshot::channel::<Result<(), ArachneError>>();
+                    self.tx.send(Command::Propose {
+                        cmd,
+                        client_id,
+                        seq_no,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| "command channel closed".to_string())?;
+                    let result = match ack_rx.await {
+                        Ok(res) => res,
+                        Err(_) => return Err("ack channel closed".to_string()),
+                    };
+                    match result {
+                        Ok(()) => Ok(ForwardOutcome { value: None, leader_hint: None }),
+                        Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint,
+                        }),
+                        Err(e) => Err(format!("forward propose failed: {}", e)),
+                    }
+                }
+                ForwardCommand::Read { key } => {
+                    let (ack_tx, ack_rx) = oneshot::channel::<Result<Option<Vec<u8>>, ArachneError>>();
+                    self.tx.send(Command::Read {
+                        key,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| "command channel closed".to_string())?;
+                    let result = match ack_rx.await {
+                        Ok(res) => res,
+                        Err(_) => return Err("ack channel closed".to_string()),
+                    };
+                    match result {
+                        Ok(value) => Ok(ForwardOutcome {
+                            value,
+                            leader_hint: None,
+                        }),
+                        Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint,
+                        }),
+                        Err(e) => Err(format!("forward read failed: {}", e)),
+                    }
+                }
+                ForwardCommand::GetStale { key } => {
+                    let (ack_tx, ack_rx) = oneshot::channel::<Result<Option<Vec<u8>>, ArachneError>>();
+                    self.tx.send(Command::GetStale {
+                        key,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| "command channel closed".to_string())?;
+                    let result = match ack_rx.await {
+                        Ok(res) => res,
+                        Err(_) => return Err("ack channel closed".to_string()),
+                    };
+                    match result {
+                        Ok(value) => Ok(ForwardOutcome {
+                            value,
+                            leader_hint: None,
+                        }),
+                        Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint,
+                        }),
+                        Err(e) => Err(format!("forward get_stale failed: {}", e)),
+                    }
+                }
+            }
+        })
+    }
+}
 use arachne_kv_seam::storage::{
     EntryType as SeamEntryType, Snapshot as SeamSnapshot, Storage as _,
 };
@@ -490,7 +589,7 @@ enum Outcome {
 }
 
 /// The node runtime actor.
-pub struct Runtime<T: Transport + Clone, Tr: TransportRx> {
+pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     node: RaftNode<WalStorage, T, Tr>,
     /// The apply task, handed to `run` to spawn. `None` once running.
     apply_task: Option<ApplyTask>,
@@ -540,7 +639,13 @@ pub struct Runtime<T: Transport + Clone, Tr: TransportRx> {
     raft_to_node: HashMap<RaftId, NodeId>,
     addresses: HashMap<NodeId, SocketAddr>,
     commands: mpsc::Receiver<Command>,
-    tick: tokio::time::Interval,
+    /// Heartbeat period, stored as a plain `Duration`. The concrete
+    /// `tokio::time::Interval` is built lazily in [`run`], which always executes
+    /// inside a tokio runtime (this actor's own, or an embedder's). Storing the
+    /// interval here eagerly would panic on a thread with no runtime (the
+    /// peerless / no-runtime assembly path), since `tokio::time::interval`
+    /// requires a running tokio runtime.
+    tick: Duration,
     pending: Vec<Pending>,
     /// Committed entries not yet dispatched, in log order. Every entry waits
     /// behind a preceding ConfChange so that the state machine and the
@@ -593,9 +698,12 @@ pub struct Runtime<T: Transport + Clone, Tr: TransportRx> {
     /// The index of the newest snapshot this node created or installed. Guards
     /// against re-taking a snapshot at an index that is already covered.
     snapshot_index: LogIndex,
+    /// Where forwarded client commands are run (propsol v0.2.19). Set by the
+    /// facade after `new` so the transport can register it for its gRPC server.
+    command_sink: Arc<ForwardCommandSink>,
 }
 
-impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
+impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
     /// Assemble the runtime and its local [`Handle`].
     pub fn new(
         config: RuntimeConfig,
@@ -656,6 +764,9 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
         // A second handle for background fetches: a transfer can take seconds,
         // so it cannot run on the actor.
         let fetch_transport = transport.clone();
+        // The forwarder this node offers to remote followers (propsol v0.2.19).
+        // `None` for transports without remote forwarding (in-memory, peerless).
+        let forwarder = transport.forwarder();
         let node = RaftNode::new_with_config(
             config.self_raft_id,
             config.peers.clone(),
@@ -672,14 +783,27 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
             .iter()
             .map(|(raft, node)| (node.as_str().to_string(), *raft))
             .collect();
-        let raft_to_node = config
+        let mut raft_to_node: HashMap<RaftId, NodeId> = config
             .peers
             .iter()
             .map(|(raft, node)| (*raft, node.clone()))
             .collect();
+        // The peers list excludes this node, but a node that *becomes* leader
+        // (via transfer_leader, or as the initial leader) must resolve itself:
+        // `hint()` looks up `raft_to_node[leader_id]`, and when this node is
+        // the leader that key is its *own* raft id. Without the self entry the
+        // hint returns `None` (or a stale leader) for the node that just
+        // gained leadership. Insert it before the `self_node_id` move below.
+        raft_to_node.insert(config.self_raft_id, config.self_node_id.clone());
 
         let (tx, commands) = mpsc::channel(1024);
-        let handle = Handle::new_local(config.self_node_id.clone(), tx, &config.profile);
+        let command_sink = Arc::new(ForwardCommandSink::new(tx.clone()));
+        let handle = Handle::new_local(
+            config.self_node_id.clone(),
+            tx,
+            forwarder,
+            &config.profile,
+        );
         // One fetch at a time: raft hands one snapshot at a time, so a deep
         // queue would only hide a bug.
         let (snapshot_fetches, snapshot_fetch_rx) = mpsc::channel::<SnapshotFetchDone>(1);
@@ -714,7 +838,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
             raft_to_node,
             addresses: config.addresses,
             commands,
-            tick: tokio::time::interval(period),
+            tick: period,
             pending: Vec::new(),
             committed_queue: VecDeque::new(),
             pending_conf: Vec::new(),
@@ -737,13 +861,27 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
             last_wal_sample: Instant::now(),
             applied_bytes_at_snapshot: 0,
             snapshot_index,
+            command_sink,
         };
         runtime.refresh_metrics();
         Ok((runtime, handle))
     }
 
+    /// The command sink this node offers to its transport, for its gRPC `Forward`
+    /// RPC. The facade registers it with the transport factory after `new`.
+    pub fn command_sink(&self) -> Arc<ForwardCommandSink> {
+        Arc::clone(&self.command_sink)
+    }
+
     /// Run the actor until the transport closes or the command channel ends.
     pub async fn run(mut self) {
+        // Build the heartbeat interval lazily, now that we are inside a tokio
+        // runtime: `tokio::time::interval` requires a running runtime. `new`
+        // may be called from a thread with no runtime (the peerless / no-runtime
+        // assembly path), so the interval is only materialised here — the only
+        // place that is guaranteed to run inside a runtime (this actor's own,
+        // or an embedder's).
+        let mut tick = tokio::time::interval(self.tick);
         if let Some(task) = self.apply_task.take() {
             tokio::spawn(task.run());
         }
@@ -751,7 +889,7 @@ impl<T: Transport + Clone, Tr: TransportRx> Runtime<T, Tr> {
             let outcome = tokio::select! {
                 biased;
                 _ = self.stop.notified() => Outcome::Stop,
-                _ = self.tick.tick() => Outcome::Tick,
+                _ = tick.tick() => Outcome::Tick,
                 progress = self.progress.changed() => Outcome::Progress(progress),
                 _ = self.durability.notified() => Outcome::Durability,
                 cmd = self.commands.recv() => Outcome::Command(cmd),
@@ -2050,7 +2188,7 @@ impl Drop for RuntimeThread {
 
 impl<T, Tr> Runtime<T, Tr>
 where
-    T: Transport + Clone + Send + 'static,
+    T: Transport + Clone + ForwardTransport + Send + 'static,
     Tr: TransportRx + Send + 'static,
 {
     /// Run this actor on a **dedicated OS thread** with its own current-thread

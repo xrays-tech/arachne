@@ -54,7 +54,7 @@ returns `AlreadyInitialized`; static reads before `start` (or after
 `NotInitialized`. For multi-node clusters or membership control, use `Runtime`
 / `Handle` directly.
 
-`Handle` is the full client surface: `put` / `get` / `get_stale` / `delete`, membership operations (`add_learner`, `promote_learner`, `remove_member`, `transfer_leader`, `membership`), raw proposal hooks, and `leader_hint` for redirects. The complete assembly — including how to wire the tonic transport and an HTTP front-end — is the `arachne-node` binary's `node.rs`, which serves as the reference integration.
+`Handle` is the full client surface: `put` / `get` / `get_stale` / `delete`, membership operations (`add_learner`, `promote_learner`, `remove_member`, `transfer_leader`, `membership`), raw proposal hooks, and `leader_hint` for redirects. The four membership operations take a **`RaftId`** (`u64`) — the member's **1-based ordinal in `initial_cluster`** (the i-th member ⇒ raft id = i+1) — whereas `leader_hint()` / the `NotLeader` hint return the leader's **address identity** (`NodeId` string + `SocketAddr`), *not* a `RaftId`; to derive the hinted leader's `RaftId` look up its `NodeId`'s position in `initial_cluster` (1-based). The complete assembly — including how to wire the tonic transport and an HTTP front-end — is the `arachne-node` binary's `node.rs`, which serves as the reference integration.
 
 ## Consistency semantics
 
@@ -64,7 +64,7 @@ The operation set is deliberately small, and the consistency story is stated up 
 |---|---|
 | `put` / `delete` | linearizable write — appended to the raft log, committed on quorum persistence, replied after apply |
 | `get` | linearizable read by default — served via **ReadIndex**; a non-leader node redirects or reports `NotLeader` |
-| `get_stale` | stale read — served from the local state machine, documented as **not guaranteed monotone** across calls |
+| `get_stale` | stale read — served from the local state machine, documented as **not guaranteed monotone** across calls. *Lagging read:* after a write commits, the local state machine catches up within millisecond scale (measured ≤7 ms), so a `get_stale` immediately after the commit may still return `None`/a stale value — a single `None` is **not** an authoritative denial that the key is absent. For authoritative reads, use the linearizable `get` |
 
 Arachne is a **CP** system: at most one leader at a time, writes and linearizable reads require a quorum, and when the quorum is lost every linearizable operation fails (`QuorumUnavailable`) rather than degrading to read-mostly or splitting the brain. `get_stale` keeps working in that state, with the staleness caveat above.
 
@@ -87,6 +87,10 @@ The workspace includes a runnable node binary that composes the library with the
 $ cargo build --release -p arachne-kv-node
 $ arachne-node --config path/to/node.toml
 ```
+
+> Note: building protobuf codegen needs a networked env (fetching the vendored
+> `protoc-bin-vendored`) or a pre-installed protoc 3.x (`PROTOC` /
+> `PROTOC_FALLBACK`; see `scripts/find-protoc.sh`).
 
 The config is a TOML file:
 

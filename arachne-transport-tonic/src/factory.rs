@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arachne_kv_seam::seam::{TransportFactory, TransportMessage};
+use arachne_kv_seam::seam::{CommandSink, TransportFactory, TransportMessage};
 use arachne_kv_seam::types::NodeId;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
@@ -127,6 +127,13 @@ struct FactoryInner<Io: TransportIo> {
     /// Set once before `start`; `None` makes `FetchSnapshot` answer
     /// `unavailable` instead of pretending the node can serve snapshots.
     snapshot_provider: Mutex<Option<Arc<dyn SnapshotProvider>>>,
+    /// Where forwarded client commands are run, keyed by the node the server
+    /// feeds (propsol v0.2.19). Each node's server looks its sink up at request
+    /// time (not start time), so the facade can register it right after
+    /// `Runtime::new`. A node without a sink makes its `Forward` RPC answer
+    /// `unavailable` — the follower's client falls back to the in-process /
+    /// quorum-unavailable path.
+    command_sinks: Arc<RwLock<HashMap<NodeId, Arc<dyn CommandSink>>>>,
     /// Live server handles, set by `start`, consumed by `shutdown`.
     servers: Mutex<Option<Vec<ServerHandle>>>,
     /// Resolved transport knobs; the optional setters overwrite individual
@@ -215,6 +222,7 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
                 receivers: Mutex::new(receivers),
                 rejects: Arc::new(AtomicU64::new(0)),
             snapshot_provider: Mutex::new(None),
+                command_sinks: Arc::new(RwLock::new(HashMap::new())),
                 servers: Mutex::new(None),
                 config: Mutex::new(TransportConfig {
                     connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -272,6 +280,17 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
     /// snapshots must say so rather than hang a follower.
     pub fn snapshot_provider(&self, provider: Arc<dyn SnapshotProvider>) -> &Self {
         *unlock(&self.inner.snapshot_provider) = Some(provider);
+        self
+    }
+
+    /// Install the sink this node runs forwarded client commands through
+    /// (propsol v0.2.19). Mirrors [`Self::snapshot_provider`]: call it before
+    /// [`Self::start`] (or [`Self::start_with_bind`]) — the gRPC service is built
+    /// at start-up and captures the sink then. Per-node: the sink is looked up
+    /// by the node the server feeds. A node without a sink makes its `Forward`
+    /// RPC answer `unavailable`.
+    pub fn set_command_sink(&self, node: NodeId, sink: Arc<dyn CommandSink>) -> &Self {
+        self.inner.command_sinks.write().unwrap().insert(node, sink);
         self
     }
 
@@ -418,6 +437,8 @@ impl<Io: TransportIo> TonicTransportFactory<Io> {
                 Arc::clone(&self.inner.rejects),
                 sender,
                 unlock(&self.inner.snapshot_provider).clone(),
+                Arc::clone(&self.inner.command_sinks),
+                node.clone(),
                 config.snapshot_rate_bps,
                 config.max_message_size,
             );

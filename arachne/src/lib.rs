@@ -77,6 +77,9 @@ pub use arachne_kv_seam::{
     NodeId, NodeIdError, RaftId, RaftState, Rng, Snapshot, SnapshotMeta, StateMachine, Storage,
     StorageError, Term, Timestamp, Transport, TransportFactory, TransportMessage, TransportRx,
 };
+pub use arachne_kv_seam::seam::{
+    CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport, RemoteForwarder,
+};
 pub use profile::{Profile, ProfileConfig, ProfileError};
 
 /// Return the current crate version (from `CARGO_PKG_VERSION`).

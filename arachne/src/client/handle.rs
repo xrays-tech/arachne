@@ -36,7 +36,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::client::ArachneError;
 use crate::runtime::Command;
 use crate::state_machine::KvStateMachine;
-use crate::{NodeId, ProfileConfig, RaftId};
+use crate::{
+    ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
+};
 use raft_seedable::eraftpb::ConfChangeType;
 
 /// The maximum number of client-side redirects (propsol §3.3: "default 3").
@@ -65,6 +67,7 @@ impl Handle {
     pub(crate) fn new_local(
         self_id: NodeId,
         tx: mpsc::Sender<Command>,
+        remote: Option<Arc<dyn RemoteForwarder>>,
         profile: &ProfileConfig,
     ) -> Self {
         Self {
@@ -93,6 +96,7 @@ impl Handle {
                         .saturating_mul(2)
                         .saturating_add(profile.election_timeout_ms.max(1)),
                 ),
+                remote,
             }),
             max_redirects: MAX_REDIRECTS,
         }
@@ -323,6 +327,112 @@ impl Handle {
 
     // ---- redirect (propsol §3.3) --------------------------------------------
 
+    /// Map a stable wire error code (produced by the leader's command sink,
+    /// [`crate::runtime::ForwardCommandSink::code`]) to the corresponding client
+    /// error. The `not_leader` case never appears as a code: it is signalled by a
+    /// `ForwardOutcome` carrying a fresh `leader_hint`, which drives re-redirect
+    /// below.
+    fn code_to_error(code: &str) -> ArachneError {
+        match code {
+            "quorum_unavailable" => ArachneError::QuorumUnavailable,
+            "timeout" => ArachneError::Timeout,
+            "busy" => ArachneError::Busy,
+            "session_expired" => ArachneError::SessionExpired,
+            "session_table_full" => ArachneError::SessionTableFull,
+            "shutting_down" => ArachneError::ShuttingDown,
+            // Anything else is an unrecoverable condition on the leader side
+            // (unknown kind, unavailable sink, …).
+            other => ArachneError::Unrecoverable(format!("forwarded request failed: {other}")),
+        }
+    }
+
+    /// Forward a write request to the leader over the wire (propsol v0.2.19).
+    ///
+    /// Multi-process analogue of the in-process redirect: when the hinted leader
+    /// is not a known in-process peer (a follower with no local peer handles),
+    /// the command is carried to the leader's gRPC `Forward` RPC via the
+    /// transport's [`RemoteForwarder`].
+    ///
+    /// Returns:
+    /// - `Ok(Ok(()))`            — the forwarded write committed.
+    /// - `Ok(Err(NotLeader{hint}))` — the leader re-redirected us (fresh hint;
+    ///   the caller must re-feed it).
+    /// - `Ok(Err(other))`         — the leader reported a stable failure code.
+    /// - `Err(e)`                 — the forward itself failed (dial/connect/
+    ///   timeout); treat as an unreachable leader.
+    async fn forward_request(
+        &self,
+        remote: &Arc<dyn RemoteForwarder>,
+        leader_id: NodeId,
+        leader_addr: SocketAddr,
+        req: &Request,
+        deadline: Instant,
+    ) -> Result<Result<(), ArachneError>, ArachneError> {
+        // Only writes are forwardable in M1. `ConfChange`/`TransferLeader` are
+        // only ever proposed by the node itself to a known in-process peer,
+        // so they never reach this path; refuse rather than hang if they do.
+        let forward_cmd = match req {
+            Request::Propose {
+                cmd,
+                client_id,
+                seq_no,
+            } => ForwardCommand::Propose {
+                cmd: cmd.clone(),
+                client_id: *client_id,
+                seq_no: *seq_no,
+            },
+            _ => return Err(ArachneError::QuorumUnavailable),
+        };
+
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            remote.forward(leader_id, leader_addr, forward_cmd),
+        ).await
+        {
+            Ok(Ok(outcome)) => {
+                // A `not_leader` outcome carries a *fresh* hint (re-redirect);
+                // otherwise the write succeeded.
+                match outcome.leader_hint {
+                    Some((id, a)) => Ok(Err(ArachneError::NotLeader {
+                        leader_hint: Some((id, a)),
+                    })),
+                    None => Ok(Ok(()))
+                }
+            }
+            // A stable code from the leader's command sink (a non-`not_leader`
+            // outcome never carries a hint).
+            Ok(Err(code)) => Ok(Err(Handle::code_to_error(&code))),
+            // Dial/connect/timeout: the leader is unreachable.
+            Err(_) => Err(ArachneError::QuorumUnavailable),
+        }
+    }
+
+    /// Reach `target_id` for `req`, choosing the in-process or wire path, and
+    /// return the *inner* result the redirect loop routes (`Ok(())` on success,
+    /// `Err(e)` for the node's verdict) or a reachability error (`Err(e)` on the
+    /// outer side, e.g. an unreachable leader or a gone peer).
+    async fn reach_target(
+        &self,
+        target_id: &NodeId,
+        wire_addr: Option<SocketAddr>,
+        req: &Request,
+        deadline: Instant,
+    ) -> Result<Result<(), ArachneError>, ArachneError> {
+        // In-process: a known in-process peer (self or a registered peer).
+        if self.handle_for(target_id).is_some() {
+            return self.send_request(target_id, req, deadline).await;
+        }
+        // No in-process peer: forward to the leader over the wire (the multi-
+        // process case). `wire_addr` is only `Some` when it came from a hint.
+        if let (Some(remote), Some(addr)) = (&self.inner.remote, wire_addr) {
+            return self
+                .forward_request(remote, target_id.clone(), addr, req, deadline)
+                .await;
+        }
+        // No path to the target: the cluster cannot be reached.
+        Err(ArachneError::QuorumUnavailable)
+    }
+
     async fn propose_with_redirect(
         &self,
         cmd: Vec<u8>,
@@ -343,39 +453,62 @@ impl Handle {
     /// the actor's channel, so they share this loop: a follower answers
     /// `NotLeader{hint}` for both, and both must not treat an unreachable peer
     /// as "this node is shutting down".
+    ///
+    /// The hint drives the target to reach: in-process when it's a known peer,
+    /// over the wire otherwise (the multi-process case). A fresh hint re-feeds
+    /// the loop toward the current leader.
     async fn request_with_redirect(&self, req: Request) -> Result<(), ArachneError> {
         let deadline = Instant::now() + self.inner.timeout;
         let order = self.target_order();
         let mut pos = 0usize;
         let mut redirects = 0u32;
-        let mut unreachable_peers = 0u32;
+        let mut unreachable = 0u32;
+        // The most recent known leader. While `None`, the loop walks the
+        // in-process order (self, then peers); once set, it drives the target
+        // to reach (via the wire if the leader is not an in-process peer).
+        let mut hint: Option<(NodeId, SocketAddr)> = None;
         loop {
-            let target = order[pos].clone();
-            let result = match self.send_request(&target, &req, deadline).await {
-                Ok(result) => result,
+            // Target to reach: the latest known leader, else the next in-process
+            // target. `wire_addr` is `Some` only when it came from a hint (i.e.
+            // the target is reached over the wire).
+            let (target_id, wire_addr) = match &hint {
+                Some((id, a)) => (id.clone(), Some(a.clone())),
+                None => (order[pos].clone(), None),
+            };
+            let result = match self
+                .reach_target(&target_id, wire_addr, &req, deadline)
+                .await
+            {
+                Ok(res) => res,
                 // A *peer* that no longer accepts requests is a node that went
-                // away, not this client's node shutting down: keep looking, and
-                // report the loss of quorum once every peer has failed. (A
-                // closed channel on `self` is a genuine shutdown and is
-                // propagated unchanged.)
-                Err(ArachneError::ShuttingDown) if target != self.inner.self_id => {
-                    unreachable_peers += 1;
-                    if unreachable_peers + 1 >= order.len() as u32 {
+                // away, not this client's node shutting down. While walking the
+                // in-process order, skip it; while following a hint, there is no
+                // "next" node, so report the loss of quorum. (A closed channel on
+                // `self` is a genuine shutdown and propagates unchanged.)
+                Err(ArachneError::ShuttingDown) if target_id != self.inner.self_id => {
+                    if hint.is_none() {
+                        unreachable += 1;
+                        if unreachable + 1 >= order.len() as u32 {
+                            return Err(ArachneError::QuorumUnavailable);
+                        }
+                        pos = (pos + 1) % order.len();
+                        continue;
+                    } else {
                         return Err(ArachneError::QuorumUnavailable);
                     }
-                    pos = (pos + 1) % order.len();
-                    continue;
                 }
                 Err(e) => return Err(e),
             };
             match result {
                 Ok(()) => return Ok(()),
+                // Re-redirect to the (possibly fresh) leader the node named.
                 Err(ArachneError::NotLeader { leader_hint }) => {
                     if self.max_redirects == 0 {
                         // Single-shot handle: surface the hint unchanged.
                         return Err(ArachneError::NotLeader { leader_hint });
                     }
-                    pos = self.redirect_pos(&order, pos, leader_hint)?;
+                    hint = leader_hint;
+                    pos = (pos + 1) % order.len();
                     redirects += 1;
                     if redirects > self.max_redirects {
                         return Err(ArachneError::Timeout);
@@ -394,32 +527,47 @@ impl Handle {
         let order = self.target_order();
         let mut pos = 0usize;
         let mut redirects = 0u32;
-        let mut unreachable_peers = 0u32;
+        let mut unreachable = 0u32;
+        // The most recent known leader (see `request_with_redirect`).
+        let mut hint: Option<(NodeId, SocketAddr)> = None;
         loop {
-            let target = order[pos].clone();
-            let result = match self.send_get(&target, key, deadline).await {
-                Ok(result) => result,
-                // See `propose_with_redirect`: a peer that cannot accept the
-                // request is unreachable, and unreachable peers mean the
-                // cluster cannot confirm a read index.
-                Err(ArachneError::ShuttingDown) if target != self.inner.self_id => {
-                    unreachable_peers += 1;
-                    if unreachable_peers + 1 >= order.len() as u32 {
+            // Target to reach: the latest known leader, else the next in-process
+            // target. `wire_addr` is `Some` only when it came from a hint.
+            let (target_id, wire_addr) = match &hint {
+                Some((id, a)) => (id.clone(), Some(a.clone())),
+                None => (order[pos].clone(), None),
+            };
+            let result = match self
+                .reach_get(&target_id, wire_addr, key, deadline)
+                .await
+            {
+                Ok(res) => res,
+                // A peer that cannot accept the request is unreachable; an
+                // unreachable peer means the cluster cannot confirm a read index.
+                Err(ArachneError::ShuttingDown) if target_id != self.inner.self_id => {
+                    if hint.is_none() {
+                        unreachable += 1;
+                        if unreachable + 1 >= order.len() as u32 {
+                            return Err(ArachneError::QuorumUnavailable);
+                        }
+                        pos = (pos + 1) % order.len();
+                        continue;
+                    } else {
                         return Err(ArachneError::QuorumUnavailable);
                     }
-                    pos = (pos + 1) % order.len();
-                    continue;
                 }
                 Err(e) => return Err(e),
             };
             match result {
                 Ok(value) => return Ok(value),
+                // Re-redirect to the (possibly fresh) leader the node named.
                 Err(ArachneError::NotLeader { leader_hint }) => {
                     if self.max_redirects == 0 {
                         // Single-shot handle: surface the hint unchanged.
                         return Err(ArachneError::NotLeader { leader_hint });
                     }
-                    pos = self.redirect_pos(&order, pos, leader_hint)?;
+                    hint = leader_hint;
+                    pos = (pos + 1) % order.len();
                     redirects += 1;
                     if redirects > self.max_redirects {
                         return Err(ArachneError::Timeout);
@@ -428,31 +576,6 @@ impl Handle {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    /// Resolve the next target position for a `NotLeader` hint: the hinted
-    /// leader if it is a known peer, otherwise the next peer in deterministic
-    /// order (the seeds-order fallback). No forward progress (no leader, or the
-    /// hint cycles back to ourselves) is a quorum failure.
-    fn redirect_pos(
-        &self,
-        order: &[NodeId],
-        pos: usize,
-        hint: Option<(NodeId, SocketAddr)>,
-    ) -> Result<usize, ArachneError> {
-        let Some((leader_id, _)) = hint else {
-            // No leader is known (or the leader stepped down): quorum is lost.
-            return Err(ArachneError::QuorumUnavailable);
-        };
-        let next = order
-            .iter()
-            .position(|id| id == &leader_id)
-            .unwrap_or((pos + 1) % order.len());
-        if next == pos {
-            // The hint points back at ourselves: no forward progress.
-            return Err(ArachneError::QuorumUnavailable);
-        }
-        Ok(next)
     }
 
     /// The ordered node list to try: self first, then peers in sorted order.
@@ -565,6 +688,69 @@ impl Handle {
         self.await_oneshot(ack_rx, deadline).await
     }
 
+    /// Forward a read to the leader over the wire (propsol v0.2.19).
+    ///
+    /// Multi-process analogue of the in-process read redirect. Returns:
+    /// - `Ok(Ok(value))`        — the forwarded read returned `value`.
+    /// - `Ok(Err(NotLeader{hint}))` — the leader re-redirected us (fresh hint).
+    /// - `Ok(Err(other))`       — the leader reported a stable failure code.
+    /// - `Err(e)`               — the forward itself failed; treat as unreachable.
+    async fn forward_get(
+        &self,
+        remote: &Arc<dyn RemoteForwarder>,
+        leader_id: NodeId,
+        leader_addr: SocketAddr,
+        key: &[u8],
+        deadline: Instant,
+    ) -> Result<Result<Option<Vec<u8>>, ArachneError>, ArachneError> {
+        let forward_cmd = ForwardCommand::Read {
+            key: key.to_vec(),
+        };
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            remote.forward(leader_id, leader_addr, forward_cmd),
+        ).await
+        {
+            Ok(Ok(outcome)) => {
+                // A `not_leader` outcome carries a *fresh* hint (re-redirect);
+                // otherwise the read succeeded and the value is returned.
+                match outcome.leader_hint {
+                    Some((id, a)) => Ok(Err(ArachneError::NotLeader {
+                        leader_hint: Some((id, a)),
+                    })),
+                    None => Ok(Ok(outcome.value)),
+                }
+            }
+            // A stable code from the leader's command sink.
+            Ok(Err(code)) => Ok(Err(Handle::code_to_error(&code))),
+            // Dial/connect/timeout: the leader is unreachable.
+            Err(_) => Err(ArachneError::QuorumUnavailable),
+        }
+    }
+
+    /// Reach `target_id` for a read, choosing the in-process or wire path, and
+    /// return the *inner* result the redirect loop routes (`Ok(value)` on success,
+    /// `Err(e)` for the node's verdict) or a reachability error (`Err(e)` on the
+    /// outer side).
+    async fn reach_get(
+        &self,
+        target_id: &NodeId,
+        wire_addr: Option<SocketAddr>,
+        key: &[u8],
+        deadline: Instant,
+    ) -> Result<Result<Option<Vec<u8>>, ArachneError>, ArachneError> {
+        // In-process: a known in-process peer (self or a registered peer).
+        if self.handle_for(target_id).is_some() {
+            return self.send_get(target_id, key, deadline).await;
+        }
+        // No in-process peer: forward to the leader over the wire.
+        if let (Some(remote), Some(addr)) = (&self.inner.remote, wire_addr) {
+            return self.forward_get(remote, target_id.clone(), addr, key, deadline).await;
+        }
+        // No path to the target: the cluster cannot be reached.
+        Err(ArachneError::QuorumUnavailable)
+    }
+
     /// Await a oneshot reply bounded by `deadline`. A dropped sender (the
     /// runtime actor stopped) is a shutdown; a timeout is a `Timeout`.
     async fn await_oneshot<T>(
@@ -651,6 +837,11 @@ struct HandleInner {
     /// The total deadline for a single **read** operation. Must exceed the
     /// runtime actor's ReadIndex budget (see [`Handle::new_local`]).
     read_timeout: Duration,
+    /// The follower's remote forwarder (propsol v0.2.19). `None` for in-memory
+    /// / peerless nodes, where the in-process redirect is the only path. When
+    /// set, a `NotLeader` whose hinted leader is not a known in-process peer is
+    /// forwarded over the wire instead of collapsing to `QuorumUnavailable`.
+    remote: Option<Arc<dyn RemoteForwarder>>,
 }
 
 /// The next per-handle `client_id`: the process id in the high bits (so

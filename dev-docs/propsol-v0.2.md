@@ -1,4 +1,4 @@
-# Arachne 设计文档（v0.2.24 运行中）
+# Arachne 设计文档（v0.2.25 运行中）
 
 > 上游文档：`propsol.md`（v0.1）。本文件在其基础上做需求/设计精化，**不包含实现代码**。
 > 设计基线不变：复用成熟共识内核（`tikv/raft-rs`，备选 `openraft`）、CP 语义、不自研共识、失去多数派不自动接管、不基于 ACK 超时自动剔除节点。
@@ -761,6 +761,8 @@ node.shutdown().await?;                      // 优雅关闭：停提案 → (�
 运维 API（`node` 上，供 CLI/嵌入方调用）：`add_learner`、`promote_learner`、`remove_member`（若目标是 leader 自动先 transfer）、`transfer_leader`、`leader_id()`、`metrics()`。`transfer_leader` 为**公开 API**（v0.2.1 决议 Q3）：shutdown 的可选转让与 `remove_member(leader)` 的先转让流程均内部依赖它，藏不住不如明示并纳入 M3 API review。
 运维入口（v0.2.4 决议 D-ART）：上述运维操作同时经 **`arachne-kv-node` CLI 子命令**暴露（`force-recovery`、成员操作、`leader-id`、metrics 导出）——嵌入方走 lib API，运维走 CLI，**二者调用同一 lib 路径**，不允许 bin 内出现第二套逻辑（test-plan §3.3）。
 
+**标识约定（v0.2.25 注记）**：成员变更四命令 `add_learner` / `promote_learner` / `remove_member` / `transfer_leader` 的参数是 **`RaftId`（u64，1 基序号）** = 成员在 `initial_cluster` 中的位置（第 i 个成员 ⇒ raft id = i+1，如三节点 `n1,n2,n3` ⇒ 1,2,3）；而 `leader_hint()` / `NotLeader.leader_hint` 返回 leader 的**地址身份**（`NodeId` 字符串 + `SocketAddr`），**不是 RaftId**。由 hinted NodeId 反查其 RaftId：按该 NodeId 在 `initial_cluster` 中的 1 基位置（第 i 位 ⇒ i+1）——两套编号的迁移在 `start_multi_node`（`initial_cluster` 第 i 项 ⇒ 对端 raft id = i+1；自身 raft id = 自身在 `initial_cluster` 中的 1 基位置）中建立。
+
 ### 3.2 错误模型（完整枚举）
 
 ```rust
@@ -871,6 +873,7 @@ enum ArachneError {
   4. 加入节点在握手期校验 `cluster_id` + mTLS 证书身份（CN ↔ node_id 映射）；异集群节点拒绝并返回 `ClusterIdMismatch`，防数据混写。
 - **rejoin**：依赖持久化 `node_id` + PreVote，不重走"加入"流程。
 - 集群可缩容至 1 节点（Raft 安全性由多数派保证），文档提示 2 节点集群容错为 0。
+- **标识约定（v0.2.25 注记）**：上述命令的参数为 `RaftId`（u64）= 成员在 `initial_cluster` 中的 **1 基序号**（第 i 个成员 ⇒ raft id = i+1）；与之相对，`leader_hint()` / `NotLeader.leader_hint` 返回的是 leader 的**地址身份** `(NodeId, SocketAddr)`，不是 RaftId；反查：按 hinted NodeId 在 `initial_cluster` 中的位置取 1 基序号。
 
 ### 5.4 读路径
 

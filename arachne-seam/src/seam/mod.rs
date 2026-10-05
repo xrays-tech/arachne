@@ -12,11 +12,13 @@
 //! See each submodule for the precise contract and its determinism rules.
 
 mod clock;
+mod forward;
 mod rng;
 mod state_machine;
 mod transport;
 
 pub use clock::Clock;
+pub use forward::{CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport, RemoteForwarder};
 pub use rng::Rng;
 pub use state_machine::{ApplyOutcome, StateMachine};
 pub use transport::{Transport, TransportFactory, TransportMessage, TransportRx};

@@ -25,8 +25,8 @@ pub mod storage;
 pub mod types;
 
 pub use seam::{
-    ApplyOutcome, Clock, Rng, StateMachine, Transport, TransportFactory, TransportMessage,
-    TransportRx,
+    ApplyOutcome, Clock, CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport, Rng,
+    RemoteForwarder, StateMachine, Transport, TransportFactory, TransportMessage, TransportRx,
 };
 pub use storage::{
     ConfState, EntryType, FsyncObserver, HardState, LogEntry, RaftId, RaftState, Snapshot,

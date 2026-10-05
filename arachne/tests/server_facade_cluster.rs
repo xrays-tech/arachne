@@ -161,10 +161,11 @@ mod cluster {
             .await
             .expect("a leader must be elected in the 3-node cluster");
 
-        // Write through the leader, then confirm via the leader's stale read.
+        // Write through the leader, then confirm via a redirect-following read.
         nodes[leader].handle.put(b"hello", b"world").await.expect("put through leader");
-        assert!(
-            nodes[leader].handle.get_stale(b"hello").await == Ok(Some(b"world".to_vec())),
+        assert_eq!(
+            nodes[leader].handle.get(b"hello").await,
+            Ok(Some(b"world".to_vec())),
             "leader should serve the written value"
         );
 
@@ -197,12 +198,9 @@ mod cluster {
 
         // Commit a value before killing the leader.
         nodes[leader].handle.put(b"key", b"value-1").await.expect("commit value-1");
-        assert!(
-            nodes[leader]
-                .handle
-                .get_stale(b"key")
-                .await
-                .is_ok(),
+        assert_eq!(
+            nodes[leader].handle.get(b"key").await,
+            Ok(Some(b"value-1".to_vec())),
             "leader committed value-1"
         );
 
@@ -247,12 +245,9 @@ mod cluster {
             .put(b"key", b"value-2")
             .await
             .expect("write through new leader");
-        assert!(
-            nodes[new_leader]
-                .handle
-                .get_stale(b"key")
-                .await
-                == Ok(Some(b"value-2".to_vec())),
+        assert_eq!(
+            nodes[new_leader].handle.get(b"key").await,
+            Ok(Some(b"value-2".to_vec())),
             "new leader should serve the post-failover value"
         );
 

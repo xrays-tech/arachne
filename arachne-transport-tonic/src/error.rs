@@ -19,6 +19,22 @@ pub const ERR_PROTOCOL_MISMATCH: &str = "protocol_mismatch";
 /// cluster misconfigured with an empty id / major `0`).
 pub const ERR_HELLO_MISSING: &str = "missing_hello";
 
+/// Stable wire code: the forwarded target is not the leader; a fresh
+/// `leader_*` hint is attached to the `ForwardReply`.
+pub const ERR_NOT_LEADER: &str = "not_leader";
+/// Stable wire code: the command could not be run because quorum is lost.
+pub const ERR_QUORUM_UNAVAILABLE: &str = "quorum_unavailable";
+/// Stable wire code: the forwarded command timed out.
+pub const ERR_TIMEOUT: &str = "timeout";
+/// Stable wire code: the command queue / read queue is full.
+pub const ERR_BUSY: &str = "busy";
+/// Stable wire code: the session has expired.
+pub const ERR_SESSION_EXPIRED: &str = "session_expired";
+/// Stable wire code: the session table is full.
+pub const ERR_SESSION_TABLE_FULL: &str = "session_table_full";
+/// Stable wire code: the node is shutting down.
+pub const ERR_SHUTTING_DOWN: &str = "shutting_down";
+
 /// Errors the tonic transport reports to the core.
 ///
 /// The node treats a failed `send` as non-fatal (raft retransmits), so these

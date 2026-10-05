@@ -57,6 +57,7 @@ use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne_kv::{
     FsyncObserver, NodeId, RaftId, StateMachine, Transport, TransportFactory, TransportMessage,
 };
+use arachne_kv::ForwardTransport;
 use arachne_kv_testsupport::{
     block_on, FsyncLedger, InMemoryRx, InMemoryTransportFactory, InMemoryTx, TransportError,
 };
@@ -196,6 +197,9 @@ impl Transport for RecordingTx {
         std::future::ready(result)
     }
 }
+
+// No forwarding in the ordering harness (it's in-memory); default `None`.
+impl ForwardTransport for RecordingTx {}
 
 // ---------------------------------------------------------------------------
 // Two-node cluster over the recording transport

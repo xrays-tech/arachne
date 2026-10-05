@@ -122,6 +122,7 @@
         </div>
         <div class="desc">
           <p>本地（弱）读：直接读节点自身提交状态；在单节点上即使 ReadIndex 轮未完成也可用。</p>
+          <p><strong>滞后读取</strong>：写入提交后本节点状态机在毫秒级（实测 ≤7ms）内追平；因此提交后紧接的一次 <code>get_stale</code> 可能返回 <code>None</code>/旧值——单次 <code>None</code> 不是该 key「不存在」的权威否证。需要权威读请用线性一致的 <code>get</code>。</p>
         </div>
       </div>
 
@@ -168,7 +169,10 @@
         <code>Handle</code> 是连接一个节点运行时 actor 的客户端入口，<code>Clone</code> 廉价
         （包裹 <code>Arc</code>）。一次操作返回 <code>NotLeader</code> 时按提示重定向，
         最多 <code>MAX_REDIRECTS</code>（3）次，总 deadline 为一个选举超时，超时返回
-        <code>Timeout</code>。正常情况下通过 <code>Runtime::new</code> 的返回值或
+        <code>Timeout</code>。重定向目标优先 <code>register_peer</code> 注册的进程内对端；
+        否则（真实多进程集群的任意节点读写）会经 tonic 向提示的 <code>SocketAddr</code>
+        发送 <strong>Forward RPC</strong>，由 leader 注入本地运行时完成命令——库内透明转发，
+        调用方无需自行重发。正常情况下通过 <code>Runtime::new</code> 的返回值或
         <code>Arachne::handle()</code> 获得。
       </p>
 
@@ -193,7 +197,7 @@
             </tr>
             <tr>
               <td><code>get_stale(&amp;self, key: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, ArachneError&gt;</code></td>
-              <td>任意陈旧读：直接读本节点已应用状态机。任何节点可答（无重定向），可能陈旧，且<strong>不保证单调</strong>。</td>
+              <td>任意陈旧读：直接读本节点已应用状态机。任何节点可答（无重定向），可能陈旧，且<strong>不保证单调</strong>。滞后读取：写入提交后本节点状态机在毫秒级（实测 ≤7ms）内追平；提交后紧接的一次可能返回 <code>None</code>/旧值——单次 <code>None</code> 不是该 key「不存在」的权威否证，需要权威读请用 <code>get</code>。</td>
             </tr>
           </tbody>
         </table>
@@ -220,7 +224,7 @@
             </tr>
             <tr>
               <td><code>membership(&amp;self) -&gt; Result&lt;(Vec&lt;RaftId&gt;, Vec&lt;RaftId&gt;), ArachneError&gt;</code></td>
-              <td>返回已应用的成员关系 <code>(voters, learners)</code>。本地态读取：任何节点（含非 leader）都能答，仲裁丢失时也不会挂起。</td>
+              <td>返回已应用的成员关系 <code>(voters, learners)</code>（同为 <code>RaftId</code> 编号）。本地态读取：任何节点（含非 leader）都能答，仲裁丢失时也不会挂起。</td>
             </tr>
             <tr>
               <td><code>transfer_leader(&amp;self, node_id: RaftId) -&gt; Result&lt;(), ArachneError&gt;</code></td>
@@ -228,6 +232,15 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          上述成员变更方法（<code>add_learner</code> / <code>promote_learner</code> / <code>remove_member</code> / <code>transfer_leader</code>）的参数 <code>id</code> 是
+          <code>RaftId</code>（<code>u64</code>）= 成员在 <code>initial_cluster</code> 中的 <strong>1 基序号</strong>
+          （<code>initial_cluster</code> 第 i 个成员 ⇒ raft id = i+1，如 <code>n1,n2,n3</code> 三节点 ⇒ 1,2,3）。
+        </p>
       </div>
 
       <p style="margin-top:14px;">成员变更的单发纪律：同一时刻至多一个成员变更在进行，第二个被 <code>ConfChangePending</code> 拒绝；普通写不受影响。</p>
@@ -253,7 +266,7 @@
             </tr>
             <tr>
               <td><code>leader_hint(&amp;self) -&gt; Option&lt;(NodeId, SocketAddr)&gt;</code>（async）</td>
-              <td>报告节点当前的 leader 提示：已知 leader 时返回其 <code>(NodeId, SocketAddr)</code>，否则 <code>None</code>（无 leader / 失仲裁）。受操作 deadline 约束。</td>
+              <td>报告节点当前的 leader 提示：已知 leader 时返回其 <code>(NodeId, SocketAddr)</code>，否则 <code>None</code>（无 leader / 失仲裁）。受操作 deadline 约束。注意：返回的是 leader 的<strong>地址身份</strong>（<code>NodeId</code> 字符串 + <code>SocketAddr</code>），<strong>不是 <code>RaftId</code></strong>；由 <code>leader_hint</code> 反查其 <code>RaftId</code>：按该 <code>NodeId</code> 在 <code>initial_cluster</code> 中的 1 基位置（第 i 位 ⇒ raft id = i+1）。</td>
             </tr>
             <tr>
               <td><code>const MAX_REDIRECTS: u32</code></td>
@@ -343,7 +356,7 @@
             <tr><th>变体</th><th>出现时机</th><th>HTTP 映射</th></tr>
           </thead>
           <tbody>
-            <tr><td><code>NotLeader { leader_hint: Option&lt;(NodeId, SocketAddr)&gt; }</code></td><td>本节点不是 leader；提示（可能过期）指向当前 leader。客户端应重定向。</td><td><span class="nowrap">409 Conflict</span> + leader body</td></tr>
+            <tr><td><code>NotLeader { leader_hint: Option&lt;(NodeId, SocketAddr)&gt; }</code></td><td>本节点不是 leader；提示（可能过期）指向当前 leader。客户端应重定向。提示同样是 leader 的<strong>地址身份</strong>（<code>NodeId</code> + <code>SocketAddr</code>），不是 <code>RaftId</code>：反查 <code>RaftId</code> 按 <code>initial_cluster</code> 位置（第 i 位 ⇒ raft id = i+1）。</td><td><span class="nowrap">409 Conflict</span> + leader body</td></tr>
             <tr><td><code>QuorumUnavailable</code></td><td>失去仲裁：leader 退位、无已知 leader，或 ReadIndex 仲裁轮失败。</td><td><span class="nowrap">503 Service Unavailable</span></td></tr>
             <tr><td><code>Timeout</code></td><td>有界等待耗尽，<strong>结果未知</strong>（写可能已落）。</td><td><span class="nowrap">503</span></td></tr>
             <tr><td><code>Busy</code></td><td>背压：提议队列或读等待队列满。非致命，稍后重试。</td><td><span class="nowrap">503</span></td></tr>

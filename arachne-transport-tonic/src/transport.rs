@@ -9,19 +9,24 @@
 //! resolved by the node itself.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
-use arachne_kv_seam::seam::{Transport, TransportMessage};
+use arachne_kv_seam::seam::{ForwardCommand, ForwardOutcome, ForwardTransport, RemoteForwarder, Transport, TransportMessage};
 use arachne_kv_seam::types::NodeId;
 use tokio::io::AsyncWriteExt;
 use tonic::transport::{Channel, Endpoint};
+use tonic::Request;
 
 use crate::error::TransportError;
 use crate::factory::TransportConfig;
 use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_client::RaftTransportClient;
-use crate::proto::{Hello, RaftEnvelope, SnapshotRequest};
+use crate::proto::{
+    ForwardReply, ForwardRequest, Hello, RaftEnvelope, SnapshotRequest,
+};
 use crate::unlock;
 use crate::unlock_read;
 
@@ -209,6 +214,127 @@ impl<Io: TransportIo> Transport for TonicTransport<Io> {
             .await
             .map_err(|e| TransportError::SnapshotStream(e.to_string()))?;
         Ok(Some(written))
+    }
+}
+
+/// Client-side forwarder for [`ForwardTransport`]: dials the leader over gRPC
+/// and carries a forwarded client command to its runtime. It reuses the same
+/// per-peer channel cache as the raft `send` path (same connector, same client
+/// knobs, same `get_or_connect` channel reuse), so the forward is no more
+/// expensive than a raft message.
+struct Forwarder<Io: TransportIo> {
+    /// A clone of the owning transport (shares the address map, channel cache,
+    /// handshake and client knobs). The clone is `Clone` and cheap to make.
+    transport: TonicTransport<Io>,
+}
+
+impl<Io: TransportIo> Forwarder<Io> {
+    /// Carry `c` to the leader at `addr` (the hint), mapping the reply to a
+    /// `ForwardOutcome`. A `not_leader` reply re-emits a *fresh* hint so the
+    /// caller can re-redirect; any other stable code is returned as an `Err`.
+    async fn do_forward(&self, to: NodeId, addr: SocketAddr, c: ForwardCommand) -> Result<ForwardOutcome, String> {
+        // Build the wire request. The sender's handshake rides the outbound hello
+        // (this node's handshake, unchanged — it identifies the *origin* of the
+        // command); the leader's dedup uses `client_id`/`seq_no` from `c`, which
+        // were minted by the originating client and never changed in transit.
+        let mut req = ForwardRequest {
+            kind: 0,
+            cmd: Vec::new(),
+            key: Vec::new(),
+            client_id: 0,
+            seq_no: 0,
+            hello: Some(self.transport.hello.clone()),
+        };
+        match c {
+            // 0 = propose (write).
+            ForwardCommand::Propose { cmd, client_id, seq_no } => {
+                req.kind = 0;
+                req.cmd = cmd;
+                req.client_id = client_id;
+                req.seq_no = seq_no;
+            }
+            // 1 = read (ReadIndex).
+            ForwardCommand::Read { key } => {
+                req.kind = 1;
+                req.key = key;
+            }
+            // 2 = stale read.
+            ForwardCommand::GetStale { key } => {
+                req.kind = 2;
+                req.key = key;
+            }
+        }
+
+        // Reuse the cached channel to the leader (keyed by `to`), or open a new
+        // one. A `not_leader` hint always carries the leader's *current* address,
+        // so dialing `addr` is safe even if the node's map is momentarily stale.
+        let channel = get_or_connect::<Io>(
+            &self.transport.channels,
+            &self.transport.connector,
+            &to,
+            addr,
+            self.transport.config,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut client = RaftTransportClient::new(channel)
+            .max_decoding_message_size(self.transport.config.max_message_size)
+            .max_encoding_message_size(self.transport.config.max_message_size);
+        let response: tonic::Response<ForwardReply> = client
+            .forward(Request::new(req))
+            .await
+            .map_err(|e: tonic::Status| e.to_string())?;
+
+        let reply = response.into_inner();
+        if reply.ok {
+            // A successful forward: `value` is the read's answer (empty for a
+            // write) and there is no new hint.
+            Ok(ForwardOutcome {
+                value: Some(reply.value),
+                leader_hint: None,
+            })
+        } else if reply.error_code == "not_leader" {
+            // The leader redirected: hand back a fresh hint so the caller can
+            // re-feed it into its redirect loop. No value to carry.
+            let leader_addr: SocketAddr = reply
+                .leader_addr
+                .parse()
+                .map_err(|_| "bad leader address".to_string())?;
+            Ok(ForwardOutcome {
+                value: None,
+                leader_hint: Some((NodeId::new(reply.leader_node_id), leader_addr)),
+            })
+        } else {
+            // A stable code that carries no hint (quorum_unavailable, timeout,
+            // busy, session_expired, session_table_full, shutting_down,
+            // unavailable, …). Return it so the client maps it to its typed error.
+            Err(reply.error_code)
+        }
+    }
+}
+
+impl<Io: TransportIo> RemoteForwarder for Forwarder<Io> {
+    fn forward(
+        &self,
+        to: NodeId,
+        addr: SocketAddr,
+        c: ForwardCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<ForwardOutcome, String>> + Send + '_>> {
+        let transport = self.transport.clone();
+        Box::pin(async move {
+            Forwarder { transport }.do_forward(to, addr, c).await
+        })
+    }
+}
+
+impl<Io: TransportIo> ForwardTransport for TonicTransport<Io> {
+    /// This node *can* forward commands (it has a real gRPC client). The forwarder
+    /// is minted on demand; it reuses the transport's shared channel cache.
+    fn forwarder(&self) -> Option<Arc<dyn RemoteForwarder>> {
+        Some(Arc::new(Forwarder {
+            transport: self.clone(),
+        }))
     }
 }
 

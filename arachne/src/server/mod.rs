@@ -43,6 +43,7 @@ use std::sync::mpsc;
 use std::time::SystemTime;
 
 use arachne_kv_seam::{NodeId, RaftId, Transport, TransportMessage, TransportRx};
+use arachne_kv_seam::ForwardTransport;
 #[cfg(feature = "transport-tonic")]
 use arachne_kv_seam::TransportFactory;
 
@@ -109,6 +110,12 @@ impl Transport for PeerlessTx {
         std::future::ready(Ok(()))
     }
 }
+
+/// The peerless (singleton) node has no remote peers, so remote forwarding is
+/// impossible. The default `forwarder()` implementation (returning `None`)
+/// is what the client falls back to: it keeps its in-process redirect /
+/// quorum-unavailable path, which is exactly right for a single node.
+impl ForwardTransport for PeerlessTx {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerlessSendError;
@@ -525,7 +532,7 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
                     .position(|n| n == &node_id)
                     .unwrap_or(0) + 1)
                     as RaftId,
-                self_node_id: node_id,
+                self_node_id: node_id.clone(),
                 peers,
                 addresses,
                 raft,
@@ -546,6 +553,10 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
                     return Err(format!("facade init: {e}"));
                 }
             };
+
+            // Register this node's command sink so its gRPC `Forward` RPC can
+            // run forwarded client commands against the runtime.
+            factory.set_command_sink(node_id, runtime.command_sink());
 
             let thread = runtime
                 .spawn_dedicated()
@@ -674,6 +685,11 @@ pub async fn assemble_cluster(
 
     let (runtime, handle) = Runtime::new(runtime_config, wal, tx, rx, &logger)
         .map_err(|e| ArachneError::Unrecoverable(format!("assemble_cluster: {e}")))?;
+    // Register this node's command sink with the transport so its gRPC
+    // `Forward` RPC can run forwarded client commands against the runtime.
+    // The sink is looked up at request time (not start time), so it can be
+    // registered after `start_with_bind`.
+    factory.set_command_sink(node_id, runtime.command_sink());
     let thread = runtime
         .spawn_dedicated()
         .map_err(|e| ArachneError::Unrecoverable(format!("assemble_cluster: cannot spawn actor thread: {e}")))?;

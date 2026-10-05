@@ -27,7 +27,10 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
-use arachne_kv_seam::{NodeId, Transport, TransportFactory, TransportMessage, TransportRx};
+use arachne_kv_seam::{
+    NodeId, Transport, TransportFactory, TransportMessage, TransportRx,
+};
+use arachne_kv_seam::ForwardTransport;
 
 /// Errors an in-memory transport can report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +271,12 @@ impl Transport for InMemoryTx {
         std::future::ready(result)
     }
 }
+
+// The in-memory switch is a *test* transport that only ever carries raft
+// messages; it has no notion of a separate process's leader, so it offers no
+// forwarder. Leaving this as the default (`forwarder() -> None`) keeps every
+// in-memory / simulator path exactly as it was.
+impl ForwardTransport for InMemoryTx {}
 
 /// The inbound half for one node.
 #[derive(Debug)]

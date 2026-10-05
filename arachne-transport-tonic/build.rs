@@ -19,6 +19,11 @@
 // own process, no other thread runs concurrently to observe the environment
 // change, and the variable is set once before any `prost-build` call reads it.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Re-run this script whenever the wire protocol changes. Cargo tracks files
+    // opened in a build script; without this the generated proto stays stale after
+    // a `raft.proto` edit.
+    std::fs::File::open("proto/raft.proto")?;
+
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     // SAFETY: single-threaded build script; set once before any read of
     // `PROTOC`. No concurrent access to the process environment exists here.

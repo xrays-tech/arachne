@@ -39,6 +39,7 @@ use arachne_kv::{
     FsyncObserver, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportFactory,
     TransportMessage,
 };
+use arachne_kv::ForwardTransport;
 use arachne_kv_testsupport::{
     block_on, DurabilityLedger, FaultSchedule, FaultyStorage, InMemoryRx, InMemoryTransportFactory,
     InMemoryTx, TransportError,
@@ -179,6 +180,9 @@ impl Transport for DurabilityTx {
         std::future::ready(result)
     }
 }
+
+// No forwarding in the durability harness (it's in-process); default `None`.
+impl ForwardTransport for DurabilityTx {}
 
 // ---------------------------------------------------------------------------
 // Cluster

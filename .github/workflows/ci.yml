@@ -40,6 +40,9 @@ jobs:
       # calendar-versioned releases modern distros ship. Install a pinned 3.x
       # and put it on PATH; `scripts/find-protoc.sh` (pointed at by PROTOC in
       # .cargo/config.toml) then resolves it.
+      # Note: building protobuf codegen needs a networked env (fetching the
+      # vendored `protoc-bin-vendored`) or a pre-installed protoc 3.x
+      # (`PROTOC`/`PROTOC_FALLBACK`; see `scripts/find-protoc.sh`).
       - name: Install protoc 3.x (raft-proto codegen requirement)
         run: |
           set -euo pipefail
@@ -146,6 +149,9 @@ jobs:
           rustup toolchain install "${channel}" --profile minimal
           rustup default "${channel}"
 
+      # Note: building protobuf codegen needs a networked env (fetching the
+      # vendored `protoc-bin-vendored`) or a pre-installed protoc 3.x
+      # (`PROTOC`/`PROTOC_FALLBACK`; see `scripts/find-protoc.sh`).
       - name: Install protoc 3.x (raft-proto codegen requirement)
         run: |
           set -euo pipefail
@@ -185,6 +191,9 @@ jobs:
       # `protoc` 3.x. Without this the fuzz job died while *building* the target
       # (`protobuf-build` panics with `Option::unwrap() on None`), before the
       # fuzzer ever ran.
+      # Note: building protobuf codegen needs a networked env (fetching the
+      # vendored `protoc-bin-vendored`) or a pre-installed protoc 3.x
+      # (`PROTOC`/`PROTOC_FALLBACK`; see `scripts/find-protoc.sh`).
       - name: Install protoc 3.x (raft-proto codegen requirement)
         run: |
           set -euo pipefail
