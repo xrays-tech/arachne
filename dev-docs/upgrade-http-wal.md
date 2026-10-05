@@ -46,9 +46,9 @@ in-network 驱动；`arachne/tests/bench_runtime.rs`（进程内，`#[ignore]`�
 ## 3. 批次拆分与依赖
 
 ```
-B1 (U1) HTTP 面重构 hyper —— arachne-node 	┐ 相互独立，可并行派发
-B2 (U2) WAL sync 平台化 + 段预分配 —— arachne 核心 ┘
-B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne 核心   ← 依赖 B2（在 B2 的 sync 抽象/流水线上续）
+B1 (U1) HTTP 面重构 hyper —— arachne-kv-node	┐ 相互独立，可并行派发
+B2 (U2) WAL sync 平台化 + 段预分配 —— arachne-kv 核心 ┘
+B3 (U3) 组提交（一次 sync 落一批并发写）—— arachne-kv 核心   ← 依赖 B2（在 B2 的 sync 抽象/流水线上续）
 ```
 
 - **B1、B2 无文件重叠**（B1 限 `arachne-node/`，B2 限 `arachne/src/storage/`），可并行。

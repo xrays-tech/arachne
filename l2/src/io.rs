@@ -1,12 +1,12 @@
 //! The deterministic I/O seam for the tonic transport, over `turmoil` (M1 stage 3b).
 //!
 //! [`TurmoilIo`] is the simulator's implementation of the production
-//! [`TransportIo`](arachne_transport_tonic::TransportIo) seam. It virtualizes
+//! [`TransportIo`](arachne_kv_transport_tonic::TransportIo) seam. It virtualizes
 //! every OS touch point the transport uses — listener bind, the incoming
 //! connection stream, and the client-side dial — on top of `turmoil`'s
 //! simulated TCP. The transport code (`factory.rs` / `transport.rs`) is
 //! unchanged: it is generic over `Io`, and this file is the only thing that
-//! differs from production's [`TokioIoProvider`](arachne_transport_tonic::TokioIoProvider).
+//! differs from production's [`TokioIoProvider`](arachne_kv_transport_tonic::TokioIoProvider).
 //!
 //! No real network, no wall clock, no real sleeps: everything runs on turmoil's
 //! seeded simulated network + clock, which is what makes the 3-node cluster
@@ -111,7 +111,7 @@ impl Service<Uri> for TurmoilConnector {
     }
 }
 
-impl arachne_transport_tonic::TransportIo for TurmoilIo {
+impl arachne_kv_transport_tonic::TransportIo for TurmoilIo {
     type Listener = TcpListener;
     // `Pin<Box<dyn Stream ..>>` is itself `Unpin` (the `Unpin` bound on the
     // associated type is satisfied by the box), so we must NOT also require

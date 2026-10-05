@@ -54,11 +54,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arachne_seam::storage::{
+use arachne_kv_seam::storage::{
     ConfState, FlushToken, FlushWaker, FsyncObserver, HardState, LogEntry, PersistSubmit,
     RaftState, Snapshot, Storage, StorageError,
 };
-use arachne_seam::types::{LogIndex, Term};
+use arachne_kv_seam::types::{LogIndex, Term};
 
 use crate::storage::format::{
     decode_entry, decode_hard_state, decode_record, encode_entry, encode_hard_state,
@@ -2046,21 +2046,21 @@ fn truncate_file_at(path: &Path, offset: u64) -> Result<(), StorageError> {
 }
 
 /// Convert a `u8` entry type (from the wire format) to the seam `EntryType`.
-fn entry_type_to_seam(ety: u8) -> arachne_seam::storage::EntryType {
+fn entry_type_to_seam(ety: u8) -> arachne_kv_seam::storage::EntryType {
     match ety {
-        0 => arachne_seam::storage::EntryType::Entry,
-        1 => arachne_seam::storage::EntryType::ConfChange,
-        2 => arachne_seam::storage::EntryType::ConfChangeV2,
-        _ => arachne_seam::storage::EntryType::Entry,
+        0 => arachne_kv_seam::storage::EntryType::Entry,
+        1 => arachne_kv_seam::storage::EntryType::ConfChange,
+        2 => arachne_kv_seam::storage::EntryType::ConfChangeV2,
+        _ => arachne_kv_seam::storage::EntryType::Entry,
     }
 }
 
 /// Convert a seam `EntryType` to its `u8` wire representation.
-fn seam_entry_type_to_u8(ety: arachne_seam::storage::EntryType) -> u8 {
+fn seam_entry_type_to_u8(ety: arachne_kv_seam::storage::EntryType) -> u8 {
     match ety {
-        arachne_seam::storage::EntryType::Entry => 0,
-        arachne_seam::storage::EntryType::ConfChange => 1,
-        arachne_seam::storage::EntryType::ConfChangeV2 => 2,
+        arachne_kv_seam::storage::EntryType::Entry => 0,
+        arachne_kv_seam::storage::EntryType::ConfChange => 1,
+        arachne_kv_seam::storage::EntryType::ConfChangeV2 => 2,
     }
 }
 
@@ -2068,7 +2068,7 @@ fn seam_entry_type_to_u8(ety: arachne_seam::storage::EntryType) -> u8 {
 mod tests {
     use super::*;
     use crate::storage::segment_name;
-    use arachne_seam::storage::{ConfState, SnapshotMeta};
+    use arachne_kv_seam::storage::{ConfState, SnapshotMeta};
     use std::fs;
 
     /// Create a unique temp directory for a test.
@@ -2125,7 +2125,7 @@ mod tests {
         LogEntry {
             index,
             term,
-            entry_type: arachne_seam::storage::EntryType::Entry,
+            entry_type: arachne_kv_seam::storage::EntryType::Entry,
             data: data.to_vec(),
         }
     }
@@ -3056,7 +3056,7 @@ mod tests {
 
     #[test]
     fn buffered_writes_become_durable_only_after_an_offloaded_flush() {
-        use arachne_testsupport::FsyncLedger;
+        use arachne_kv_testsupport::FsyncLedger;
         use std::sync::Arc;
 
         let dir = temp_dir();
@@ -3105,7 +3105,7 @@ mod tests {
 
     #[test]
     fn offloaded_durability_defers_the_flush_until_polled() {
-        use arachne_testsupport::FsyncLedger;
+        use arachne_kv_testsupport::FsyncLedger;
 
         let dir = temp_dir();
         let ledger = Arc::new(FsyncLedger::new());
@@ -3984,7 +3984,7 @@ mod tests {
     #[test]
     #[cfg(feature = "fault-injection")]
     fn coalesced_flush_counted_once_per_segment() {
-        use arachne_testsupport::FsyncLedger;
+        use arachne_kv_testsupport::FsyncLedger;
         use std::sync::Arc;
         // 5 entries, all in one segment (default 128 MiB). A drain-coalescing
         // flush loop must emit exactly ONE real fsync for the 5 queued jobs,

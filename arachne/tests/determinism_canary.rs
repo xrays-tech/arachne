@@ -37,11 +37,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{NodeId, RaftId, StateMachine, TransportFactory, TransportMessage};
-use arachne_testsupport::{block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx};
+use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{NodeId, RaftId, StateMachine, TransportFactory, TransportMessage};
+use arachne_kv_testsupport::{block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx};
 use raft::prelude::{ConfState, Config, Raft};
 use raft::storage::MemStorage;
 use raft::{clear_election_rng_seed, set_election_rng_seed};

@@ -63,13 +63,13 @@
             <tr><th>crate / 模块</th><th>职责</th><th>本页覆盖</th></tr>
           </thead>
           <tbody>
-            <tr><td><code>arachne::server</code></td><td>进程内嵌入 facade（零 tokio、单实例）</td><td>第 2 节：<code>Arachne</code></td></tr>
-            <tr><td><code>arachne::client</code></td><td>客户端 API 层：错误模型与 <code>Handle</code></td><td>第 3 节 <code>Handle</code>、第 5 节 <code>ArachneError</code></td></tr>
-            <tr><td><code>arachne::storage</code></td><td>WAL、段、同步、CRC</td><td>第 4 节：<code>WalConfig</code> / <code>WalOptions</code></td></tr>
-            <tr><td><code>arachne::consensus</code></td><td>raft 节点（<code>RaftNode</code>）与节点配置</td><td>教程第 7 节</td></tr>
-            <tr><td><code>arachne::state_machine</code></td><td>KV 状态机（<code>KvStateMachine</code>）</td><td>教程第 7 节</td></tr>
-            <tr><td><code>arachne::runtime</code></td><td>actor + 客户端 <code>Handle</code> 的宿主</td><td>教程第 5 节</td></tr>
-            <tr><td><code>arachne-node</code></td><td>参考节点二进制：HTTP、配置、成员运维面</td><td>第 6 节：HTTP 接口</td></tr>
+            <tr><td><code>arachne_kv::server</code></td><td>进程内嵌入 facade（零 tokio、单实例）</td><td>第 2 节：<code>Arachne</code></td></tr>
+            <tr><td><code>arachne_kv::client</code></td><td>客户端 API 层：错误模型与 <code>Handle</code></td><td>第 3 节 <code>Handle</code>、第 5 节 <code>ArachneError</code></td></tr>
+            <tr><td><code>arachne_kv::storage</code></td><td>WAL、段、同步、CRC</td><td>第 4 节：<code>WalConfig</code> / <code>WalOptions</code></td></tr>
+            <tr><td><code>arachne_kv::consensus</code></td><td>raft 节点（<code>RaftNode</code>）与节点配置</td><td>教程第 7 节</td></tr>
+            <tr><td><code>arachne_kv::state_machine</code></td><td>KV 状态机（<code>KvStateMachine</code>）</td><td>教程第 7 节</td></tr>
+            <tr><td><code>arachne_kv::runtime</code></td><td>actor + 客户端 <code>Handle</code> 的宿主</td><td>教程第 5 节</td></tr>
+            <tr><td><code>arachne-kv-node</code></td><td>参考节点二进制：HTTP、配置、成员运维面</td><td>第 6 节：HTTP 接口</td></tr>
           </tbody>
         </table>
       </div>

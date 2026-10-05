@@ -18,8 +18,8 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arachne::storage::snapshot::snapshot_file_name;
-use arachne_transport_tonic::{SnapshotProvider, SnapshotReader};
+use arachne_kv::storage::snapshot::snapshot_file_name;
+use arachne_kv_transport_tonic::{SnapshotProvider, SnapshotReader};
 
 /// Serves snapshots out of a node's data directory.
 pub struct DataDirSnapshots {

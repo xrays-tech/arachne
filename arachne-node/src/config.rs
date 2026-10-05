@@ -47,9 +47,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use arachne::NodeId;
-use arachne::{Profile, ProfileConfig, server::ClusterConfig};
-use arachne::storage::WalConfig;
+use arachne_kv::NodeId;
+use arachne_kv::{Profile, ProfileConfig, server::ClusterConfig};
+use arachne_kv::storage::WalConfig;
 use serde::Deserialize;
 
 /// The parsed and validated node configuration.

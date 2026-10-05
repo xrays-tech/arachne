@@ -11,11 +11,11 @@ set -euo pipefail
 # same story until it got a trigger.
 #
 # Coverage is deliberately narrow — the production crates only:
-#   * `arachne`       the library,
-#   * `arachne-node`  the ops binary,
-#   * `arachne-transport-tonic`  the transport.
+#   * `arachne-kv`       the library,
+#   * `arachne-kv-node`  the ops binary,
+#   * `arachne-kv-transport-tonic`  the transport.
 # Test code does not count: a knob exercised only by a test is still unwired.
-# `arachne-seam` has no profile, and the test-support crate must not read it.
+# `arachne-kv-seam` has no profile, and the test-support crate must not read it.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
@@ -24,7 +24,7 @@ cd "${ROOT_DIR}"
 # Keep this list shrinking: the gate fails if an entry becomes used, so a landed
 # feature cannot leave a stale exemption behind.
 # Empty: every knob is read by production code. The transport's snapshot rate
-# was the last gap, closed by rev T T2b (`arachne-node` installs the provider and
+# was the last gap, closed by rev T T2b (`arachne-kv-node` installs the provider and
 # the profile's rate on its factory). Keep this list empty, or shrink it.
 known_gaps=(
 )

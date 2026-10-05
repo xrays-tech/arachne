@@ -1,4 +1,4 @@
-//! A small, fully-deterministic PRNG ([`Rng`](arachne_seam::Rng) impl) written from
+//! A small, fully-deterministic PRNG ([`Rng`](arachne_kv_seam::Rng) impl) written from
 //! scratch with zero external dependencies.
 //!
 //! It uses the [SplitMix64](https://en.wikipedia.org/wiki/Random_number_generation#SplitMix64)
@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne_seam::Rng;
+use arachne_kv_seam::Rng;
 
 /// SplitMix64 increment (the "golden ratio" constant).
 const SPLITMIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;

@@ -25,7 +25,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arachne_transport_tonic::{SnapshotProvider, SnapshotReader};
+use arachne_kv_transport_tonic::{SnapshotProvider, SnapshotReader};
 
 use crate::storage::snapshot::snapshot_file_name;
 

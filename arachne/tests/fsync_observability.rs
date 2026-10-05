@@ -7,9 +7,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::storage::{WalConfig, WalOptions, WalStorage, FsyncPolicy};
-use arachne::{EntryType, FsyncObserver, LogEntry, Storage};
-use arachne_testsupport::FsyncLedger;
+use arachne_kv::storage::{WalConfig, WalOptions, WalStorage, FsyncPolicy};
+use arachne_kv::{EntryType, FsyncObserver, LogEntry, Storage};
+use arachne_kv_testsupport::FsyncLedger;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 

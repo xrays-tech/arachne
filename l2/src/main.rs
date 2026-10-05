@@ -156,5 +156,5 @@ fn main() {
         first.elapsed
     );
     // Prove the product core is wired into the harness (lean, no transport).
-    println!("linked product core: arachne {}", arachne::version());
+    println!("linked product core: arachne {}", arachne_kv::version());
 }

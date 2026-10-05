@@ -16,7 +16,7 @@
 //!
 //! The seam traits and shared value types now live in the leaf crate
 //! [`arachne_seam`]; this crate **re-exports** them at the same public paths
-//! (`arachne::seam::*`, `arachne::types::*`, and the root re-exports) so the
+//! (`arachne_kv::seam::*`, `arachne_kv::types::*`, and the root re-exports) so the
 //! public API is unchanged.
 //!
 //! # Consistency semantics (propsol §2)
@@ -70,9 +70,9 @@ pub use metrics::Metrics;
 pub use runtime::{Command, Runtime, RuntimeConfig, RuntimeThread};
 pub use server::Arachne;
 
-pub use arachne_seam::seam;
-pub use arachne_seam::types;
-pub use arachne_seam::{
+pub use arachne_kv_seam::seam;
+pub use arachne_kv_seam::types;
+pub use arachne_kv_seam::{
     ApplyOutcome, Clock, ConfState, EntryType, FsyncObserver, HardState, LogIndex, LogEntry,
     NodeId, NodeIdError, RaftId, RaftState, Rng, Snapshot, SnapshotMeta, StateMachine, Storage,
     StorageError, Term, Timestamp, Transport, TransportFactory, TransportMessage, TransportRx,
@@ -91,7 +91,7 @@ pub fn version() -> &'static str {
 /// pull the transport "via arachne's default feature" and use it without
 /// naming `arachne-transport-tonic` directly.
 #[cfg(feature = "transport-tonic")]
-pub use arachne_transport_tonic::transport_name;
+pub use arachne_kv_transport_tonic::transport_name;
 
 #[cfg(test)]
 mod tests {

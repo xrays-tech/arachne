@@ -47,8 +47,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use arachne_seam::storage::ConfState;
-use arachne_seam::types::LogIndex;
+use arachne_kv_seam::storage::ConfState;
+use arachne_kv_seam::types::LogIndex;
 
 use crate::storage::crc32c::crc32c;
 use crate::storage::format::{decode_conf_state, encode_conf_state};

@@ -22,7 +22,7 @@
 //!
 //! * **Torn writes** — the byte-level mutation battery (`wal_mutation.rs`,
 //!   `m2_wal_faults.rs`) owns those.
-//! * **fsync failure** — [`FaultyStorage`](arachne_testsupport::FaultyStorage)
+//! * **fsync failure** — [`FaultyStorage`](arachne_kv_testsupport::FaultyStorage)
 //!   owns that.
 //! * **Real power-loss timing** — that is L4's job.
 //!

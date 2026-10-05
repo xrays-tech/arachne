@@ -27,7 +27,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
-use arachne_seam::{NodeId, Transport, TransportFactory, TransportMessage, TransportRx};
+use arachne_kv_seam::{NodeId, Transport, TransportFactory, TransportMessage, TransportRx};
 
 /// Errors an in-memory transport can report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,7 +349,7 @@ pub fn block_on<F: Future + Send>(future: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arachne_seam::TransportMessage;
+    use arachne_kv_seam::TransportMessage;
 
     fn raft(bytes: &[u8]) -> TransportMessage {
         TransportMessage::Raft(bytes.to_vec())

@@ -1,5 +1,5 @@
 //! End-to-end test of the minimal single-instance embedding façade
-//! (`arachne::server::Arachne`).
+//! (`arachne_kv::server::Arachne`).
 //!
 //! The façade is a *global* single instance (exactly one node per process,
 //! held in a `static`). `cargo test` runs tests concurrently in one process,
@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
+use arachne_kv::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 // Unique per-process sequence so that `process::id()` (shared across all tests
 // in one binary) is disambiguated without reaching for real time.

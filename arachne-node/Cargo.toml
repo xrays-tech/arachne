@@ -1,10 +1,11 @@
 [package]
-name = "arachne-node"
+name = "arachne-kv-node"
 description = "Arachne node binary: a runnable single-node Arachne process (WAL + raft + KV state machine + /readyz + /metrics)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [features]
 # D-ART-testobs (test-plan §3.3): the ONE recorded exception to the "no test
@@ -17,13 +18,13 @@ test-observability = []
 
 [dependencies]
 # The LEAN core (no transport): the node composes the transport explicitly.
-# The workspace default for `arachne` is lean, so the core itself never links
+# The workspace default for `arachne-kv` is lean, so the core itself never links
 # tonic; the real transport is pulled in directly below. (Gate A is
 # unaffected: no test/sim scaffolding is pulled in.)
-arachne = { workspace = true }
+arachne-kv = { workspace = true }
 # The real network transport (M1): the node binds one listener per process and
 # mints its `(Tx, Rx)` halves through a `TonicTransportFactory`.
-arachne-transport-tonic = { workspace = true }
+arachne-kv-transport-tonic = { workspace = true }
 # Async runtime: drives the raft Ready loop, the tick interval, and signals.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time"] }
 # Hyper HTTP/1.1 server (propsol rev U U1). Already in the dependency tree via
@@ -40,8 +41,14 @@ serde = { version = "1", features = ["derive"] }
 # `build_logger`). Structured terminal logging lands at M1.
 slog = "2"
 
+# The binary name stays `arachne-node` (process tests / docker / l4 invoke it
+# by that name); the crate name is now `arachne-kv-node`.
+[[bin]]
+name = "arachne-node"
+path = "src/main.rs"
+
 [dev-dependencies]
 # The integration tests (tests/) drive the async `RaftNode` directly, so they
-# need a tokio runtime. `arachne` stays lean (no transport) in the test build;
+# need a tokio runtime. `arachne-kv` stays lean (no transport) in the test build;
 # this is a dev-only dependency (Gate A checks the normal tree with `-e normal`).
 tokio = { version = "1", features = ["rt", "macros"] }

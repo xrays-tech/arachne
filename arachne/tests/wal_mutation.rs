@@ -30,8 +30,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne::storage::{segment_name, FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{EntryType, HardState, LogEntry, Storage, StorageError};
+use arachne_kv::storage::{segment_name, FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{EntryType, HardState, LogEntry, Storage, StorageError};
 
 // ---------------------------------------------------------------------------
 // Test plumbing

@@ -24,7 +24,7 @@
 
 use std::sync::OnceLock;
 
-use arachne::storage::{
+use arachne_kv::storage::{
     segment_name, write_meta, Meta, FORMAT_VERSION, WalConfig, WalOptions, WalStorage,
 };
 

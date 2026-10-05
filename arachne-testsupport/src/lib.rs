@@ -11,13 +11,13 @@
 //! traits, so the deterministic core can be exercised in tests and the
 //! simulator without any real time, network, or external dependencies:
 //!
-//! * [`ManualClock`] — a manually-advanced [`Clock`](arachne_seam::Clock).
-//! * [`SeededRng`] — a deterministic, seeded [`Rng`](arachne_seam::Rng).
+//! * [`ManualClock`] — a manually-advanced [`Clock`](arachne_kv_seam::Clock).
+//! * [`SeededRng`] — a deterministic, seeded [`Rng`](arachne_kv_seam::Rng).
 //! * [`InMemoryTransportFactory`] — an in-memory
-//!   [`TransportFactory`](arachne_seam::TransportFactory) wiring up
+//!   [`TransportFactory`](arachne_kv_seam::TransportFactory) wiring up
 //!   [`InMemoryTx`]/[`InMemoryRx`] over channels.
 //! * [`InMemoryStateMachine`] — a deterministic byte-keyed
-//!   [`StateMachine`](arachne_seam::StateMachine).
+//!   [`StateMachine`](arachne_kv_seam::StateMachine).
 //! * [`block_on`] — a tiny no-waker executor helper for driving the in-memory
 //!   transport futures in tests/sim.
 //! * [`oracle`] — the deterministic [`ClientOracle`](oracle::History): a
@@ -31,7 +31,7 @@
 //! * [`FaultyStorage`] — a deterministic fault-injecting [`Storage`] wrapper.
 //! * [`FsyncLedger`] — records segment fsyncs (the WAL's `FsyncObserver`).
 //!
-//! [`Storage`]: arachne_seam::Storage
+//! [`Storage`]: arachne_kv_seam::Storage
 //!
 //! All of these are dependency-free (std/core only) and build offline. The
 //! only external crate is `stateright`, which is a **dev-dependency** used solely

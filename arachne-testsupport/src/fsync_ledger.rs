@@ -1,6 +1,6 @@
 //! A deterministic per-segment fsync ledger for verifying WAL durability.
 //!
-//! [`FsyncLedger`] implements [`FsyncObserver`](arachne_seam::FsyncObserver)
+//! [`FsyncLedger`] implements [`FsyncObserver`](arachne_kv_seam::FsyncObserver)
 //! and records every segment fsync event. The key verification property is
 //! [`union_covers`](FsyncLedger::union_covers): the union of all recorded
 //! segment ranges must cover `[first_index, last_index]` for the WAL to be
@@ -12,8 +12,8 @@
 
 use std::sync::Mutex;
 
-use arachne_seam::storage::FsyncObserver;
-use arachne_seam::types::LogIndex;
+use arachne_kv_seam::storage::FsyncObserver;
+use arachne_kv_seam::types::LogIndex;
 
 /// A single recorded fsync event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

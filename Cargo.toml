@@ -24,22 +24,26 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.93"
+repository = "https://github.com/xrays-tech/arachne"
 
-# Intra-workspace path dependencies. The core (`arachne`, `arachne-seam`,
-# `arachne-testsupport`) has ZERO external crates and builds fully offline.
-# The `arachne-transport-tonic` member pulls in tonic/rustls when its feature
+# Intra-workspace path dependencies. The core (`arachne-kv`, `arachne-kv-seam`,
+# `arachne-kv-testsupport`) has ZERO external crates and builds fully offline.
+# The `arachne-kv-transport-tonic` member pulls in tonic/rustls when its feature
 # is enabled (see `scripts/check-deps.sh` Gate B for the lean-core invariant).
 [workspace.dependencies]
-arachne-seam = { path = "arachne-seam" }
-# The workspace-wide default for `arachne` is the LEAN core (no transport).
+# The `version` is required at publish time: workspace deps used via
+# `{ workspace = true }` must resolve to a version when the member is packaged
+# (the `path` is stripped from the published manifest).
+arachne-kv-seam = { path = "arachne-seam", version = "0.1.0" }
+# The workspace-wide default for `arachne-kv` is the LEAN core (no transport).
 # `default-features = false` is the single source of truth here (cargo does not
 # let a member override it). Crates that want the tonic transport opt in
-# explicitly with `features = ["transport-tonic"]` (see arachne-node).
-arachne = { path = "arachne", default-features = false }
-arachne-transport-tonic = { path = "arachne-transport-tonic" }
-arachne-node = { path = "arachne-node" }
-arachne-testsupport = { path = "arachne-testsupport" }
-arachne-sim = { path = "arachne-sim" }
+# explicitly with `features = ["transport-tonic"]` (see arachne-kv-node).
+arachne-kv = { path = "arachne", version = "0.1.0", default-features = false }
+arachne-kv-transport-tonic = { path = "arachne-transport-tonic", version = "0.1.0" }
+arachne-kv-node = { path = "arachne-node", version = "0.1.0" }
+arachne-kv-testsupport = { path = "arachne-testsupport", version = "0.1.0" }
+arachne-kv-sim = { path = "arachne-sim", version = "0.1.0" }
 
 # D-S1 (test-plan §5 E3): inject a minimal seedable election-RNG hook into the
 # consensus core so the L2 same-seed double-run gate is provable. `raft` 0.7.0

@@ -34,7 +34,7 @@
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use arachne::storage::{ForceRecoveryReport, WalConfig, WalStorage};
+use arachne_kv::storage::{ForceRecoveryReport, WalConfig, WalStorage};
 
 use crate::config::{parse_config, Config};
 

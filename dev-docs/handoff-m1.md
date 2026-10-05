@@ -6,8 +6,8 @@
 
 ## 1. 现状总览
 
-- **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
-- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）**、**(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）** 与 **(C) stage 3a/3c**（3a transport I/O 接缝 `edd913d`；3c inc.1–10 见 §3(C)，L2 场景 18 项全绿）；**`(D)/M1-5` 已收尾（commit `adb2bd7`，含 `6c79886` 的持久化 commit 修复，见 §1.5）**；**(C) stage 3b（real tonic over turmoil）已解决**（harness 显式链路延迟，见 §1.6）。
+- **M0 已完成**（含终检门禁，COMPLETE）。六工件工作区 + 崩溃安全 WAL + raft 集成 + KV/会话状态机 + 全套测试基建 + `arachne-kv-node` 单节点可运行 + examples + L4 runner 脚手架 + stateright/turmoil 骨架 + spike 关闭。
+- **M1 进行中**。已完成 M1-1、M1-2（含整改）、M1-3a、**(A) arachne-kv-node 多进程 tonic 接线（commit 5081417）**、**(B) M1-3b ReadIndex 线性一致读（commit 6616827）**、**(C) stage 1 ClientOracle + 线性化检查器（a915f6b；自证 395fc9a；门禁 GO）**、**(C) stage 2 D-S1 raft 可播种选举 RNG + 双跑金丝雀（commit f132e44；门禁 GO）** 与 **(C) stage 3a/3c**（3a transport I/O 接缝 `edd913d`；3c inc.1–10 见 §3(C)，L2 场景 18 项全绿）；**`(D)/M1-5` 已收尾（commit `adb2bd7`，含 `6c79886` 的持久化 commit 修复，见 §1.5）**；**(C) stage 3b（real tonic over turmoil）已解决**（harness 显式链路延迟，见 §1.6）。
 - **✅ 已恢复**：oracle provider 故障（模型 id 无法解析 + 空结果）已解决；(C) stage 1 确认门禁已补跑并 **GO**，stage 2 门禁亦 **GO**。
 
 ### 1.5 本轮收尾（**已提交**：`6c79886` 修复 + `adb2bd7` 收尾）
@@ -16,14 +16,14 @@
 
 1. **跨进程 `409 + leader hint`（M1 验收③）**
    - `Handle::without_redirect()`（`arachne/src/client/handle.rs`）：`max_redirects` 改为 **handle 级**字段（移出共享 `Arc<HandleInner>`），单发克隆把 `NotLeader{hint}` 原样返回。
-   - `arachne-node` HTTP 改用 `node.handle().without_redirect()`；`NodeHttp::map_error` 新增 `Timeout`/`Busy` → **503**（原先 `Timeout` 落 500，与验收②"不挂死 + 服务不可用类状态"不一致）。
+   - `arachne-kv-node` HTTP 改用 `node.handle().without_redirect()`；`NodeHttp::map_error` 新增 `Timeout`/`Busy` → **503**（原先 `Timeout` 落 500，与验收②"不挂死 + 服务不可用类状态"不一致）。
    - 测试：`arachne/tests/client_redirect.rs`（**新**：redirect 路径 + 单发 hint 断言）、`arachne-node/tests/multi_node.rs`（非 leader 必须回 `409` 且 hint 指向**真实 leader**）。
    - **顺带发现（重要）**：`arachne/src/runtime/tests.rs` 从未被声明（`runtime/mod.rs` 无 `mod tests;`，且其中的 `Node::new(...)` 类型早已不存在）——**从未编译、从未运行**的死代码（自 `2b8b046` 起）。已**删除**；其覆盖由 `client_runtime.rs`/`read_index.rs`/新的 `client_redirect.rs` 承担。
 2. **杀 leader（M1 验收①②）**
    - `multi_node.rs` 新增 `killing_the_leader_elects_a_new_one_and_writes_never_hang`：SIGKILL leader 进程 → 幸存者接管；窗口内写只能是 `409`/`503`，**绝不挂死**（HTTP 读超时返回 `None` 即判失败）；新 leader 仍服务杀前已提交值。
    - `l2_scenarios.rs` 新增 `new_leader_within_two_election_windows_after_leader_loss`：**确定性 tick 计数**断言换主 ≤ `2×election_tick`（固定种子实测 **16 轮 / 预算 20**）。Gate C 禁止 `tests/` 读真实时钟，故 L3 只能做有界轮询；严格的时序上界由 L2 的 tick 版承担。
 3. **bin CLI 集成测试（test-plan §3.3）**：新增 `arachne-node/tests/cli.rs`（**11 项**）+ 共享 `arachne-node/tests/common/mod.rs`：`--help`/参数错误退出码、配置不可读/校验失败 fail-start、**flock 冲突**、**META cluster_id 不一致**、**SIGTERM 优雅关闭并释放锁**、`/readyz` + `/metrics` + 404/405，以及 4 项 `force-recovery`（见下）。
-4. **D-ART-testobs**：`arachne-node` 新增 `test-observability` feature（**默认关**；启用时仅追加 stdout marker `{"event":"ready"|"shutdown",…}`，零行为改变，已实测）。新增 `scripts/check-release-features.sh`（Gate A：无默认 feature；Gate B：release 产物**不含** marker，而 feature 构建含之且二者 hash 不同），已接入 CI。
+4. **D-ART-testobs**：`arachne-kv-node` 新增 `test-observability` feature（**默认关**；启用时仅追加 stdout marker `{"event":"ready"|"shutdown",…}`，零行为改变，已实测）。新增 `scripts/check-release-features.sh`（Gate A：无默认 feature；Gate B：release 产物**不含** marker，而 feature 构建含之且二者 hash 不同），已接入 CI。
 5. **L4 已 ack 写入**：`l4/kill_loop.sh` 每轮发起真实 `PUT /kv/...`（200 = 已提交 + 已 apply），`kill -9` 后重启用线性一致 `GET` 读回复验；循环结束再额外重启一次复验**最后一次**写入。**顺带修复**：`l4/node.toml` / `kill_loop.sh` / `verify_wal.sh` 生成的配置缺 `rpc_timeout_ms`，在 M1-1 引入 profile 校验后**必然 fail-start**（实测复现）——三者已补齐；`l4/README.md` 的"M0 空命题"声明已更新。
 6. **`force-recovery` 子命令（propsol §6.1）——现已实现**
    - **存储层**：`WalStorage::force_recovery(dir, node_id, new_cluster_id, config, ts)` + `ForceRecoveryReport`（`arachne/src/storage/wal.rs`，已从 `storage::mod` 导出）。语义：读 META → 以**旧** cluster_id 打开（取得数据目录锁，拒绝并发进程）→ **丢弃未提交尾部**（index > commit；跨 segment 正确截断，丢弃 0 条时为 no-op）→ 写新 HardState（`term+1`、`vote=self`、`commit` 不变）→ 重写 META（默认换 cluster_id）。单测 5 项（丢弃尾部 + 轮换 cluster_id / 保留 cluster_id / 零 commit 丢弃全部 / 锁占用拒绝 / node_id 不一致拒绝）。
@@ -75,14 +75,14 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 
 ## 2. 工件与关键路径
 
-- `arachne-seam`（零依赖叶：接缝 trait + 核心类型）、`arachne`（产品核心：WAL/raft 集成/KV 状态机/客户端库）、`arachne-transport-tonic`（唯一含 tonic/prost 的 crate）、`arachne-node`（运维 bin）、`arachne-testsupport`（dev-only）、`arachne-sim`（L2 bin）。
+- `arachne-kv-seam`（零依赖叶：接缝 trait + 核心类型）、`arachne-kv`（产品核心：WAL/raft 集成/KV 状态机/客户端库）、`arachne-kv-transport-tonic`（唯一含 tonic/prost 的 crate）、`arachne-kv-node`（运维 bin）、`arachne-kv-testsupport`（dev-only）、`arachne-kv-sim`（L2 bin）。
 - 非工作区独立项目：`fuzz/`、`model-check/`（stateright）、`l2/`（turmoil）、`l4/`（kill -9 脚本）。
-- 客户端 API：`arachne::client::{ArachneError, Handle}`；运行时 actor：`arachne::runtime::{Runtime, RuntimeConfig, Command}`；指标：`arachne::Metrics`。
-- `arachne-node` 的 HTTP：`/readyz`、`/metrics`、`PUT /kv/<key>/<value>`、`GET /kv/<key>[?stale=1]`、`DELETE /kv/<key>`（非法参数→400、quorum→503）。**多进程注意**：非 leader 的写当前返回 **503**——`Handle` 的 redirect 只认识**进程内** peer（`register_peer`），跨进程没有 client redirect，因此文档语义中的 `NotLeader→409+leader hint` 在多进程 HTTP 面**不可达**（进程内嵌入仍有 409）。跨进程 409+hint 留给 (D)。
+- 客户端 API：`arachne_kv::client::{ArachneError, Handle}`；运行时 actor：`arachne_kv::runtime::{Runtime, RuntimeConfig, Command}`；指标：`arachne_kv::Metrics`。
+- `arachne-kv-node` 的 HTTP：`/readyz`、`/metrics`、`PUT /kv/<key>/<value>`、`GET /kv/<key>[?stale=1]`、`DELETE /kv/<key>`（非法参数→400、quorum→503）。**多进程注意**：非 leader 的写当前返回 **503**——`Handle` 的 redirect 只认识**进程内** peer（`register_peer`），跨进程没有 client redirect，因此文档语义中的 `NotLeader→409+leader hint` 在多进程 HTTP 面**不可达**（进程内嵌入仍有 409）。跨进程 409+hint 留给 (D)。
 
 ## 3. M1 剩余工作（按推荐顺序）
 
-### (A) arachne-node → tonic 多进程（M1-5/L3 前置）— **已完成（commit 5081417）**
+### (A) arachne-kv-node → tonic 多进程（M1-5/L3 前置）— **已完成（commit 5081417）**
 实现与最初建议的差异（供 (D)/(B) 接手）：
 1. `TonicTransportFactory::start_with_bind(me, bind)` 已加（`start()` 会绑定地址表**所有**条目——多进程会 EADDRINUSE）；公共 serve 逻辑抽到私有 `start_targets`，`start()` 行为不变。
 2. 配置：`initial_cluster` 条目现支持 `"<id>"` 或 `"<id>=<ip:port>"`（**向后兼容**，l4/ 脚本的 `["n1"]` 不变）；`Config.addresses: HashMap<NodeId, SocketAddr>`，self 恒为 `listen`（若 self 内联地址与 `listen` 不一致 → fail-start），**非 self 成员必须给出内联地址**（缺失 → fail-start）。
@@ -101,13 +101,13 @@ b3043b3 docs: propsol v0.2.8（E-rev K：修正 §7 约束与预设矛盾）
 
 ### (C) M1-4：L2 turmoil + 不变量 + 线性化（M1 验收 ④）— **分阶段执行中（用户选定：每阶段一个 oracle 门禁）**
 **stage 1（已完成，commit a915f6b）：ClientOracle v1 + 自建线性化检查器**
-- `arachne-testsupport::oracle`：无时钟纯逻辑历史（`ValueId`/`ClientId`/`SeqNo`/`CallId` + 逻辑 ts）、`merge_retries`（记录层保留原多次调用）、检查①幻值（区间语义：Put 可解释读当且仅当 `put.invoke < get.complete`）、②one-log-id-per-seq（含 Put|Delete）、③RYW（latest-mutation-wins）、④单调读，可选⑤丢写/⑥持久性；`History::validate` 对畸形历史（complete 无 invoke／CallId 复用／同 `(client,seq)` op 不一致）**报错而非静默丢弃**；§9 JSONL。
-- `arachne-testsupport::linearizability`：实时偏序上的完备回溯搜索（Wing–Gong 等价）；**required**点（成功 op）+ **optional**点（结果未知/在途写，故 timeout-committed 竞态不再是假违规）；超 `MAX_CHECK_POINTS=12` → `Inconclusive`；witness 贪心最小化；确定性（BTree/Vec、无 HashMap 迭代）。
+- `arachne-kv-testsupport::oracle`：无时钟纯逻辑历史（`ValueId`/`ClientId`/`SeqNo`/`CallId` + 逻辑 ts）、`merge_retries`（记录层保留原多次调用）、检查①幻值（区间语义：Put 可解释读当且仅当 `put.invoke < get.complete`）、②one-log-id-per-seq（含 Put|Delete）、③RYW（latest-mutation-wins）、④单调读，可选⑤丢写/⑥持久性；`History::validate` 对畸形历史（complete 无 invoke／CallId 复用／同 `(client,seq)` op 不一致）**报错而非静默丢弃**；§9 JSONL。
+- `arachne-kv-testsupport::linearizability`：实时偏序上的完备回溯搜索（Wing–Gong 等价）；**required**点（成功 op）+ **optional**点（结果未知/在途写，故 timeout-committed 竞态不再是假违规）；超 `MAX_CHECK_POINTS=12` → `Inconclusive`；witness 贪心最小化；确定性（BTree/Vec、无 HashMap 迭代）。
 - 测试：testsupport 79 项（含每检查一条坏历史元测试、贪心对抗回溯正例、**32 种子与 stateright 差分一致**——stateright 仅 dev-dependency，结构化隔离经 Gate C 验证）。
 - **门禁状态：GO（已通过）**。初次 oracle 门禁 NO-GO（B1 并发 put/读假阳性、B2 自删 RYW 假阳性、B3 timeout 写被当作未生效）已按门禁处方修复并加回归；期间 oracle provider 出过故障（模型 id `zhipuai-coding-plan/GLM-5.3-Flash` 无法解析 + 空结果），先补强本地自证（commit `395fc9a`：1000 种子多键差分对 stateright、witness 回放 500 种子模糊、optional 单调性、500 顺序历史 oracle+checker 双通过）。provider 恢复后**确认门禁经 ora-2 判 **GO****：三个 blocker 均被证明真实修复且回归测试在旧代码上会失败；S1–S5 解决；新增自证被判为实质性。**遗留 nit（L2 阶段跟进）**：(a) 差分生成器均为顺序历史，未对并发/排序搜索做 stateright 交叉验证（现靠手写并发/回溯用例覆盖）；(b) `MAX_CHECK_POINTS=12` 在对抗性全失败历史上仍有 ~12! 最坏情况——L2 接真实交错历史时需降 cap 或加 memoization。stateright 交叉验证暂限"全成功"历史（未知结果写不喂 stateright，避免 pending-invocation 建模偏差），门禁判定为**可接受的已记录缺口**。
 
 **stage 2（已完成，commit f132e44）：D-S1 可播种 raft 选举 RNG**：`arithmetic raft` 0.7.0 唯一 RNG 点（`reset_randomized_election_timeout`）原用不可播种的 `thread_rng`。已 vendor `third_party/raft/`（与 registry 仅差一个最小可上游化 hook：thread-local 可播种选举 RNG + 每节点子流 `base ^ node_id`；未设种子时行为与上游逐字节一致），root `Cargo.toml` 加 `[patch.crates-io]`，`ARACHNE-PATCH.md` 记录 diff 与「需单线程」约束；`arachne/tests/determinism_canary.rs` = 同种子双跑轨迹逐字节一致 + 不同种子→不同选举超时。**门禁 GO**；已知 nit：Cargo.lock 附带把 windows-sys 0.61.2→0.52.0（semver 合法、Windows-only）；hook 需单线程（E8），已在 PATCH.md 记录。
-**stage 3a（已完成，commit edd913d）：transport I/O 接缝**：`arachne-transport-tonic` 新增 `TransportIo` 接缝 + `TokioIoProvider`（真实 tokio）+ `TcpConnector`；`TonicTransportFactory`/`TonicTransport` 对 `Io = TokioIoProvider` 泛型，server 经 `io.bind`/`io.incoming`、client 经 `Endpoint::connect_with_connector`。既有 API 不变（默认类型参数保住 `arachne-node` 用法）；`hyper/hyper-util/tower(util)/http` 均经 tonic 已传递，无新包。**门禁 NO-GO→修 `TcpConnector` 丢 `TCP_NODELAY`（tonic 默认连接器会设、自定义连接器绕过）→GO**。
+**stage 3a（已完成，commit edd913d）：transport I/O 接缝**：`arachne-kv-transport-tonic` 新增 `TransportIo` 接缝 + `TokioIoProvider`（真实 tokio）+ `TcpConnector`；`TonicTransportFactory`/`TonicTransport` 对 `Io = TokioIoProvider` 泛型，server 经 `io.bind`/`io.incoming`、client 经 `Endpoint::connect_with_connector`。既有 API 不变（默认类型参数保住 `arachne-kv-node` 用法）；`hyper/hyper-util/tower(util)/http` 均经 tonic 已传递，无新包。**门禁 NO-GO→修 `TcpConnector` 丢 `TCP_NODELAY`（tonic 默认连接器会设、自定义连接器绕过）→GO**。
 **stage 3b（部分完成 → 记为 spike，commit 76df587）：真实 tonic over turmoil + SimNetwork**。已落地并可编译：`l2/` 的 `TurmoilIo`（`turmoil::net` listener/stream + `Accepted` newtype 实现 tonic `Connected` + `TokioIo` connector）、`SimNetwork`（partition/partition_oneway/repair/hold/release/crash/bounce/set_fail_rate/set_link_latency）、3 节点 in-sim 真实 tonic 集群；两个 `in_sim` 测试标 `#[ignore]`（原因见下）以保 `l2` suite 绿。
 - **已证明可用**：3 节点全部启动（WAL+bind+Runtime actor）；在 turmoil 承载的真实 tonic 上**成功选出 leader**；follower 学到 leader；消息双向健康（`MsgHeartbeat`/`MsgHeartbeatResponse` 双向、term 1）。
 - **卡点（已解，见 §1.6）**：客户端 `put` 永不提交。**旧记录的两处结论均已被推翻**：(a) 不是"actor 收不到 `Command::Propose`"——命令会被收到并被答复；(b) 不是 actor 逻辑死锁。根因是 harness 未设显式链路延迟、用了 turmoil 的大抖动默认延迟，超过 election_timeout 导致 CheckQuorum 反复降级。
@@ -174,7 +174,7 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
   - 崩溃前**已持久化**的已提交前缀在回放后逐字节重现（顺序与内容一致）→ 不丢已提交条目；
   - 之后重新入群，全节点状态快照一致（INV3/INV8）。
   - **顺带澄清一个语义细节（重要）**：`RaftNode::hard_state().commit` 是 raft 的**内存** commit，可能**领先于持久化 commit**（要到下一个 `step()` 才落盘）。因此 **INV2 的基准必须是"已持久化 commit"**（`DurabilityLedger::persisted_commit`），而不是内存值——我第一版扫描拿内存值当基准，被这个差异判成**假违规**（实测该 follower 的持久 HardState 只有 `(term1,commit0)`、`(term1,commit1)`，而内存 commit 已是 2）。**ack 路径不受影响**：runtime 只在 `step()` 落盘 commit 之后才 apply + ack。
-  - **精确崩溃注入（本轮补齐，propsol v0.2.9 L）**：新增**默认关闭**的 crate feature `fault-injection`（`arachne/src/fault_injection.rs`），在 `RaftNode::step` 的 `AfterPersist`（entries+HardState 已落盘、尚未发出任何消息）与 `AfterDeliver`（消息已发、尚未 apply）两个边界提供 **thread-local 一次性**崩溃 hook；关闭时调用点被 `#[cfg]` 完全编译掉（零行为改变、零运行时开销）。`m2_durability.rs` 新增 `inv2_precise_ready_stage_crash_replays_the_durable_prefix`（feature 开启时运行；leader/follower × 两阶段共 4 例）：崩溃后从 WAL **纯回放**，断言恢复出的 commit ≥ 崩溃前**已持久化** commit、applied ≥ 该 commit、**leader 已 ack 的写入不丢**、重新入群后全节点状态一致。CI 增加 `cargo test -p arachne --features fault-injection --test m2_durability` 一步；`scripts/check-release-features.sh` 新增 **Gate C**（默认 release rlib **不含** hook 哨兵、feature 构建含之——用 `--message-format=json` 取产物，避免 mtime 误判）。
+  - **精确崩溃注入（本轮补齐，propsol v0.2.9 L）**：新增**默认关闭**的 crate feature `fault-injection`（`arachne/src/fault_injection.rs`），在 `RaftNode::step` 的 `AfterPersist`（entries+HardState 已落盘、尚未发出任何消息）与 `AfterDeliver`（消息已发、尚未 apply）两个边界提供 **thread-local 一次性**崩溃 hook；关闭时调用点被 `#[cfg]` 完全编译掉（零行为改变、零运行时开销）。`m2_durability.rs` 新增 `inv2_precise_ready_stage_crash_replays_the_durable_prefix`（feature 开启时运行；leader/follower × 两阶段共 4 例）：崩溃后从 WAL **纯回放**，断言恢复出的 commit ≥ 崩溃前**已持久化** commit、applied ≥ 该 commit、**leader 已 ack 的写入不丢**、重新入群后全节点状态一致。CI 增加 `cargo test -p arachne-kv --features fault-injection --test m2_durability` 一步；`scripts/check-release-features.sh` 新增 **Gate C**（默认 release rlib **不含** hook 哨兵、feature 构建含之——用 `--message-format=json` 取产物，避免 mtime 误判）。
 - **仍未覆盖（M2 剩余）**：`slow_fsync`（逻辑 `Storage` seam 无法用模拟时间表达；属 L4/文件层时序）；INV5 属 M3（会话去重）。**I3 与快照路径已在 §1.9 落地。**
 
 3. **客户端读截止时间短于 actor 的 ReadIndex 预算（`a26d21d`，本次 CI 再次暴露）**：`Handle` 原本把**所有**操作都限制在一个 `election_timeout` 内——对写是对的（runtime 的 propose 超时相同），对读太短：runtime 的 ReadIndex 路径每次等 `read_index_timeout_ms`（= 2×election）并可重试一次，actor 合法地可能用约 `2×read_index_timeout`（≈4×election）才给出结果。于是客户端在 actor 尚在解析读时就放弃，把一次慢的 ReadIndex 轮次变成客户端可见的 `Timeout`/503。现在读有独立截止：两次 ReadIndex 等待 + 一个 election 的调度余量。CI 上的表现正是 L3 杀 leader 测试偶发失败（换主后新 leader "读不到"杀前值）——实际是读超时而非数据丢失；修完后 CI 绿。
@@ -219,7 +219,7 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 **如实声明（M2 仍未做）**：
 - 快照传输仍是**单条 `Ready` 承载**，未分片流式（§5.5.4 的 server-streaming 分片随传输层快照 RPC 落地）；安装期间本地读返回 `Busy` 也未实现（v1 安装是同步阻塞的）。
 - 字节级 `wal_trailing_keep` 窗口未接线（旋钮只在 `ProfileConfig`，未下沉 `WalConfig`），慢 follower 一律走快照路径（rev M 已记录：优化而非正确性）。
-- `snapshot_last_duration_ms` 已上报，但 `>1s` 的**告警发射**在 `arachne-node` 侧，尚未接线。
+- `snapshot_last_duration_ms` 已上报，但 `>1s` 的**告警发射**在 `arachne-kv-node` 侧，尚未接线。
 
 ### 1.10 M2 第三块：apply 独立任务 + 反压 + 延迟冒烟门槛（M2 验收 ⑤，propsol v0.2.11 N）
 
@@ -264,9 +264,9 @@ M1 的验收项与已记录缺口已全部闭合，现按 `l2/README` 的 M2 路
 | `88ab876`（修忙循环） | **10.8ms** ← 退化出现在这里 |
 | `09aa51d` / `2ed0fbc` / HEAD | ~11ms（继承） |
 
-**根因**：`arachne-testsupport` 的内存传输用 **`std::sync::mpsc`**，它没有 waker 注册能力；手写的 `RecvFuture` 只把 `cx.waker().clone()` 存进自己的字段、**从未向通道订阅**。于是 actor 停在该 future 上时只能被**自己的 tick** 唤醒 → 每条入站 raft 消息最多等一个 heartbeat。`88ab876` 之前，"每轮发空批次 + 每次都 publish 进度"的忙循环一直在替它兜底（actor 始终醒着），所以读数很快；忙循环一修，问题立刻显形——这也解释了早先观察到的"每次写 ~22ms"（leader→follower、follower→leader 两次入站各等一个 tick）。
+**根因**：`arachne-kv-testsupport` 的内存传输用 **`std::sync::mpsc`**，它没有 waker 注册能力；手写的 `RecvFuture` 只把 `cx.waker().clone()` 存进自己的字段、**从未向通道订阅**。于是 actor 停在该 future 上时只能被**自己的 tick** 唤醒 → 每条入站 raft 消息最多等一个 heartbeat。`88ab876` 之前，"每轮发空批次 + 每次都 publish 进度"的忙循环一直在替它兜底（actor 始终醒着），所以读数很快；忙循环一修，问题立刻显形——这也解释了早先观察到的"每次写 ~22ms"（leader→follower、follower→leader 两次入站各等一个 tick）。
 
-**修复**（`arachne-testsupport`）：内存 switch 换成 `tokio::sync::mpsc::unbounded`（`send` 仍是同步的，`UnboundedReceiver` 正常注册 waker），删掉手写 future。testsupport 只新增 tokio 的 `sync` feature，`check-deps.sh` Gate C 仍全过（未引入 tonic）。
+**修复**（`arachne-kv-testsupport`）：内存 switch 换成 `tokio::sync::mpsc::unbounded`（`send` 仍是同步的，`UnboundedReceiver` 正常注册 waker），删掉手写 future。testsupport 只新增 tokio 的 `sync` feature，`check-deps.sh` Gate C 仍全过（未引入 tonic）。
 
 **效果**：空闲读 p99 **10.8ms → 230–660µs**（比最早的 372µs 还好）；`read_latency` 整体 **4.2s → 2.2s**；workspace **374 passed** 全绿。
 
@@ -346,7 +346,7 @@ R1（TTL/grace 三区间）+ R2（GC + `max_sessions`）+ R3（场景）到此�
 
 新增不变量：**I5** 至多一个未 apply 的 ConfChange；**I6** `ConfState(0x04)` 不早于其条目持久化 ⇒ 恢复出的成员配置永远是真实已应用历史的**前缀**，成员偏少只会让 quorum 更难、成员偏多只会要更多选票，两个方向都只损失可用性、不破坏安全性；**I7** 成员恢复优先级 `0x04` > 快照成员表 > `initial_cluster`。
 
-落地顺序：**S1** 成员配置落盘 + 条目路由 + 回放幂等（含"不写记录则退回 bootstrap"的反向对照）→ **S2** 公开 API（`add_learner`/`promote_learner`/`remove_member`/`transfer_leader`）+ 单飞门 → **S3** 追平门 + 旋钮（过 `check-profile-knobs.sh`）→ **S4** 快照 live ConfState + 压缩丢记录 → **S5** M3 ①② 端到端（learner 加入→施压→promote→remove，全程写不中断；`remove_member(leader)` 自动转让；INV-4 断电）+ `arachne-node` 运维面子命令。**下一步从 S1 开始。**
+落地顺序：**S1** 成员配置落盘 + 条目路由 + 回放幂等（含"不写记录则退回 bootstrap"的反向对照）→ **S2** 公开 API（`add_learner`/`promote_learner`/`remove_member`/`transfer_leader`）+ 单飞门 → **S3** 追平门 + 旋钮（过 `check-profile-knobs.sh`）→ **S4** 快照 live ConfState + 压缩丢记录 → **S5** M3 ①② 端到端（learner 加入→施压→promote→remove，全程写不中断；`remove_member(leader)` 自动转让；INV-4 断电）+ `arachne-kv-node` 运维面子命令。**下一步从 S1 开始。**
 
 ### 1.20 M3 ConfChange S1a 落地：`membership` 文件（设计修正 + 存储侧完成）
 
@@ -357,7 +357,7 @@ S1 拆成两步做：**S1a 存储侧**（本轮，`membership` 文件 + seam 契
 - seam `Storage` 增两个方法（带默认实现，避免动 7 处测试替身）：`save_conf_state(index, &ConfState)`、`conf_change_index()`；seam 的 `MemStorage` 实现真实语义（供契约测试），其余测试替身沿用默认 no-op，而 `FaultyStorage` **显式委托**（默认 no-op 会让 S1b 的"apply 后崩溃"测试空洞通过），并新增 `OpKind::SaveConfState` 供断言。
 - `WalStorage`：字段 `conf_state`/`conf_change_index`，`open` 时读文件并按 **I7** 取用（文件 index > 快照 index 才赢，否则用快照成员表；`conf_change_index` 相应取快照 index 作为**回放起点**）；`save_conf_state` 原子落盘并把目录 fsync 计入 `stats.dir_fsyncs`；**文件缺失 = 正常**（`Ok(None)`，退回 bootstrap），**存在但损坏 = fail-start**（`StorageError::Corruption`，不静默退回旧配置——新增不变量 **I8**：文件是缓存、日志/快照才是权威）。
 - 测试：`membership.rs` 6 项（往返、最新写入胜出、空成员、CRC/成员 id 篡改、残留 tmp 被忽略、短文件/坏 magic）；`wal.rs` 4 项（写入后重开可见 + **反向对照**"没写过则必须为空"、快照更旧时被忽略且 `conf_change_index=5`、无文件时 `conf_change_index=快照 index`、损坏文件 fail-start）。
-- 验证：workspace **391 passed / 0 failed**（基线 378，+12 = membership 6 + wal 4 + 格式层 2；另 +1 seam 契约测试）、`--features fault-injection` **399 passed / 0 failed**、l2 **3 passed / 0 failed**、`arachne-node` 全绿、四个门禁（deps/entropy/release-features/profile-knobs）全 PASS。`check-release-features.sh` 本地须显式给 `CARGO_TARGET_DIR`（默认全局 target 在仓库外，沙箱拒绝写 → 报 `Operation not permitted`；不是代码问题，CI 正常）。
+- 验证：workspace **391 passed / 0 failed**（基线 378，+12 = membership 6 + wal 4 + 格式层 2；另 +1 seam 契约测试）、`--features fault-injection` **399 passed / 0 failed**、l2 **3 passed / 0 failed**、`arachne-kv-node` 全绿、四个门禁（deps/entropy/release-features/profile-knobs）全 PASS。`check-release-features.sh` 本地须显式给 `CARGO_TARGET_DIR`（默认全局 target 在仓库外，沙箱拒绝写 → 报 `Operation not permitted`；不是代码问题，CI 正常）。
 - **下一步 S1b**：`StepOutcome`/`PersistSubmit` 透传 `entry_type`（今天 `committed: Vec<(LogIndex, Vec<u8>)>` 把类型丢了，见 `node.rs:373` 注释）→ actor 按类型分流 → `apply_conf_change` + `save_conf_state` → 回放按 `conf_change_index` 跳过；**顺序屏障**：ConfChange 只能在其之前的条目都已 apply 之后才应用（以 apply 任务的进度水分为界），否则 KV 与成员视图的应用顺序会与日志顺序不一致。
 
 ### 1.21 M3 ConfChange S1b 落地：`entry_type` 透传 + apply 分流 + 顺序屏障
@@ -380,7 +380,7 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - **单飞门（M3 ③）与实测的 raft 行为**：门在 actor 命令入口（`!pending_conf.is_empty()` → `ConfChangePending`），普通写走另一条路径不受影响。**rev S 要求"实测而非假设"上游行为，结果值得记一笔**：`Raft::step` 对 `MsgPropose` 中的 ConfChange 会检查 `has_pending_conf()`（`pending_conf_index > applied`），命中时**把条目改写成空的 `EntryNormal` 并只打一条 info 日志**（`third_party/raft/src/raft.rs:2115`）——`propose_conf_change` 照样返回 `Ok`。也就是说上游不是报错拒绝而是**静默吞掉**：没有我们这道门，客户端会拿到"成功"而集群毫无变化。上游的 `has_pending_conf` 文档还自认可能有假阳性，所以**门必须由我们做，且它就是对外契约**。
 - **测试**（`membership_change.rs`，feature 门控，4 项，连跑 3 次全绿）：①路由/持久/重启（S1b）；②顺序（S1b）；③**单飞门**：用测试专用慢盘 `set_flush_delay_ms(120)` 把"已提案未 apply"的窗口撑开，并发两条 `add_learner` → 恰好一条 Ok、一条 `ConfChangePending`，同批 `put` 正常成功，闸门释放后第三条又被接受，停机后断言 durable learners 恰为 2；④**转让 + 移除 leader**（3 节点 runtime 集群）：显式转让到指定 voter 并断言目标真的当选、旧 leader 认得它 → `remove_member(当前 leader)` 成功 → 两票仍能写、被移除节点不再收到 commit、停机后重开存活节点 WAL 断言 voters=2 且不含被移除者。
 - 验证：workspace **391 passed / 0 failed**、`--features fault-injection` **403 passed / 0 failed**（+2）、l2 **3 passed / 0 failed**、四门禁全 PASS。
-- **下一步 S3**：`promote_learner` 的追平门（`lag_bytes` → 条目口径 `promote_lag_entries`，默认 128 + progress 在线）+ 新错误变体 + 旋钮过 `check-profile-knobs.sh`；S4 快照写 live ConfState；S5 M3 ①② 端到端 + INV-4 + `arachne-node` 运维子命令。
+- **下一步 S3**：`promote_learner` 的追平门（`lag_bytes` → 条目口径 `promote_lag_entries`，默认 128 + progress 在线）+ 新错误变体 + 旋钮过 `check-profile-knobs.sh`；S4 快照写 live ConfState；S5 M3 ①② 端到端 + INV-4 + `arachne-kv-node` 运维子命令。
 
 ### 1.23 M3 ConfChange S3 落地：Learner 追平门（+ 一处实测修正）
 
@@ -391,7 +391,7 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - `promote_lag_entries` 新旋钮（默认 128，两个预设都有）：`ProfileConfig` 的字段被 production 真读（`RuntimeConfig` → actor 字段 → 门），因此过 `check-profile-knobs.sh` ✓；§5.3 原文的 `lag_bytes` 字节口径在实现里落成条目口径，已在 §5.3 就地标注修订、rev S 给出理由（WAL 无 index→offset 映射）。
 - **测试**：单测覆盖判定边界（`behind` 0/128/129、未答过、阈值 0 非空洞）；端到端 `a_learner_that_never_answered_cannot_be_promoted`：不存在的 learner → `LearnerNotCaughtUp` 且 `behind > 0`；未知节点 → `InvalidArgument`；随后写仍成功；停机后重开 WAL 断言 **voters=[1]、learners=[2]**（反向对照：什么都没被提升）。
 - 验证：workspace **392 passed / 0 failed**、`--features fault-injection` **405 passed / 0 failed**、l2 **3 passed / 0 failed**、四门禁全 PASS（含 profile-knobs 对新旋钮的检查）。
-- **下一步**：**S4** 快照写 live ConfState + 安装路径回灌（`create_snapshot` 现在写的是 bootstrap 静态集合）；**S5** M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程写不中断）+ INV-4 断电 + `arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
+- **下一步**：**S4** 快照写 live ConfState + 安装路径回灌（`create_snapshot` 现在写的是 bootstrap 静态集合）；**S5** M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程写不中断）+ INV-4 断电 + `arachne-kv-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（新节点启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
 
 ### 1.24 M3 ConfChange S4 落地：快照携带 live 成员表（+ 一次 CI 抖动修复）
 
@@ -401,7 +401,7 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 - **CI 抖动修复（顺手，独立问题）**：S3 的 CI run **失败了**——`sessions::session_bands_dedup_then_expire_then_forget` 在第 4 步拿到 `Timeout`。根因是负载：该步是单次 propose 且无重试，而 CI 的 fault-injection 步骤在 2 核 runner 上并行跑（新增的 6 个 membership 测试各自还会 spawn 多线程 runtime），300ms 的写 deadline 被挤爆。修法与既有先例一致（`m2_wal_faults` 的有界重试）：**只对 `Timeout` 做有界重试**，且重试的是**同一个 session**——若第一次其实落盘了，状态机去重仍保证断言成立（这正是幂等机制存在的意义）。同时把 3 节点测试的 tokio worker 线程从 4 降到 2，并给 `resolve_transfers` 加"无在途转让就直接返回"的早退（它每 cycle 都跑，别白读 leader/hint）。
   **教训（工具层面）**：`gh run watch ... | tail` 的退出码来自 `tail`，`--exit-status` 会被管道吞掉——**必须用 `gh run view --json conclusion` 复核**，否则"绿"是假的（本轮就是这样发现 S3 其实红了）。
 - 验证：workspace **393 passed / 0 failed**、`--features fault-injection` **407 passed / 0 failed（连跑两次）**、l2 **3 passed / 0 failed**、四门禁全 PASS。
-- **剩余**：**S5** = M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程 quorum 存续/写不中断）+ INV-4（learner 追平瞬间断电）+ `arachne-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
+- **剩余**：**S5** = M3 ①② 端到端（真实第 4 节点以 learner 身份加入 → 追平 → promote 成功 → remove，全程 quorum 存续/写不中断）+ INV-4（learner 追平瞬间断电）+ `arachne-kv-node` 运维子命令（`add-learner`/`promote`/`remove`/`transfer-leader`）。S5 需要"新节点以 learner 身份启动"的配置面（启动声明 = `initial_cluster` voter 集 + `learners=[self]`，仅作无持久状态时的兜底）。
 
 ### 1.25 M3 ConfChange S5（前半）：加入→追平→promote→remove 端到端打通（M3 ①）
 
@@ -437,7 +437,7 @@ S1 的第二步（路由侧）。此前 `StepOutcome::committed` 是 `Vec<(LogIn
 rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一步（接线在 T2）。
 
 - **proto**：`FetchSnapshot(SnapshotRequest) returns (stream SnapshotChunk)`；`SnapshotRequest{index, term, hello}`（`index`+`term` 就是快照文件名，二者一起唯一确定它）。
-- **`SnapshotProvider` seam**（`arachne-transport-tonic/src/snapshot.rs`）：`open(index, term) -> Option<SnapshotReader{len, reader}>`。**len 与 reader 一次取出**是刻意的——分两次问会撞上"问完大小、快照被压缩掉"从而产生*短读却像传完*的假象；reader 让服务端一次只持有一个分块（64 MiB 快照不该要 64 MiB 堆）。传输 crate 只依赖 `arachne-seam`，所以它不认识存储布局，由知道的人（`arachne-node`）实现 ✓ 依赖方向不变。
+- **`SnapshotProvider` seam**（`arachne-transport-tonic/src/snapshot.rs`）：`open(index, term) -> Option<SnapshotReader{len, reader}>`。**len 与 reader 一次取出**是刻意的——分两次问会撞上"问完大小、快照被压缩掉"从而产生*短读却像传完*的假象；reader 让服务端一次只持有一个分块（64 MiB 快照不该要 64 MiB 堆）。传输 crate 只依赖 `arachne-kv-seam`，所以它不认识存储布局，由知道的人（`arachne-kv-node`）实现 ✓ 依赖方向不变。
 - **服务端**：**先验握手、再取数据**（快照是集群数据；缺握手/异 cluster/协议 major 不符 → `PermissionDenied`，且计入 `handshake_rejections`），随后后台任务从 provider 读 `256 KiB` 分块、经**令牌桶**（`RateLimiter`，0 = 不限）节流、推入**容量 2** 的通道——这就是背压：客户端不读则该任务原地等待，快照不会被堆进内存。
 - **工厂**：`snapshot_provider(...)` / `snapshot_rate_bps(...)` 两个 builder（rate 由调用方给，因为 transmission crate 看不到 profile）。
 - **测试**（`tests/snapshot_stream.rs` 3 项，连跑两次全绿）+ `RateLimiter` 2 项单测：①**逐字节相同**（2×256 KiB+1234 字节跨块拼接；快照自身 CRC 是最终裁判 ⇒ I10）；②**未认证拿不到字节**（三种拒绝 + 计数 = 3）；③**限速可观测**：768 KiB @ 256 KiB/s ⇒ 500ms 内不可能完成、但最终完成，rate=0 同量数据 500ms 内有富余 ⇒ 反向对照成立。
@@ -460,10 +460,10 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
   1. **不能先安装到存储再交给 raft**：`Raft::restore` 会拿快照去**存储**核验（`match_term`），而先把存储日志轮转到 `index+1` 会让 restore **静默失败** ⇒ raft 日志与存储不一致 ⇒ 下一条 AppendEntries 直接在 `unstable.slice` 越界 panic（`log_unstable.rs:201`，backtrace 一路指到 `on_message`）。正确顺序 = 解码校验 → step（raft restore）→ in-`Ready` 安装 ✓（一条路径覆盖两种来源）。我为"先装后交"发明的 `install_local_snapshot` 因此**删除**。
   2. `submit_ready` 里"跳过安装"的判据必须看**有没有字节**而非"是否开流式"：拦截流程 step 进去的消息带**真实数据**，其 `Ready` 快照必须照常安装 ✓（只有"空 data 的元数据快照"才无事可做）。
   另有一处测试侧教训：磁盘文件名是**零填充**的（`snapshot-<020>-<020>.snap`）而请求带裸数字 ⇒ provider 必须做映射（真实实现用 `snapshot_file_name`）。
-- **生产接线同时落地**：`arachne-node` 工厂装 `DataDirSnapshots` + `snapshot_rate_bps(profile...)` ⇒ **profile-knobs 门禁白名单清空（known gaps: none）**，最后一个旋钮 `snapshot_transfer_rate_bps` 真正被读 ✓。能力判定收紧为**安全默认**：`TonicTransport::supports_snapshot_streaming()` = **该节点注册了 provider**（只会拉取不会服务是半残：leader 会发出对端永远补不齐的元数据快照）⇒ 没接 provider 的嵌入方/既有 tonic 测试仍走旧路径，真实部署自动启用 ✓。
+- **生产接线同时落地**：`arachne-kv-node` 工厂装 `DataDirSnapshots` + `snapshot_rate_bps(profile...)` ⇒ **profile-knobs 门禁白名单清空（known gaps: none）**，最后一个旋钮 `snapshot_transfer_rate_bps` 真正被读 ✓。能力判定收紧为**安全默认**：`TonicTransport::supports_snapshot_streaming()` = **该节点注册了 provider**（只会拉取不会服务是半残：leader 会发出对端永远补不齐的元数据快照）⇒ 没接 provider 的嵌入方/既有 tonic 测试仍走旧路径，真实部署自动启用 ✓。
 - 原（已实现前的）形状分析：
 - **T2b 的形状被一处安全分析改写（本轮的设计产出，务必按它实现）**：**元数据快照不能先交给 raft**。`Raft::restore`（raft.rs:2617）只要 `index >= committed` 就会截断 raft 日志、把 committed/applied 推到快照 index 并改配置；而**没有任何代码自动回 `MsgSnapshotStatus`**（全仓 grep 无 `send_snapshot_status`），回执必须由 app 调 `report_snapshot`。所以"先 step、再拉取"有个致命窗口：**拉取失败时 raft 视图已跳到快照 index，本地存储还停在旧日志** ⇒ 两者不一致（后续条目 `index ordering violation` 打死节点）。正确形状是**拦截**：runtime 在把入站消息交给 raft 之前识别出流式元数据快照并**不 step**，先 spawn 拉取；成功 → 解码（CRC = I9）→ `install_local_snapshot` → **再** step 该消息（此时走的是与既有 in-`Ready` 路径**完全相同**的 restore/SM restore 路径）→ `report_snapshot(from, true)`；失败 → 什么都没进 raft，`report_snapshot(from, false)` 让 raft 转 probe 重试。识别不需额外解析（`on_message` 本就要 parse）：node 侧记 `(from, raw_bytes)` 到"待拉取入站快照"槽位 + 一个 `step_held_snapshot()`。**该形状还消掉了原计划的"暂存 committed 条目"复杂性**：快照消息既然没进 raft，同 cycle 就不存在"快照之后的条目"要等 ✓。
-- **本轮已落地的 T2b 脚手架**（`arachne-testsupport`，独立可验证）：`InMemoryTransportFactory::with_snapshot_streaming()` + `set_snapshot_source(peer, closure)`（按 `(index,term)` 供字节；`None` = 该 peer 没有这份快照 = 模拟传输失败），`InMemoryTx` 补 `Clone`（T2b 需要把 transport 克隆交给拉取任务）并实现 `supports_snapshot_streaming`/`fetch_snapshot`（写 `dest` 文件）。测试：注册源则文件逐字节相同、未注册源/不存在的快照都返回 `Ok(None)` 且**不留下文件**。这样 T2b 的端到端测试能走**与 tonic 相同的运行时路径**（真实 gRPC 流已由 T1/T1b 覆盖）。
+- **本轮已落地的 T2b 脚手架**（`arachne-kv-testsupport`，独立可验证）：`InMemoryTransportFactory::with_snapshot_streaming()` + `set_snapshot_source(peer, closure)`（按 `(index,term)` 供字节；`None` = 该 peer 没有这份快照 = 模拟传输失败），`InMemoryTx` 补 `Clone`（T2b 需要把 transport 克隆交给拉取任务）并实现 `supports_snapshot_streaming`/`fetch_snapshot`（写 `dest` 文件）。测试：注册源则文件逐字节相同、未注册源/不存在的快照都返回 `Ok(None)` 且**不留下文件**。这样 T2b 的端到端测试能走**与 tonic 相同的运行时路径**（真实 gRPC 流已由 T1/T1b 覆盖）。
 - **T2b 待做（下一步）**：`Runtime` 持 transport 克隆（需 `T: Clone`：`TonicTransport` 已是，`InMemoryTx` 补 derive）+ 按能力设 flag；actor 收到元数据快照 → **spawn 拉取**（不能 await，几十 MB 会卡住 tick/心跳/读）→ 结果回 actor → 读文件 `decode_snapshot`（CRC = I9）→ `install_local_snapshot` → 复用既有 `enqueue_apply(Some(完整快照), 暂存条目)` → `report_snapshot(from, true)`；期间该 cycle 与后续 cycle 的 committed 条目**暂存**（快照必须先 restore 才能 apply 其后的条目）。测试：进程内三节点 + 给 `InMemoryTransportFactory` 注册"快照字节来源"（按 `(from,index,term)` 读 leader 数据目录的快照文件）⇒ 与 tonic 相同的运行时路径；**真实 tonic 三节点回归**（gRPC 上限压到 64 KiB 让单消息路线必失败）列为验收项。
 - **T3 ✓ 已解决（第 16 轮）：根因在 raft 的"本地消息"分类，修法是 follower 侧本地重试**。
   - **根因（源码级确认）**：`RawNode::step` 第一件事是 `if is_local_msg(m.get_msg_type()) { return Err(StepLocalMsg) }`，而 `is_local_msg` **包含 `MsgSnapStatus`**（`raw_node.rs:57-66`）⇒ **follower 根本无法通过网络把快照状态告诉 leader**；同时全仓 `snapshot_failure()` 只有一个调用点（`raft.rs:2024`，即 leader 本地的 `report_snapshot` 路径）。上一轮"状态已送达却毫无效果"的怪象由此解释 ✓：消息被 `step` 静默拒绝（我们的 `on_message` 把错误忽略掉了）。
@@ -499,7 +499,7 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
 - （原计划的）**T3 待做**：流中断恢复（§9"快照传输中断后恢复"）。
 - 早期计划（已被上面取代）：元数据快照（`RaftStorage::snapshot()` 返回无 data 版本）+ 运行时编排（收到元数据快照 → 拉取 → 聚合落盘 → `install_snapshot` → `report_snapshot`）+ `Transport::fetch_snapshot` 默认实现 + **真实 tonic 三节点回归**（把 gRPC 上限调到 64 KiB，让单消息路线必失败、流式路线追上）；T3 流中断恢复。
 
-### 1.31 结构性 flake：`arachne-node` 的 `alloc_port`（**第 22 轮已修 ✓**）
+### 1.31 结构性 flake：`arachne-kv-node` 的 `alloc_port`（**第 22 轮已修 ✓**）
 
 **现象**：第 21 轮给传输层加了一个"peer 同址重启后仍可达"的回归测试（本地与 transport
 套件连跑两次都过 ✓），但 CI 上 `Build & test` 红了，失败的是**与之无关的两个进程级测试**
@@ -519,7 +519,7 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
 3. 或把进程级测试串行化（`--test-threads=1` 只对该文件生效需要 harness 配置 ✗）。
 方案 1 最小且无副作用 ✓。
 
-**第 22 轮已按方案 1 修掉 ✓**：`alloc_port()` 现在从**本进程自己的端口带**（pid 推导）按单调计数器取候选，并对候选做一次 bind 探测（占用则跳到下一个）⇒ 同进程内两个测试**永不重叠**（这正是观察到的失败模式 ✓），仍会跳过真正被占用的端口 ✓。验证：`arachne-node` 全量连跑两次 50/50 ✓、`cli.rs` 12/12 ✓、CI 绿 ✓。
+**第 22 轮已按方案 1 修掉 ✓**：`alloc_port()` 现在从**本进程自己的端口带**（pid 推导）按单调计数器取候选，并对候选做一次 bind 探测（占用则跳到下一个）⇒ 同进程内两个测试**永不重叠**（这正是观察到的失败模式 ✓），仍会跳过真正被占用的端口 ✓。验证：`arachne-kv-node` 全量连跑两次 50/50 ✓、`cli.rs` 12/12 ✓、CI 绿 ✓。
 
 **（历史记录）为什么当时不修**：那时上下文预算已耗尽，而这是一个**独立的测试基建问题**（与 rev T 的
 剩余项无关）✗；留红不可接受，故先把新测试 revert 掉恢复绿 ✓，并把根因与三个候选修法记在此处。
@@ -554,7 +554,7 @@ rev T 的 T1（传输层）落地，这是把 8 MiB/64 MiB 缺口关掉的第一
 3. **【已知限制】快照在 leader 侧被压缩掉时 follower 会持续重试**：follower 侧重试 8 次退避后放弃、等 leader 的下一份快照 ✓；只有 leader 继续产生新快照才会自愈 ✗。若要消除，需按第 2 条改成 leader 驱动（leader 自己知道传输失败 ✓）。
 4. **【测试缺口】流式传输"传到一半断开"的恢复**：T3 覆盖的是"首次尝试即失败" ✓（in-memory，§1.27–1.32）；**没有**覆盖"分块传到中途断开再恢复" ✗。入口：给 `InMemoryTransportFactory` 的 snapshot source 加"第 N 次调用返回截断字节"的能力（`fetch_snapshot` 已把字节写到 `dest` ✓，截断会被 `decode_snapshot` 的 CRC 拒绝 ✓），或在 tonic 层注入流中断。
 5. **【测试缺口】限速 + 大快照的真实传输**：限速已有传输层测试（768 KiB @256 KiB/s ✓），但**没有**在真实 tonic + Runtime 下跑"大快照被限速"的端到端 ✗（第 23 轮的 harness 可加 `snapshot_rate_bps` 直接复用 ✓）。
-6. **【部署注意，非缺陷】未注册 `SnapshotProvider` 的嵌入方仍受 `max_message_size` 约束**：流式是**安全默认关闭**的 ✓（`arachne-node` 已注册 ✓），但自建 factory 不注册时，大于上限的快照仍传不过去 ✗（与 streaming 之前一致，非回归 ✓）。
+6. **【部署注意，非缺陷】未注册 `SnapshotProvider` 的嵌入方仍受 `max_message_size` 约束**：流式是**安全默认关闭**的 ✓（`arachne-kv-node` 已注册 ✓），但自建 factory 不注册时，大于上限的快照仍传不过去 ✗（与 streaming 之前一致，非回归 ✓）。
 7. **【环境/工具】沙箱与 CI**：本地跑门禁需 `CARGO_TARGET_DIR=<repo>/.dsh-target`（默认全局 target 在仓库外会被沙箱拒绝 ✗）；`gh` 需 `XDG_CACHE_HOME=<repo>/.gh-cache` ✓；`gh run watch … | tail` 会吞掉退出码 ⇒ **必须用 `gh run view --json conclusion` 复核** ✓（这条踩过 ✗）；protoc 下载在 CI 上偶发 502/504，已加 `--retry-all-errors` ✓。
 
 ### 1.34 首次 `--release` 综合性能基准（机器相关数字，非 SLO；`--release` 跑）
@@ -578,8 +578,8 @@ Lan profile 底、`FsyncPolicy::Always`；数字有 ±20% 级随机波动）：
 
 **harness**：`arachne/tests/bench_runtime.rs`（runtime 全维度）+ `arachne-transport-tonic/tests/bench_tonic_snapshot.rs`
 （真实 tonic 快照限速对照）。跑法：
-`CARGO_TARGET_DIR=.dsh-target cargo test --release -p arachne --test bench_runtime -- --ignored --nocapture`
-（tonic 同理换 `-p arachne-transport-tonic --test bench_tonic_snapshot`）。
+`CARGO_TARGET_DIR=.dsh-target cargo test --release -p arachne-kv --test bench_runtime -- --ignored --nocapture`
+（tonic 同理换 `-p arachne-kv-transport-tonic --test bench_tonic_snapshot`）。
 
 **踩到的一个 harness 坑（值得记）**：in-memory 下**不能靠 drop 某节点 Handle 来"杀掉"它**——
 `register_peer` 存的是完整 `Handle` 克隆（持 command sender），其余节点的 peer map 会让该节点的
@@ -650,23 +650,23 @@ put 单连接 **821 ops/s / p50 1.13ms**（keep-alive 1154）；4 并发 375 ops
 cargo build --workspace
 cargo test --workspace
 cargo build --examples
-cargo build -p arachne --no-default-features
+cargo build -p arachne-kv --no-default-features
 bash scripts/check-deps.sh
 bash scripts/check-entropy.sh
 bash scripts/check-release-features.sh          # D-ART-testobs（release 产物排除 test-observability）
 # 3 节点真实网络（库级）：
-cargo test -p arachne-transport-tonic --test three_node -- --nocapture
-cargo test -p arachne-transport-tonic --test three_node_client -- --nocapture
+cargo test -p arachne-kv-transport-tonic --test three_node -- --nocapture
+cargo test -p arachne-kv-transport-tonic --test three_node_client -- --nocapture
 # 3 进程真实集群（bin 级，L3 冒烟 + 杀 leader）：
-cargo test -p arachne-node --test multi_node -- --nocapture
-cargo test -p arachne-node --test cli -- --nocapture
-cargo test -p arachne-transport-tonic --test multi_node_bind -- --nocapture
+cargo test -p arachne-kv-node --test multi_node -- --nocapture
+cargo test -p arachne-kv-node --test cli -- --nocapture
+cargo test -p arachne-kv-transport-tonic --test multi_node_bind -- --nocapture
 # ReadIndex 读路径（进程内 3 节点）：
-cargo test -p arachne --test read_index -- --nocapture
+cargo test -p arachne-kv --test read_index -- --nocapture
 # 客户端重定向契约（普通 handle + 单发 handle）：
-cargo test -p arachne --test client_redirect -- --nocapture
+cargo test -p arachne-kv --test client_redirect -- --nocapture
 # 持久化 commit 回归（真实 Runtime actor + force-recovery）：
-cargo test -p arachne --test force_recovery -- --nocapture
+cargo test -p arachne-kv --test force_recovery -- --nocapture
 # L4 真机 kill -9（每轮一次 acked 写入 + 崩溃后复验；需真实磁盘）：
 ARACHNE_L4_ITERATIONS=3 bash l4/kill_loop.sh
 # L2 独立工程（turmoil；真实 tonic 集群 + 传输延迟门禁，CI 有独立 job）：

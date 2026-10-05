@@ -31,13 +31,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::client::Handle;
-use arachne::consensus::RaftNodeConfig;
-use arachne::runtime::{Runtime, RuntimeConfig};
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::TransportFactory;
-use arachne::{ArachneError, Metrics, NodeId, Profile, ProfileConfig};
-use arachne_testsupport::InMemoryTransportFactory;
+use arachne_kv::client::Handle;
+use arachne_kv::consensus::RaftNodeConfig;
+use arachne_kv::runtime::{Runtime, RuntimeConfig};
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::TransportFactory;
+use arachne_kv::{ArachneError, Metrics, NodeId, Profile, ProfileConfig};
+use arachne_kv_testsupport::InMemoryTransportFactory;
 use slog::{o, Drain, Logger};
 use tokio::time::Instant;
 
@@ -163,7 +163,7 @@ async fn linearizable_read_latency_is_bounded_under_a_write_storm() {
 
     let mut handles: Vec<Handle> = Vec::new();
     let mut metrics: Vec<Arc<Metrics>> = Vec::new();
-    let mut runtimes: Vec<arachne::RuntimeThread> = Vec::new();
+    let mut runtimes: Vec<arachne_kv::RuntimeThread> = Vec::new();
     let mut dirs = Vec::new();
     for i in 1..=N {
         let dir = temp_dir(&format!("n{i}"));

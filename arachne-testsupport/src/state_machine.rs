@@ -1,4 +1,4 @@
-//! A trivial, deterministic [`StateMachine`](arachne_seam::StateMachine) for tests.
+//! A trivial, deterministic [`StateMachine`](arachne_kv_seam::StateMachine) for tests.
 //!
 //! It is a byte-keyed map plus a record of the highest index applied. It
 //! exists to prove the `StateMachine` seam is implementable and to give the
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Applying a command sets each key to its value and returns the value of the
-//! last pair (or [`ApplyOutcome::None`](arachne_seam::ApplyOutcome::None) for an
+//! last pair (or [`ApplyOutcome::None`](arachne_kv_seam::ApplyOutcome::None) for an
 //! empty command).
 //!
 //! # Snapshot encoding
@@ -35,11 +35,11 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 
-use arachne_seam::{ApplyOutcome, LogIndex, StateMachine};
+use arachne_kv_seam::{ApplyOutcome, LogIndex, StateMachine};
 
 /// Errors a state machine can report.
 ///
-/// Per the [`StateMachine::apply`](arachne_seam::StateMachine::apply) contract,
+/// Per the [`StateMachine::apply`](arachne_kv_seam::StateMachine::apply) contract,
 /// any of these is a **fail-stop** condition: the caller must abort, never
 /// retry or degrade.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,6 +4,7 @@
 > 工具调研基线：2026-09，所引版本已核验（turmoil 0.7.2、loom 0.7.2、shuttle 0.9.3、cargo-fuzz 0.13.2、libfuzzer-sys 0.4.13、arbitrary 1.4.2、proptest 1.11.0、stateright 0.31.0、`raft` crate 0.7.0、madsim 0.2.34）。
 > 设计前提沿用上游：共识内核复用 `raft` crate（tikv/raft-rs）、tonic 传输、WAL+快照存储、全内存状态机+会话表、§2 一致性语义、§4.2 不变量 I1–I4、§5.5.3 恢复算法。
 > 修订记录：v0.1.1 新增决策记录表（D-T1/D-T2/D-L4/D-S1 评审锁定）与 **§3.2 工件/工作区布局、§3.3 进程级 harness（D-ART）**——补齐 L3/L4 所预设的可执行载体；v0.1.2 锁定 D-ART 四项子决策（crate 名、默认 feature、TOML 配置、test-observability 特性门禁）；**v0.1.3 D-ART-rev1：抽出无依赖叶 crate `arachne-seam`（接缝 trait + 核心类型）**——`arachne-transport-tonic` 改依赖 `arachne-seam`（不再 `→ arachne`）以消除 `transport-tonic → arachne` 与 D-ART-feature `arachne → transport-tonic` 构成的 **cargo 包循环**；`arachne` 重导出接缝保持嵌入者公共 API 不变；并澄清 sim/testsupport 精简构建（对 `arachne` 一律 `default-features = false`，testsupport 永不含 tonic，sim 的 tonic 仅 L2 落地时显式启用）。
+> 注：v0.2.25 全家族改名 arachne-* → arachne-kv-*（二进制名 arachne-node 不变）。
 
 ## 决策记录（评审已锁定）
 
@@ -15,12 +16,12 @@
 | D-T2 | 线性化检查器 | **stateright 0.31.0 锁定为 `dev-dependency`**（仅测试依赖，不进生产依赖树）：作 T3 有界模型检查引擎 + 自建 Wing–Gong 检查器的交叉验证参照。**"去掉参照检查器"不是选项**——检查器自身的正确性门禁依赖它（§11 缺口 8） | 自建检查器是新代码，必须有独立参照兜底；stateright 另承担设计层模型检查 | §4 T2/T3、§11；上游 §9.1 |
 | D-L4 | L4 真机持久性门禁 | **专用真实磁盘 CI runner 现在即立项建设**（M0 起配置、M1 起可用、M4 出全量门禁）；"发版前手工执行"与"延后到 M2"两个备选已评审**否决**——fsync 语义不能等到 M4 才第一次被真实验证 | INV2/INV6 的真盘复验不可替代（模拟 fsync 是"撒谎的"）；自动化 runner 是唯一可重复的证明方式 | §2 L4 行、§10、§12 M0/M4；上游 §9.4 |
 | D-S1 | raft-rs 选举 RNG 不可注入时的响应 | **锁定方案：workspace `[patch.crates-io]` 携带一行 RNG 注入改动，以上游化为目标**；补丁进 cargo-deny/vendor 审计清单跟踪。S1 spike 只核验"是否需要补丁"，不再决定"要不要补丁" | 双跑复现门禁是整个确定性体系的根基（§5），不能留缺口；一行 patch 成本远低于失去可复现性 | §5 E3、§13 S1；上游 §9.5、§13 R3 |
-| D-ART-names | 工件与 crate 命名 | **锁定**：`arachne`（lib）、`arachne-transport-tonic`、`arachne-node`（bin）、`arachne-testsupport`、`arachne-sim`，外加 `examples/`、`fuzz/`、`model-check/` | 名称即职责：lib 产品主体 / 生产传输隔离 / 运维 bin / 测试支撑 dev-only / 测试 bin 不发布 | §3.2；上游 §4 工件边界 |
-| D-ART-feature | `arachne` 默认 feature 拉入 tonic | **锁定：默认 feature `transport-tonic` 经 `arachne-transport-tonic` 拉入**，嵌入者单依赖即得完整栈；**代价**：默认依赖树更重（tonic/rustls）——精简核心可用 `default-features = false` 自选传输；sim 测试构建一律 `default-features = false` | 嵌入者工效学优先；代价由 embedder 显式选择规避，且 tonic 类型仍被隔离在单一 crate | §3.2；上游 §4 |
+| D-ART-names | 工件与 crate 命名 | **锁定**：`arachne-kv`（lib）、`arachne-kv-transport-tonic`、`arachne-kv-node`（bin，二进制名仍为 `arachne-node`）、`arachne-kv-testsupport`、`arachne-kv-sim`，外加 `examples/`、`fuzz/`、`model-check/` | 名称即职责：lib 产品主体 / 生产传输隔离 / 运维 bin / 测试支撑 dev-only / 测试 bin 不发布 | §3.2；上游 §4 工件边界 |
+| D-ART-feature | `arachne-kv` 默认 feature 拉入 tonic | **锁定：默认 feature `transport-tonic` 经 `arachne-kv-transport-tonic` 拉入**，嵌入者单依赖即得完整栈；**代价**：默认依赖树更重（tonic/rustls）——精简核心可用 `default-features = false` 自选传输；sim 测试构建一律 `default-features = false` | 嵌入者工效学优先；代价由 embedder 显式选择规避，且 tonic 类型仍被隔离在单一 crate | §3.2；上游 §4 |
 | D-ART-config | 节点配置文件格式 | **锁定 TOML**：`arachne-node --config node.toml`，字段 = 上游 §7 Profile + 覆盖项 + §5.7 `initial_cluster`；CLI 单项覆盖为辅；测试 harness 复用同一 TOML 配置面，不引入第二格式 | TOML 与 §7 配置预设表同构、可注释、diff 友好；单一格式避免"文档一处、文件一处"漂移 | §3.3；上游 §7 |
-| D-ART-testobs | 生产 bin 携带 `test-observability` feature | **锁定为"无测试代码入生产"规则的最小例外**：`arachne-node` 可带 `test-observability` feature（仅追加结构化 marker 日志，零行为改变）；**CI 门禁强制 release/发布构建排除该 feature**（feature 解析检查 + 发布产物 hash 断言） | L4 的阶段精确 kill 需要进程内标记（§3.3）；feature flag 而非独立分支 = 无分叉维护成本；门禁保证出货产物不含该特性 | §3.3、§10；上游 §9.4 |
-| D-ART | 测试工件与工作区布局 | **五工件布局锁定**（§3.2）：`arachne`（lib 产品主体）+ `arachne-transport-tonic` + **`arachne-node`（薄运维 bin，生产交付物）** + `arachne-testsupport`（仅 dev-dependency）+ `arachne-sim`/`examples/`/`fuzz`/`model-check`。L3/L4 的被测进程就是 `arachne-node` | force-recovery（上游 §6）与成员运维（上游 §3.1）本就是生产接口 → bin 是一等交付物而非测试装置；bin 与嵌入者共用同一 lib 代码路径，L3/L4 测的即出货代码；测试依赖不得泄漏进生产树 | §3.2/§3.3、§9、§10、§12；上游 §1/§3.1/§4/§6.1/§7 |
-| D-ART-rev1 | 抽出叶 crate `arachne-seam` 消除包循环 | **锁定**：新增**无依赖叶 crate** `arachne-seam`（接缝 trait `Transport`/`TransportRx`/`TransportFactory`/`Clock`/`Rng`/`StateMachine` + 核心类型 `NodeId`/`LogIndex`/`Term`/`Timestamp`）；`arachne-transport-tonic` 依赖 `arachne-seam`（**不再依赖 `arachne`**）；`arachne` 依赖 `arachne-seam` 并重导出接缝（嵌入者公共 API 不变）；工件布局由五件扩为**六件**；sim/testsupport 对 `arachne` 一律 `default-features = false` | 原 `transport-tonic → arachne`（为 `impl arachne::seam::Transport`）与 D-ART-feature 的 `arachne --(default)--> transport-tonic` 构成 **cargo 包循环**（实测硬拒绝）；叶 crate 使"接缝归核心、实现归传输 crate"可落地，并顺带澄清 F2 精简构建 | §3.2；上游 §4 工件边界 |
+| D-ART-testobs | 生产 bin 携带 `test-observability` feature | **锁定为"无测试代码入生产"规则的最小例外**：`arachne-kv-node` 可带 `test-observability` feature（仅追加结构化 marker 日志，零行为改变）；**CI 门禁强制 release/发布构建排除该 feature**（feature 解析检查 + 发布产物 hash 断言） | L4 的阶段精确 kill 需要进程内标记（§3.3）；feature flag 而非独立分支 = 无分叉维护成本；门禁保证出货产物不含该特性 | §3.3、§10；上游 §9.4 |
+| D-ART | 测试工件与工作区布局 | **五工件布局锁定**（§3.2）：`arachne-kv`（lib 产品主体）+ `arachne-kv-transport-tonic` + **`arachne-kv-node`（薄运维 bin，生产交付物）** + `arachne-kv-testsupport`（仅 dev-dependency）+ `arachne-kv-sim`/`examples/`/`fuzz`/`model-check`。L3/L4 的被测进程就是 `arachne-node` | force-recovery（上游 §6）与成员运维（上游 §3.1）本就是生产接口 → bin 是一等交付物而非测试装置；bin 与嵌入者共用同一 lib 代码路径，L3/L4 测的即出货代码；测试依赖不得泄漏进生产树 | §3.2/§3.3、§9、§10、§12；上游 §1/§3.1/§4/§6.1/§7 |
+| D-ART-rev1 | 抽出叶 crate `arachne-kv-seam` 消除包循环 | **锁定**：新增**无依赖叶 crate** `arachne-kv-seam`（接缝 trait `Transport`/`TransportRx`/`TransportFactory`/`Clock`/`Rng`/`StateMachine` + 核心类型 `NodeId`/`LogIndex`/`Term`/`Timestamp`）；`arachne-kv-transport-tonic` 依赖 `arachne-kv-seam`（**不再依赖 `arachne-kv`**）；`arachne-kv` 依赖 `arachne-kv-seam` 并重导出接缝（嵌入者公共 API 不变）；工件布局由五件扩为**六件**；sim/testsupport 对 `arachne-kv` 一律 `default-features = false` | 原 `transport-tonic → arachne-kv`（为 `impl arachne_kv::seam::Transport`）与 D-ART-feature 的 `arachne-kv --(default)--> transport-tonic` 构成 **cargo 包循环**（实测硬拒绝）；叶 crate 使"接缝归核心、实现归传输 crate"可落地，并顺带澄清 F2 精简构建 | §3.2；上游 §4 工件边界 |
 
 ---
 
@@ -63,7 +64,7 @@
 
 | 接缝 | 生产实现 | 测试实现 | 针对的风险 |
 |---|---|---|---|
-| `Transport` | `arachne-transport-tonic`（tonic + rustls mTLS） | turmoil 承载**真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配）；另有内存交换机实现供 L1 | madsim 式"换运行时"路线迫使 `[patch.crates-io]` 追版本（madsim-tonic 钉 tonic 0.14）——**采纳 turmoil 后此风险消除，但 tonic/turmoil 版本演进仍需隔离在单一 adapter crate** |
+| `Transport` | `arachne-kv-transport-tonic`（tonic + rustls mTLS） | turmoil 承载**真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配）；另有内存交换机实现供 L1 | madsim 式"换运行时"路线迫使 `[patch.crates-io]` 追版本（madsim-tonic 钉 tonic 0.14）——**采纳 turmoil 后此风险消除，但 tonic/turmoil 版本演进仍需隔离在单一 adapter crate** |
 | `WalStorage` + `StateMachine`（raft-rs `Storage` 之下的自有缝） | 真实 WAL/内存状态机 | `FaultyStorage`（§6.2） | 磁盘故障注入点；raft-rs 要求自实现 Storage，此缝天然存在 |
 | `Clock` | `std::time` 包装 | turmoil 模拟时钟 / 手动拨钟 | 会话 TTL、read_index 超时、GC 调度不可控；**规则：模拟相关路径禁直接调用 `std::time::Instant/SystemTime`**（CI grep 门禁）。GC 时间戳本就走日志传播（§2.3），天然确定 |
 | `Rng` | `rand` 默认 | 由 sim seed 派生的 `DeterministicRng`（每 host 一个子流） | 选举抖动、重试抖动、UUID 生成引入不可复现性 |
@@ -71,29 +72,29 @@
 
 ### 3.2 工件与工作区布局（决策 D-ART，v0.1.1 新增）
 
-**缺口闭合**：本方案 L3/L4、升级矩阵（S12/S20）、RunManifest 的 `binary_hash`、force-recovery 的 CLI 集成测试都预设一个**可运行的节点二进制**——上游 §3 只定义了库 API。D-ART 锁定五工件布局（**D-ART-rev1 扩为六工件：新增无依赖叶 crate `arachne-seam` 消除包循环**）；crate 命名、默认 feature、配置格式、test-observability 特性四项子决策已锁定（D-ART-names / D-ART-feature / D-ART-config / D-ART-testobs），包循环消除与精简构建澄清见 D-ART-rev1（见顶部决策记录表）：
+**缺口闭合**：本方案 L3/L4、升级矩阵（S12/S20）、RunManifest 的 `binary_hash`、force-recovery 的 CLI 集成测试都预设一个**可运行的节点二进制**——上游 §3 只定义了库 API。D-ART 锁定五工件布局（**D-ART-rev1 扩为六工件：新增无依赖叶 crate `arachne-kv-seam` 消除包循环**）；crate 命名、默认 feature、配置格式、test-observability 特性四项子决策已锁定（D-ART-names / D-ART-feature / D-ART-config / D-ART-testobs），包循环消除与精简构建澄清见 D-ART-rev1（见顶部决策记录表）：
 
 | 工件 | 类型 | 职责 | 依赖方向 |
 |---|---|---|---|
-| `arachne-seam` | **lib（叶 crate，无依赖；D-ART-rev1 新增）** | 接缝 trait（`Transport`/`TransportRx`/`TransportFactory`/`Clock`/`Rng`/`StateMachine`）+ 核心类型（`NodeId`/`LogIndex`/`Term`/`Timestamp`）。**无依赖、不含任何传输/存储实现**——接缝归核心、实现归传输 crate | 无（叶 crate） |
-| `arachne` | **lib（产品主体）** | 上游 §2–§6 全部核心：API/共识封装/状态机/存储。**接缝 trait 与核心类型现居 `arachne-seam`，`arachne` 依赖并重导出之（嵌入者公共 API 不变）**。不含 tonic/rustls 类型（传输实现经默认 feature `transport-tonic` 引入；sim 测试构建用 `default-features = false`）。**命名锁定（D-ART-names）；D-ART-rev1 增 `arachne-seam`** | → `arachne-seam`；可选（默认 feature `transport-tonic`）→ `arachne-transport-tonic` |
-| `arachne-transport-tonic` | lib | 生产传输实现（tonic + rustls mTLS）；**唯一允许出现 tonic/rustls 类型的地方**；`impl arachne-seam::Transport` | → `arachne-seam`（**不依赖 `arachne`**——断环，D-ART-rev1） |
-| `arachne-node` | **bin（生产交付物，非测试装置）** | 薄装配层：CLI/TOML 配置加载（上游 §7 配置面）、信号与优雅关闭、`/readyz` + `/metrics` 端点（上游 §8）、`force-recovery` 与成员运维子命令（上游 §6/§3.1）。**禁止包含共识/存储/状态机逻辑**——保证 L3/L4 被测进程与嵌入者运行同一份 lib 代码 | → `arachne`（接缝经其重导出；M1 接线真实传输时按上文对齐依赖） |
-| `arachne-testsupport` | lib（**仅 dev-dependency，`publish = false`**） | FaultyStorage、fsync 台账、ClientOracle、不变量检查器、RunManifest、**进程 harness（§3.3）**、turmoil 包装（SimNetwork） | → `arachne-seam`（仅叶 crate——**结构上不可能拉入 tonic**；D-ART-rev1）（+ turmoil/shuttle 等 dev 生态） |
-| `arachne-sim` | 测试 bin（`publish = false`） | L2 场景注册表 + repro CLI（§9） | → `arachne`（`default-features = false`）+ `arachne-seam` + `arachne-testsupport`；tonic 仅在 L2 harness 落地时**显式**启用（D-ART-rev1） |
-| `examples/`（arachne 的 examples） | 示例（**禁止演示版**） | 完整可运行的公共 API 用例，无 TODO/桩/`unwrap` 演示味；每个示例都是 **API 工效学门禁**（示例难写 = API 难用，PR review 可见） | → `arachne`（默认 feature `transport-tonic` 含传输） |
-| `fuzz/`、`model-check/` | 测试 bin | T5 fuzz targets / T3 stateright 模型 | → `arachne`（+ `arachne-seam`）/ 纯模型（不依赖 arachne） |
+| `arachne-kv-seam` | **lib（叶 crate，无依赖；D-ART-rev1 新增）** | 接缝 trait（`Transport`/`TransportRx`/`TransportFactory`/`Clock`/`Rng`/`StateMachine`）+ 核心类型（`NodeId`/`LogIndex`/`Term`/`Timestamp`）。**无依赖、不含任何传输/存储实现**——接缝归核心、实现归传输 crate | 无（叶 crate） |
+| `arachne-kv` | **lib（产品主体）** | 上游 §2–§6 全部核心：API/共识封装/状态机/存储。**接缝 trait 与核心类型现居 `arachne-kv-seam`，`arachne-kv` 依赖并重导出之（嵌入者公共 API 不变）**。不含 tonic/rustls 类型（传输实现经默认 feature `transport-tonic` 引入；sim 测试构建用 `default-features = false`）。**命名锁定（D-ART-names）；D-ART-rev1 增 `arachne-kv-seam`** | → `arachne-kv-seam`；可选（默认 feature `transport-tonic`）→ `arachne-kv-transport-tonic` |
+| `arachne-kv-transport-tonic` | lib | 生产传输实现（tonic + rustls mTLS）；**唯一允许出现 tonic/rustls 类型的地方**；`impl arachne_kv_seam::Transport` | → `arachne-kv-seam`（**不依赖 `arachne-kv`**——断环，D-ART-rev1） |
+| `arachne-kv-node` | **bin（生产交付物，非测试装置）** | 薄装配层：CLI/TOML 配置加载（上游 §7 配置面）、信号与优雅关闭、`/readyz` + `/metrics` 端点（上游 §8）、`force-recovery` 与成员运维子命令（上游 §6/§3.1）。**禁止包含共识/存储/状态机逻辑**——保证 L3/L4 被测进程与嵌入者运行同一份 lib 代码 | → `arachne-kv`（接缝经其重导出；M1 接线真实传输时按上文对齐依赖） |
+| `arachne-kv-testsupport` | lib（**仅 dev-dependency，`publish = false`**） | FaultyStorage、fsync 台账、ClientOracle、不变量检查器、RunManifest、**进程 harness（§3.3）**、turmoil 包装（SimNetwork） | → `arachne-kv-seam`（仅叶 crate——**结构上不可能拉入 tonic**；D-ART-rev1）（+ turmoil/shuttle 等 dev 生态） |
+| `arachne-kv-sim` | 测试 bin（`publish = false`） | L2 场景注册表 + repro CLI（§9） | → `arachne-kv`（`default-features = false`）+ `arachne-kv-seam` + `arachne-kv-testsupport`；tonic 仅在 L2 harness 落地时**显式**启用（D-ART-rev1） |
+| `examples/`（arachne-kv 的 examples） | 示例（**禁止演示版**） | 完整可运行的公共 API 用例，无 TODO/桩/`unwrap` 演示味；每个示例都是 **API 工效学门禁**（示例难写 = API 难用，PR review 可见） | → `arachne-kv`（默认 feature `transport-tonic` 含传输） |
+| `fuzz/`、`model-check/` | 测试 bin | T5 fuzz targets / T3 stateright 模型 | → `arachne-kv`（+ `arachne-kv-seam`）/ 纯模型（不依赖 arachne-kv） |
 
-**依赖方向规则**：`arachne-seam` 为无依赖叶 crate，接缝 trait 与核心类型全部归其所有；`arachne` 依赖 `arachne-seam` 并**重导出**之（**嵌入者公共 API 不变**）。`arachne-transport-tonic` 仅依赖 `arachne-seam`（**不依赖 `arachne`**）——由此 D-ART-feature 的"默认 feature `arachne → arachne-transport-tonic`"与"传输 crate 实现 `Transport`"不再构成 **cargo 包循环**（D-ART-rev1）。常规依赖图无环（`arachne` 的集成测试经 `dev-dependencies` 引 `arachne-testsupport`——cargo 允许 dev-cycle，但**生产依赖图必须无环**）；CI 以 `cargo-tree` 门禁检查"测试依赖不进生产 crate 的 `[dependencies]`"。嵌入者视角：`arachne` + 默认 feature 即得完整栈（D-ART-feature）。**精简构建（F2）**：`arachne-testsupport` 仅依赖叶 crate `arachne-seam`（结构上不可能拉入 tonic）；`arachne-sim` 对 `arachne` 用 `default-features = false`，其 tonic 仅在 L2 harness 落地时**显式**启用（D-ART-rev1）。**注意 feature 统一**：workspace 级 `cargo build --workspace` 会做 feature unification——sim 二进制会链接到含 tonic 的 `arachne` rlib；"sim 不编译 tonic"严格成立于 `-p arachne-sim` 构建，L2 启用 tonic 时据此决策。
+**依赖方向规则**：`arachne-kv-seam` 为无依赖叶 crate，接缝 trait 与核心类型全部归其所有；`arachne-kv` 依赖 `arachne-kv-seam` 并**重导出**之（**嵌入者公共 API 不变**）。`arachne-kv-transport-tonic` 仅依赖 `arachne-kv-seam`（**不依赖 `arachne-kv`**）——由此 D-ART-feature 的"默认 feature `arachne-kv → arachne-kv-transport-tonic`"与"传输 crate 实现 `Transport`"不再构成 **cargo 包循环**（D-ART-rev1）。常规依赖图无环（`arachne-kv` 的集成测试经 `dev-dependencies` 引 `arachne-kv-testsupport`——cargo 允许 dev-cycle，但**生产依赖图必须无环**）；CI 以 `cargo-tree` 门禁检查"测试依赖不进生产 crate 的 `[dependencies]`"。嵌入者视角：`arachne-kv` + 默认 feature 即得完整栈（D-ART-feature）。**精简构建（F2）**：`arachne-kv-testsupport` 仅依赖叶 crate `arachne-kv-seam`（结构上不可能拉入 tonic）；`arachne-kv-sim` 对 `arachne-kv` 用 `default-features = false`，其 tonic 仅在 L2 harness 落地时**显式**启用（D-ART-rev1）。**注意 feature 统一**：workspace 级 `cargo build --workspace` 会做 feature unification——sim 二进制会链接到含 tonic 的 `arachne-kv` rlib；"sim 不编译 tonic"严格成立于 `-p arachne-kv-sim` 构建，L2 启用 tonic 时据此决策。
 
-**否决项（记录在案）**：① test-only 专用 main——测试路径与生产路径分叉，L3/L4 将不再测出货代码；② 用 example 充当进程 harness——示例职责是 API 工效学与编译门禁，进程编排是 `arachne-testsupport::proc` 的职责（§3.3）。
+**否决项（记录在案）**：① test-only 专用 main——测试路径与生产路径分叉，L3/L4 将不再测出货代码；② 用 example 充当进程 harness——示例职责是 API 工效学与编译门禁，进程编排是 `arachne-kv-testsupport::proc` 的职责（§3.3）。
 
 ### 3.3 进程级 harness（L3/L4 被测进程与注入机制）
 
 - **被测进程** = `arachne-node`（生产 bin）。两种构建：**生产二进制**（无测试 feature；用于 S12 升级矩阵与 L3 冒烟）与 **fault-hook 二进制**（`--features test-observability`：仅追加结构化标记日志——fsync 批次完成、ready 循环计数、快照起止——**不改变行为逻辑**）。L4 的阶段精确 kill 用 fault-hook 二进制，升级矩阵用生产二进制。
 - **配置注入（D-ART-config 锁定）**：**配置文件格式 = TOML**（`arachne-node --config node.toml`，字段 = 上游 §7 Profile + 覆盖项 + §5.7 `initial_cluster`），CLI 单项覆盖（`--data-dir`/`--advertise`/`--node-id`）为辅；harness 为每节点生成独立 TOML 配置 + 临时 `data_dir` + OS 分配的真实端口写入配置。**测试不引入第二配置格式**——测试用的就是用户用的配置面。
 - **就绪等待**：`/readyz`（metrics 端点，上游 §8）返回 200 = raft 初始化完成（已当选或已追平）；辅以 stdout JSON ready 行（`{"event":"ready","node_id":…,"raft_addr":…}`）双保险；harness 等待超时上限 = 5×election_timeout。
-- **故障注入（L4）**：`kill -9` 由 `arachne-testsupport::proc` 注入器从**外部**发送（进程组管理，杜绝孤儿进程）；触发时机 correlate 到 fault-hook 标记（如"第 N 次 ready 循环"/"第 M 次 fsync 批"），使 INV2 的"任意 ready 阶段 kill"**精确可复现**而非随机碰运气；注入序列写入 RunManifest。
+- **故障注入（L4）**：`kill -9` 由 `arachne-kv-testsupport::proc` 注入器从**外部**发送（进程组管理，杜绝孤儿进程）；触发时机 correlate 到 fault-hook 标记（如"第 N 次 ready 循环"/"第 M 次 fsync 批"），使 INV2 的"任意 ready 阶段 kill"**精确可复现**而非随机碰运气；注入序列写入 RunManifest。
 - **`test-observability` 特性门禁（D-ART-testobs）**：该 feature 仅追加结构化 marker 日志、零行为改变，是"无测试代码入生产"规则的**唯一记录在案例外**；CI 强制 release/发布产物不含它（feature 解析检查 + 发布产物 hash 断言，入 §10 PR 门禁）。
 - **磁盘故障（L4）**：真盘 kill -9 + **离线变异**（停机 → WAL 位翻转/截断 → 重启，对应 S04/S05/S06）；运行中在线腐蚀是 L2 FaultyStorage 的职责（§11 缺口 1 如实声明 L4 不覆盖在线腐蚀）。
 - **日志/指标收集**：每节点 stdout/stderr → `artifacts/<run_id>/node-<id>.log`；结束时抓取 `/metrics` 快照；RunManifest 记录 marker 序列用于与 kill 时刻对账。
@@ -146,7 +147,7 @@ Target：① WAL 记录解码（逐字节截断/位翻转变异 → 断言 INV6 
 
 ### T6 存储一致性 Suite：移植 openraft `testing::log::Suite` 模式
 
-把 raft-rs `Storage` 契约（entries/term/first_index/last_index/snapshot/Compacted 语义）做成**可对任意实现运行的测试电池** `arachne-testsupport::store::Suite`：真实 WAL 实现、FaultyStorage 各故障档、以及未来若 D1 决议翻转引入 redb 时的第三实现——同一套 Suite 全绿才准接。raft-rs 仓库自带 `harness/`（内存 Network、Interface、failpoints_cases、datadriven）**作为模式复用，不作为依赖**（它是 repo-only，且测的是内核不是我们的集成）。
+把 raft-rs `Storage` 契约（entries/term/first_index/last_index/snapshot/Compacted 语义）做成**可对任意实现运行的测试电池** `arachne-kv-testsupport::store::Suite`：真实 WAL 实现、FaultyStorage 各故障档、以及未来若 D1 决议翻转引入 redb 时的第三实现——同一套 Suite 全绿才准接。raft-rs 仓库自带 `harness/`（内存 Network、Interface、failpoints_cases、datadriven）**作为模式复用，不作为依赖**（它是 repo-only，且测的是内核不是我们的集成）。
 
 ### T7 状态性属性测试：proptest 1.11 + proptest-state-machine
 
@@ -172,7 +173,7 @@ Target：① WAL 记录解码（逐字节截断/位翻转变异 → 断言 INV6 
 
 ## 6. 测试替身契约
 
-### 6.1 SimNetwork（turmoil 包装，`arachne-sim`）
+### 6.1 SimNetwork（turmoil 包装，`arachne-kv-sim`）
 
 | 原语 | 语义 | 主要服务的场景 |
 |---|---|---|
@@ -261,9 +262,9 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 
 ## 9. 测试数据结构与结果
 
-- **RunManifest（每次 L2/L3/L4 运行产出）**：`{scenario_id, seed, git_rev, profile, fault_schedule[], host_list, binary_hash, chaos_phase_ticks}`——种子 + 场景即可完全重导出调度。`binary_hash` = sha256(bin 产物) + `git_rev` + feature 标志（`fault-hooks` 有/无），复现时据此重建同一二进制；L3/L4 由 `arachne-testsupport::proc` 生成（§3.3）；S12 升级矩阵记录 v(n−1)/v(n) 两个 hash 并断言混版拓扑按上游 §5.6 握手规则运行。
+- **RunManifest（每次 L2/L3/L4 运行产出）**：`{scenario_id, seed, git_rev, profile, fault_schedule[], host_list, binary_hash, chaos_phase_ticks}`——种子 + 场景即可完全重导出调度。`binary_hash` = sha256(bin 产物) + `git_rev` + feature 标志（`fault-hooks` 有/无），复现时据此重建同一二进制；L3/L4 由 `arachne-kv-testsupport::proc` 生成（§3.3）；S12 升级矩阵记录 v(n−1)/v(n) 两个 hash 并断言混版拓扑按上游 §5.6 握手规则运行。
 - **历史**：oracle 产出 JSONL `{client_id, seq, op, key, val, invoke_ts, complete_ts, result, log_id?}`；重试合并规则在记录层保留原始多次调用（供调试），喂检查器时合并。
-- **复现**：`cargo run -p arachne-sim -- repro --manifest run.json`（同种子重放，双跑门禁同路径）。
+- **复现**：`cargo run -p arachne-kv-sim -- repro --manifest run.json`（同种子重放，双跑门禁同路径）。
 - **失败产物保留**：WAL/快照目录副本、fsync 台账、sim 事件日志、历史 JSONL、不变量违规报告（指明 INV 编号 + 最小反例历史摘录），保留 30 天，路径 `artifacts/<run_id>/`。
 - **不变量违规报告格式**：`[INV#] 场景 种子 节点 最小反例片段`——保证可一键转回归用例（固定该种子入场景注册表）。
 
@@ -279,7 +280,7 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 
 **Flake 政策**：L0–L2 任何 flake = 确定性缺陷（P0），禁止"重跑到绿"；L3/L4 涉及真实环境，允许一次重跑并强制记录原因。PR 门禁红即禁合并——"混沌清单全绿"是 M4 验收，不是 nightly 的可选项。
 
-**`test-observability` 与依赖隔离门禁（D-ART-testobs / D-ART）**：CI 强制 release/发布构建**排除** `test-observability` feature（feature 解析检查 + 发布产物 hash 断言）——该 feature 仅追加结构化 marker 日志、零行为改变，是"无测试代码入生产"规则的唯一记录在案例外（§3.3）；PR 门禁另跑 `cargo-tree` 检查，确保测试工件（`arachne-testsupport`/`arachne-sim` 及 turmoil/shuttle/stateright 等）不进入任何生产 crate 的 `[dependencies]`。
+**`test-observability` 与依赖隔离门禁（D-ART-testobs / D-ART）**：CI 强制 release/发布构建**排除** `test-observability` feature（feature 解析检查 + 发布产物 hash 断言）——该 feature 仅追加结构化 marker 日志、零行为改变，是"无测试代码入生产"规则的唯一记录在案例外（§3.3）；PR 门禁另跑 `cargo-tree` 检查，确保测试工件（`arachne-kv-testsupport`/`arachne-kv-sim` 及 turmoil/shuttle/stateright 等）不进入任何生产 crate 的 `[dependencies]`。
 
 ## 11. 覆盖矩阵与缺口
 
@@ -300,7 +301,7 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 | §5.5 存储/恢复 | INV2/INV6/INV12/INV13 + S04–S06/S09 + T6 Suite |
 | §5.6 版本握手 | S12 |
 | §5.7 引导 | S17 |
-| §6 force-recovery 与启动校验 | S13 + `arachne-node` bin 集成测试（§3.3：启动校验/flock/META 校验/优雅关闭/force-recovery 前置检查与双确认） |
+| §6 force-recovery 与启动校验 | S13 + `arachne-kv-node` bin 集成测试（§3.3：启动校验/flock/META 校验/优雅关闭/force-recovery 前置检查与双确认） |
 
 **诚实缺口清单（无法/不打算在此体系内证明）**：
 
@@ -317,8 +318,8 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 
 | 里程碑 | 本方案交付 | 支撑的验收项（上游 §10） |
 |---|---|---|
-| **M0** | 全部接缝 trait（Transport/Clock/Rng/存储）+ FaultyStorage + fsync 台账 + L1 harness（raft-rs harness 模式）+ T6 Suite + fuzz target ①（WAL 变异）+ **双跑复现门禁上线** + §13 spike 清单关闭 + **L4 专用 runner 脚手架（D-L4：runner 配置 + WAL 校验脚本 + kill -9 注入器）** + stateright dev-dependency 接入（D-T2）+ **工作区六工件骨架（D-ART，D-ART-rev1 增 `arachne-seam` 叶 crate）与 `arachne-node` 单节点可运行（/readyz、--config）+ examples 编译门禁** | 上游 M0 验收 ①–④ 全部依赖此处基建 |
-| **M1** | turmoil L2 骨架 + SimNetwork 全原语 + ClientOracle v1（G1/G2 判定）+ INV3/4/7/8/9 + S01/S02/S16 + **L3 冒烟（`arachne-node` ×3 真实进程）+ bin CLI 集成测试（§3.3）** | M1 验收 ④（线性化判定） |
+| **M0** | 全部接缝 trait（Transport/Clock/Rng/存储）+ FaultyStorage + fsync 台账 + L1 harness（raft-rs harness 模式）+ T6 Suite + fuzz target ①（WAL 变异）+ **双跑复现门禁上线** + §13 spike 清单关闭 + **L4 专用 runner 脚手架（D-L4：runner 配置 + WAL 校验脚本 + kill -9 注入器）** + stateright dev-dependency 接入（D-T2）+ **工作区六工件骨架（D-ART，D-ART-rev1 增 `arachne-kv-seam` 叶 crate）与 `arachne-kv-node` 单节点可运行（/readyz、--config）+ examples 编译门禁** | 上游 M0 验收 ①–④ 全部依赖此处基建 |
+| **M1** | turmoil L2 骨架 + SimNetwork 全原语 + ClientOracle v1（G1/G2 判定）+ INV3/4/7/8/9 + S01/S02/S16 + **L3 冒烟（`arachne-kv-node` ×3 真实进程）+ bin CLI 集成测试（§3.3）** | M1 验收 ④（线性化判定） |
 | **M2** | 快照/追赶场景 S03/S09/S18 + INV10–INV14 + stateright 有界模型检查 + 延迟冒烟基准 | M2 验收 ①–⑤ |
 | **M3** | 成员变更/会话场景 + INV5/INV15 + shuttle 全集 + proptest-state-machine | M3 验收 ①–⑥ |
 | **M4** | L3 多进程 + L4 kill -9 门禁全量（专用 runner，D-L4）+ 升级矩阵 + 混沌矩阵全绿 ×3 种子 + force-recovery 场景 S13 | M4 验收 ①–⑤ |

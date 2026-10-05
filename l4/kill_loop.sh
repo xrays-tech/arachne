@@ -72,7 +72,7 @@ find_node_bin() {
     return 0
   fi
   echo "L4: arachne-node not built; building it (first run)..."
-  ( cd "${REPO_ROOT}" && cargo build -p arachne-node )
+  ( cd "${REPO_ROOT}" && cargo build -p arachne-kv-node )
   printf '%s' "${target_dir}/debug/arachne-node"
 }
 

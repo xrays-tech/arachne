@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 
-use arachne_seam::seam::{ApplyOutcome, StateMachine};
-use arachne_seam::types::LogIndex;
+use arachne_kv_seam::seam::{ApplyOutcome, StateMachine};
+use arachne_kv_seam::types::LogIndex;
 
 /// Errors from the KV state machine.
 #[derive(Debug, thiserror::Error)]

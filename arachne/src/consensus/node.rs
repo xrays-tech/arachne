@@ -31,13 +31,13 @@ use raft::ReadOnlyOption;
 use raft::{Config as RaftConfig, RawNode};
 use slog::Logger;
 
-use arachne_seam::seam::{Transport, TransportMessage, TransportRx};
-use arachne_seam::storage::{
+use arachne_kv_seam::seam::{Transport, TransportMessage, TransportRx};
+use arachne_kv_seam::storage::{
     ConfState as SeamConfState, EntryType as SeamEntryType, FlushToken, FlushWaker,
     HardState as SeamHardState, LogEntry, PersistSubmit, RaftId, Snapshot as SeamSnapshot,
     SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage,
 };
-use arachne_seam::types::{LogIndex, NodeId, Term};
+use arachne_kv_seam::types::{LogIndex, NodeId, Term};
 
 use super::raft_storage::RaftStorage;
 use crate::profile::ProfileConfig;
@@ -1230,12 +1230,12 @@ fn group_by_peer(messages: &[Message]) -> Vec<(RaftId, Vec<Message>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arachne_seam::seam::{StateMachine, TransportFactory};
-    use arachne_seam::storage::{
+    use arachne_kv_seam::seam::{StateMachine, TransportFactory};
+    use arachne_kv_seam::storage::{
         HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
     };
-    use arachne_seam::types::{LogIndex, NodeId};
-    use arachne_testsupport::{
+    use arachne_kv_seam::types::{LogIndex, NodeId};
+    use arachne_kv_testsupport::{
         block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx,
     };
     use crate::state_machine::KvStateMachine;
@@ -1251,7 +1251,7 @@ mod tests {
     struct MemStore {
         entries: Vec<LogEntry>,
         hard_state: HardState,
-        fsync_observer: Option<std::sync::Arc<dyn arachne_seam::FsyncObserver>>,
+        fsync_observer: Option<std::sync::Arc<dyn arachne_kv_seam::FsyncObserver>>,
         /// Highest index durable so far (for observer callbacks).
         durable_through: LogIndex,
     }
@@ -1266,7 +1266,7 @@ mod tests {
             }
         }
 
-        fn with_observer(observer: std::sync::Arc<dyn arachne_seam::FsyncObserver>) -> Self {
+        fn with_observer(observer: std::sync::Arc<dyn arachne_kv_seam::FsyncObserver>) -> Self {
             let mut s = Self::new();
             s.fsync_observer = Some(observer);
             s
@@ -1479,8 +1479,8 @@ mod tests {
 
     #[test]
     fn i1_i2_persist_durable_before_step_returns() {
-        let ledger = std::sync::Arc::new(arachne_testsupport::FsyncLedger::new());
-        let observer: std::sync::Arc<dyn arachne_seam::FsyncObserver> = ledger.clone();
+        let ledger = std::sync::Arc::new(arachne_kv_testsupport::FsyncLedger::new());
+        let observer: std::sync::Arc<dyn arachne_kv_seam::FsyncObserver> = ledger.clone();
         let store = MemStore::with_observer(observer);
         let (mut node, mut sm) = (make_node(store), KvStateMachine::new());
 

@@ -22,10 +22,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::runtime::{Runtime, RuntimeConfig, RuntimeThread};
-use arachne::storage::{FsyncPolicy, Storage, WalConfig, WalOptions, WalStorage};
-use arachne::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
-use arachne_testsupport::InMemoryTransportFactory;
+use arachne_kv::runtime::{Runtime, RuntimeConfig, RuntimeThread};
+use arachne_kv::storage::{FsyncPolicy, Storage, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
+use arachne_kv_testsupport::InMemoryTransportFactory;
 use raft::eraftpb::ConfChangeType;
 use slog::{o, Drain, Logger};
 
@@ -72,14 +72,14 @@ fn wal_options_for(i: u64) -> WalOptions {
 }
 
 /// Start a single-voter cluster on `dir`, returning the running parts.
-fn start(dir: &PathBuf) -> (Arc<Metrics>, arachne::client::Handle, RuntimeThread) {
+fn start(dir: &PathBuf) -> (Arc<Metrics>, arachne_kv::client::Handle, RuntimeThread) {
     start_with_profile(dir, profile())
 }
 
 fn start_with_profile(
     dir: &PathBuf,
     profile: ProfileConfig,
-) -> (Arc<Metrics>, arachne::client::Handle, RuntimeThread) {
+) -> (Arc<Metrics>, arachne_kv::client::Handle, RuntimeThread) {
     let wal = WalStorage::open(dir, wal_options()).expect("open wal");
     let factory = InMemoryTransportFactory::new();
     let (tx, rx) = factory.create(NodeId::from("n1"));
@@ -89,7 +89,7 @@ fn start_with_profile(
         self_node_id: NodeId::from("n1"),
         peers: HashMap::new(),
         addresses: HashMap::new(),
-        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        raft: arachne_kv::consensus::RaftNodeConfig::from_profile(&profile),
         profile: profile.clone(),
         metrics: Arc::clone(&metrics),
     };
@@ -276,7 +276,7 @@ async fn a_conf_change_is_applied_between_the_commands_around_it() {
 const SLOW_FLUSH_MS: u64 = 120;
 
 /// Start a single-voter cluster whose disk is slow, returning the handle.
-fn start_slow(dir: &PathBuf) -> (Arc<Metrics>, arachne::client::Handle, RuntimeThread) {
+fn start_slow(dir: &PathBuf) -> (Arc<Metrics>, arachne_kv::client::Handle, RuntimeThread) {
     let profile = profile();
     let mut wal = WalStorage::open(dir, wal_options()).expect("open wal");
     wal.set_flush_delay_ms(SLOW_FLUSH_MS);
@@ -288,7 +288,7 @@ fn start_slow(dir: &PathBuf) -> (Arc<Metrics>, arachne::client::Handle, RuntimeT
         self_node_id: NodeId::from("n1"),
         peers: HashMap::new(),
         addresses: HashMap::new(),
-        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        raft: arachne_kv::consensus::RaftNodeConfig::from_profile(&profile),
         profile: profile.clone(),
         metrics: Arc::clone(&metrics),
     };
@@ -356,7 +356,7 @@ fn nid(i: u64) -> NodeId {
 
 struct ClusterNode {
     raft_id: u64,
-    handle: arachne::client::Handle,
+    handle: arachne_kv::client::Handle,
     metrics: Arc<Metrics>,
     dir: PathBuf,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -414,7 +414,7 @@ async fn spawn_cluster_node_at(
     let (tx, rx) = factory.create(nid(i));
     let metrics = Arc::new(Metrics::new());
     let peers = (1..=n).filter(|j| *j != i).map(|j| (j, nid(j))).collect();
-    let mut raft = arachne::consensus::RaftNodeConfig::from_profile(profile);
+    let mut raft = arachne_kv::consensus::RaftNodeConfig::from_profile(profile);
     raft.bootstrap_voters = Some(bootstrap_voters);
     raft.join_as_learner = join_as_learner;
     let config = RuntimeConfig {
@@ -475,7 +475,7 @@ async fn wait_until_all_agree_on(nodes: &[ClusterNode], leader: u64) {
     panic!("the cluster must converge on leader {leader}");
 }
 
-async fn until_put(handle: &arachne::client::Handle, key: &[u8], value: &[u8]) {
+async fn until_put(handle: &arachne_kv::client::Handle, key: &[u8], value: &[u8]) {
     for _ in 0..800 {
         match handle.put(key, value).await {
             Ok(()) => return,

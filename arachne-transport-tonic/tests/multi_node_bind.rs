@@ -21,8 +21,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use arachne::{NodeId, Transport, TransportFactory, TransportMessage, TransportRx};
-use arachne_transport_tonic::TonicTransportFactory;
+use arachne_kv::{NodeId, Transport, TransportFactory, TransportMessage, TransportRx};
+use arachne_kv_transport_tonic::TonicTransportFactory;
 
 /// Bounded window for the cross-process send to land on the receiver.
 const RECV_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);

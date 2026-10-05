@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne_node::config::parse_config;
-use arachne_node::metrics::Metrics;
-use arachne_node::node::Arachne;
+use arachne_kv_node::config::parse_config;
+use arachne_kv_node::metrics::Metrics;
+use arachne_kv_node::node::Arachne;
 use slog::Drain;
 
 static DIR: AtomicU64 = AtomicU64::new(0);

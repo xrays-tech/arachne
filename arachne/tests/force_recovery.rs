@@ -16,11 +16,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::consensus::RaftNodeConfig;
-use arachne::runtime::{Runtime, RuntimeConfig};
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{Metrics, NodeId, Profile, ProfileConfig};
-use arachne_testsupport::InMemoryTransportFactory;
+use arachne_kv::consensus::RaftNodeConfig;
+use arachne_kv::runtime::{Runtime, RuntimeConfig};
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{Metrics, NodeId, Profile, ProfileConfig};
+use arachne_kv_testsupport::InMemoryTransportFactory;
 use slog::Drain;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -59,7 +59,7 @@ async fn runtime_persists_the_committed_index_for_force_recovery() {
 
     let factory = InMemoryTransportFactory::new();
     let (tx, rx) = {
-        use arachne::TransportFactory;
+        use arachne_kv::TransportFactory;
         factory.create(NodeId::from("n1"))
     };
     let metrics = Arc::new(Metrics::new());

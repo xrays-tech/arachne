@@ -18,11 +18,11 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use arachne_transport_tonic::proto::raft_transport_client::RaftTransportClient;
-use arachne_transport_tonic::proto::{Hello, SnapshotRequest};
-use arachne_transport_tonic::snapshot::{SnapshotProvider, SnapshotReader};
-use arachne_transport_tonic::TonicTransportFactory;
-use arachne_seam::types::NodeId;
+use arachne_kv_transport_tonic::proto::raft_transport_client::RaftTransportClient;
+use arachne_kv_transport_tonic::proto::{Hello, SnapshotRequest};
+use arachne_kv_transport_tonic::snapshot::{SnapshotProvider, SnapshotReader};
+use arachne_kv_transport_tonic::TonicTransportFactory;
+use arachne_kv_seam::types::NodeId;
 
 /// The chunk size the server streams in (kept in step with `SNAPSHOT_CHUNK_BYTES`).
 const CHUNK: usize = 256 * 1024;
@@ -229,7 +229,7 @@ async fn the_transport_streams_a_snapshot_into_a_file() {
     // stream into a file, which is what `install_snapshot` will validate and
     // install. Exercised through the `Transport` trait, not the generated
     // client, because that is the interface the runtime will call.
-    use arachne_seam::seam::{Transport, TransportFactory};
+    use arachne_kv_seam::seam::{Transport, TransportFactory};
 
     let source: Arc<[u8]> = payload(2 * CHUNK + 77).into();
     let (addr, factory) = start_server(Arc::clone(&source), 0).await;

@@ -5,17 +5,17 @@ set -euo pipefail
 #
 # Gates:
 #   A. No production crate may pull the test/sim scaffolding
-#      (arachne-testsupport / arachne-sim) through its *normal* dependency tree.
-#   B. The lean core (`arachne --no-default-features`) must not pull in
-#      arachne-transport-tonic.
+#      (arachne-kv-testsupport / arachne-kv-sim) through its *normal* dependency tree.
+#   B. The lean core (`arachne-kv --no-default-features`) must not pull in
+#      arachne-kv-transport-tonic.
 #   C. The test/sim scaffolding must never pull in the tonic transport:
-#      arachne-testsupport's *normal* tree and arachne-sim's *default* tree
-#      must both be free of arachne-transport-tonic.
+#      arachne-kv-testsupport's *normal* tree and arachne-kv-sim's *default* tree
+#      must both be free of arachne-kv-transport-tonic.
 #
 # The production-crate list is DERIVED from the workspace members (minus the
 # test/sim scaffolding), so a newly added crate is picked up automatically.
 #
-# NOTE (Gate C / L2): arachne-sim's *deliberate* tonic enablement — exercising
+# NOTE (Gate C / L2): arachne-kv-sim's *deliberate* tonic enablement — exercising
 # the real transport in the L2 integration harness — lands with the L2 harness
 # in a later phase. It is intentionally NOT wired now; enabling it would re-add
 # the tonic edge to the sim's default tree and break Gate C.
@@ -29,9 +29,9 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 # Test/sim scaffolding crates (never "production").
-NON_PROD=(arachne-testsupport arachne-sim)
+NON_PROD=(arachne-kv-testsupport arachne-kv-sim)
 # Crates that must never appear in a production normal-dependency tree.
-FORBIDDEN=(arachne-testsupport arachne-sim)
+FORBIDDEN=(arachne-kv-testsupport arachne-kv-sim)
 
 overall_status=0
 
@@ -99,12 +99,12 @@ fi
 # --- Gate B ------------------------------------------------------------------
 echo ""
 echo "== check-deps: Gate B (lean core must not pull in the transport) =="
-if ! lean_tree="$(cargo tree -p arachne --no-default-features -e normal)"; then
-  echo "FAIL (Gate B): 'cargo tree -p arachne --no-default-features -e normal' failed"
+if ! lean_tree="$(cargo tree -p arachne-kv --no-default-features -e normal)"; then
+  echo "FAIL (Gate B): 'cargo tree -p arachne-kv --no-default-features -e normal' failed"
   overall_status=1
 else
-  if printf '%s\n' "${lean_tree}" | grep -q -E "[[:space:]]arachne-transport-tonic[[:space:]]"; then
-    echo "FAIL (Gate B): 'arachne --no-default-features' normal-dep tree contains 'arachne-transport-tonic'"
+  if printf '%s\n' "${lean_tree}" | grep -q -E "[[:space:]]arachne-kv-transport-tonic[[:space:]]"; then
+    echo "FAIL (Gate B): 'arachne-kv --no-default-features' normal-dep tree contains 'arachne-kv-transport-tonic'"
     printf '%s\n' "${lean_tree}"
     overall_status=1
   else
@@ -114,24 +114,24 @@ fi
 
 # --- Gate C ------------------------------------------------------------------
 # Test/sim scaffolding must never pull in the tonic transport (even
-# transitively). We check arachne-testsupport's normal tree (it must not depend
-# on `arachne` at all) and arachne-sim's effective (lean) tree (its `arachne`
+# transitively). We check arachne-kv-testsupport's normal tree (it must not depend
+# on `arachne-kv` at all) and arachne-kv-sim's effective (lean) tree (its `arachne-kv`
 # dep is default-features=false). NOTE: feature unification means a
-# workspace-wide build still links sim against the tonic-enabled arachne rlib;
-# the "sim compiles no tonic" property holds for `-p arachne-sim`. See the
+# workspace-wide build still links sim against the tonic-enabled arachne-kv rlib;
+# the "sim compiles no tonic" property holds for `-p arachne-kv-sim`. See the
 # NOTE (Gate C / L2) above.
 echo ""
 echo "== check-deps: Gate C (test/sim scaffolding must not pull in the tonic transport) =="
 gate_c_status=0
-for crate in arachne-testsupport arachne-sim; do
+for crate in arachne-kv-testsupport arachne-kv-sim; do
   if ! tree="$(cargo tree -p "${crate}" -e normal)"; then
     echo "FAIL (Gate C): 'cargo tree -p ${crate} -e normal' failed"
     gate_c_status=1
     overall_status=1
     continue
   fi
-  if printf '%s\n' "${tree}" | grep -q -E "[[:space:]]arachne-transport-tonic[[:space:]]"; then
-    echo "FAIL (Gate C): '${crate}' normal-dep tree contains 'arachne-transport-tonic'"
+  if printf '%s\n' "${tree}" | grep -q -E "[[:space:]]arachne-kv-transport-tonic[[:space:]]"; then
+    echo "FAIL (Gate C): '${crate}' normal-dep tree contains 'arachne-kv-transport-tonic'"
     printf '%s\n' "${tree}"
     gate_c_status=1
     overall_status=1

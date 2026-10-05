@@ -2,11 +2,11 @@
 
 A transport-agnostic, linearizable key-value engine for Rust programs, built on the [raft](https://crates.io/crates/raft) consensus algorithm. Arachne is first a **library**: you embed it in your own process, give it a storage backend and a transport, and get a raft-consistent `Handle` for reads and writes. The workspace also ships a small reference node binary (`arachne-node`) that wires storage + transport + HTTP together so you can run and drive a cluster without writing a line of glue.
 
-The consensus, WAL and KV state machine form the `arachne` core. By design the core is **transport-agnostic**:
+The consensus, WAL and KV state machine form the `arachne-kv` core. By design the core is **transport-agnostic**:
 
 - it is built against the *seam* traits (`Transport`, `Storage`, `StateMachine`, `Clock`, `Rng`, `FsyncObserver`, …) — the core itself contains no concrete clock, RNG, network code, or file I/O;
 - with `--no-default-features` it compiles as a **lean core with zero external crates**, no network dependency, offline-buildable;
-- a concrete transport (`arachne-transport-tonic`, tonic / HTTP-2 / rustls) is plugged in by whoever embeds it, the same way the tests plug in an in-memory transport.
+- a concrete transport (`arachne-kv-transport-tonic`, tonic / HTTP-2 / rustls) is plugged in by whoever embeds it, the same way the tests plug in an in-memory transport.
 
 ## Embedding
 
@@ -14,16 +14,16 @@ Add the core with the transport you want:
 
 ```toml
 [dependencies]
-arachne = { path = "…/arachne" }            # default: pulls tonic transport
+arachne-kv = { path = "…/arachne" }            # default: pulls tonic transport
 # or a transport-free build:
-# arachne = { path = "…/arachne", default-features = false }
+# arachne-kv = { path = "…/arachne", default-features = false }
 ```
 
-For a single in-process node, `arachne::server` gives you a minimal facade —
+For a single in-process node, `arachne_kv::server` gives you a minimal facade —
 no tokio runtime to poll, no `Runtime`/`Handle` plumbing:
 
 ```rust,ignore
-use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
+use arachne_kv::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 // One node per process; the marker is decorative, the node lives for the
 // process and is shut down explicitly. single_node is an N=1 cluster.
@@ -75,7 +75,7 @@ A dedicated flusher thread batches the durability work: concurrent proposals tha
 The workspace includes a runnable node binary that composes the library with the tonic transport and a Hyper HTTP/1.1 server — useful for running a real cluster and as a working example of embedding Arachne.
 
 ```console
-$ cargo build --release -p arachne-node
+$ cargo build --release -p arachne-kv-node
 $ arachne-node --config path/to/node.toml
 ```
 
@@ -140,11 +140,11 @@ Gates are wired as `scripts/check-*.sh`; `scripts/check-perf-baseline.sh` enforc
 
 ## Workspace layout
 
-- `arachne` — the embeddable core: `src/consensus`, `src/storage` (WAL, segments, sync), `src/runtime` (the actor + client `Handle`), `src/client`, `src/state_machine`, `src/profile`, and the `seam` traits.
-- `arachne-seam` — leaf crate with the seam traits and shared value types; no dependencies of its own.
-- `arachne-transport-tonic` — the tonic / rustls transport, enabled by the `transport-tonic` feature.
-- `arachne-node` — the reference node binary (HTTP server, config, membership surface).
-- `arachne-testsupport`, `arachne-sim` — test and simulation support.
+- `arachne-kv` — the embeddable core: `src/consensus`, `src/storage` (WAL, segments, sync), `src/runtime` (the actor + client `Handle`), `src/client`, `src/state_machine`, `src/profile`, and the `seam` traits.
+- `arachne-kv-seam` — leaf crate with the seam traits and shared value types; no dependencies of its own.
+- `arachne-kv-transport-tonic` — the tonic / rustls transport, enabled by the `transport-tonic` feature.
+- `arachne-kv-node` — the reference node binary (HTTP server, config, membership surface).
+- `arachne-kv-testsupport`, `arachne-kv-sim` — test and simulation support.
 - `l2/`, `l4/`, `fuzz/`, `model-check/` — standalone deterministic test harnesses, not part of the cargo workspace.
 - `dev-docs/` — the design record (`propsol-v0.2.md` is the running design authority, with each revision annotated).
 

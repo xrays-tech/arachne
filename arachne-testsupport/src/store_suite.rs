@@ -1,7 +1,7 @@
 //! The T6 storage conformance suite: a reusable battery any `Storage` impl
 //! must pass (test-plan §4 T6).
 //!
-//! This suite is **generic** over any `S: arachne_seam::Storage` and tests
+//! This suite is **generic** over any `S: arachne_kv_seam::Storage` and tests
 //! only the logical contract of the seam — not WAL-specific behavior. Any
 //! future engine (e.g., redb if D1 is revisited) must pass this suite.
 //!
@@ -33,10 +33,10 @@
 //! The suite includes a negative test: a deliberately-broken `Storage` impl
 //! that the suite **must** reject (see `tests::broken_impl_is_rejected`).
 
-use arachne_seam::storage::{
+use arachne_kv_seam::storage::{
     EntryType, HardState, LogEntry, Storage, StorageError,
 };
-use arachne_seam::types::{LogIndex, Term};
+use arachne_kv_seam::types::{LogIndex, Term};
 
 // ---------------------------------------------------------------------------
 // Report types
@@ -563,7 +563,7 @@ fn make_entry(index: LogIndex, term: Term, data: &[u8]) -> LogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arachne_seam::storage::{ConfState, RaftState, Snapshot};
+    use arachne_kv_seam::storage::{ConfState, RaftState, Snapshot};
 
     /// A minimal in-memory `Storage` double that correctly implements the
     /// contract. Used to prove the suite passes on a correct impl.

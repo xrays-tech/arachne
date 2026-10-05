@@ -54,7 +54,7 @@ use crate::types::Timestamp;
 use crate::{
     Clock, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx,
 };
-use arachne_seam::storage::{
+use arachne_kv_seam::storage::{
     EntryType as SeamEntryType, Snapshot as SeamSnapshot, Storage as _,
 };
 use raft::eraftpb::ConfChangeType;

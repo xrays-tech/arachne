@@ -10,7 +10,7 @@
 //!
 //! # Modules
 //!
-//! * [`io`] — `TurmoilIo`, the deterministic [`TransportIo`](arachne_transport_tonic::TransportIo)
+//! * [`io`] — `TurmoilIo`, the deterministic [`TransportIo`](arachne_kv_transport_tonic::TransportIo)
 //!   implementation (virtualized `Listener`/`Incoming`/`ClientIo`/`Connector`).
 //! * [`net`] — `SimNetwork`, a thin, well-named wrapper over `turmoil::Sim`
 //!   exposing the fault-injection primitives, layered on top of the transport

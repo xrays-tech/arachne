@@ -1,5 +1,5 @@
 //! A minimal embedding example: one in-process Arachne node driven through the
-//! `arachne::server` facade. No peers, no network, no external runtime
+//! `arachne_kv::server` facade. No peers, no network, no external runtime
 //! ownership — the facade owns its own dedicated-thread runtime. The example
 //! only `block`s the facade's public async API on its own (trivial) tokio
 //! runtime.
@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
+use arachne_kv::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 fn main() {
     let dir = std::env::temp_dir().join(format!(

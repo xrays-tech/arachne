@@ -5,7 +5,7 @@
 //! Individual fields are `pub`, so a deployment can override any single one:
 //!
 //! ```
-//! use arachne::{Profile, ProfileConfig};
+//! use arachne_kv::{Profile, ProfileConfig};
 //! let base = Profile::Lan.config();
 //! let tuned = ProfileConfig { heartbeat_interval_ms: 50, ..base };
 //! assert_eq!(tuned.heartbeat_interval_ms, 50);

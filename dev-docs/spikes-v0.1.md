@@ -33,7 +33,7 @@
 
 ## S6 — stateright `semantics/linearizability.rs` 可否独立复用 —— **部分核验（接入完成，复用方式待定）**
 
-- **已完成**：`model-check/`（独立非工作区项目）已接入 `stateright = "0.31"`，并用真实 `arachne` 跑通一个有界 3 节点复制日志模型（`cargo run`：3259 unique states，always 属性无反例，找到 liveness 例）。
+- **已完成**：`model-check/`（独立非工作区项目）已接入 `stateright = "0.31"`，并用真实 `arachne-kv` 跑通一个有界 3 节点复制日志模型（`cargo run`：3259 unique states，always 属性无反例，找到 liveness 例）。
 - **待定**：`semantics/linearizability.rs` 能否**独立**（脱离其 `Tester`）作历史检查器复用尚未评估。
 - **默认决策**：不可 → 将其算法移植进自建 Wing–Gong 检查器（主案不变），**交叉验证门禁不取消**。M1/M2 落地自建检查器时核验。
 

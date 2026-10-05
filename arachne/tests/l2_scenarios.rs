@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{NodeId, RaftId, StateMachine, TransportFactory};
-use arachne_testsupport::{
+use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{NodeId, RaftId, StateMachine, TransportFactory};
+use arachne_kv_testsupport::{
     block_on, check_linearizable, CallId, CheckOutcome, ClientId, History, InMemoryRx,
     InMemoryTransportFactory, InMemoryTx, Invariant, KvState, Op, OpResult, OracleErrorKind,
     SeqNo, ValueId,
@@ -111,9 +111,9 @@ struct Cluster {
     /// Per-node committed log `(index, data)` in apply order.
     committed: Vec<Vec<(RaftId, Vec<u8>)>>,
     /// Read states emitted across the run: `(node, request_ctx, read_index)`.
-    read_states: Vec<(RaftId, Vec<u8>, arachne::LogIndex)>,
+    read_states: Vec<(RaftId, Vec<u8>, arachne_kv::LogIndex)>,
     /// Snapshot installs, per node: the index of each installed snapshot.
-    installed: Vec<Vec<arachne::LogIndex>>,
+    installed: Vec<Vec<arachne_kv::LogIndex>>,
     faults: Faults,
     /// `(term, leader)` observations across the whole run, for INV7.
     leader_obs: Vec<(u64, RaftId)>,
@@ -181,7 +181,7 @@ impl Cluster {
         }
 
         // Drain every node's outbound queue, then deliver per policy.
-        let mut outbound: Vec<(RaftId, RaftId, arachne::TransportMessage)> = Vec::new();
+        let mut outbound: Vec<(RaftId, RaftId, arachne_kv::TransportMessage)> = Vec::new();
         for i in 0..self.nodes.len() {
             if let Some(node) = self.nodes[i].as_mut() {
                 loop {
@@ -216,7 +216,7 @@ impl Cluster {
 
     /// Tick+step only node `i` with NO message delivery, returning the read
     /// states it emits locally. Isolates "does this node serve ReadIndex itself?".
-    fn step_local(&mut self, i: usize) -> Vec<(Vec<u8>, arachne::LogIndex)> {
+    fn step_local(&mut self, i: usize) -> Vec<(Vec<u8>, arachne_kv::LogIndex)> {
         let node = self.nodes[i].as_mut().expect("node present");
         node.tick();
         let out = block_on(node.step()).expect("step");
@@ -300,7 +300,7 @@ impl Cluster {
     ///
     /// Returns the snapshot index. The snapshot is taken at the **applied**
     /// index, which is what makes compaction safe (propsol §5.5.4).
-    fn snapshot_and_compact(&mut self, i: RaftId) -> arachne::LogIndex {
+    fn snapshot_and_compact(&mut self, i: RaftId) -> arachne_kv::LogIndex {
         let idx = (i - 1) as usize;
         let applied = self.sms[idx].applied_index();
         assert!(applied > 0, "node {i} has nothing to snapshot");
@@ -310,7 +310,7 @@ impl Cluster {
         node.create_snapshot(
             applied,
             term,
-            arachne::ConfState {
+            arachne_kv::ConfState {
                 voters: vec![1, 2, 3],
                 learners: Vec::new(),
             },
@@ -329,12 +329,12 @@ impl Cluster {
 }
 
 /// Snapshot indexes present in a node's data directory.
-fn snapshot_files(dir: &std::path::Path) -> Vec<arachne::LogIndex> {
-    let mut found: Vec<arachne::LogIndex> = std::fs::read_dir(dir)
+fn snapshot_files(dir: &std::path::Path) -> Vec<arachne_kv::LogIndex> {
+    let mut found: Vec<arachne_kv::LogIndex> = std::fs::read_dir(dir)
         .expect("read data dir")
         .flatten()
         .filter_map(|e| {
-            arachne::storage::snapshot::parse_snapshot_file_name(&e.file_name().to_string_lossy())
+            arachne_kv::storage::snapshot::parse_snapshot_file_name(&e.file_name().to_string_lossy())
         })
         .map(|(index, _term)| index)
         .collect();
@@ -650,7 +650,7 @@ fn run_snapshot_catchup(seed: u64, mode: Lagging) -> Outcome {
     );
     // Non-vacuity: the snapshot really carried the gap. The follower's applied
     // *entry* log skips the indices the snapshot covered.
-    let victim_entries: BTreeSet<arachne::LogIndex> = c.committed[victim_idx]
+    let victim_entries: BTreeSet<arachne_kv::LogIndex> = c.committed[victim_idx]
         .iter()
         .map(|(index, _)| *index)
         .collect();
@@ -717,8 +717,8 @@ fn double_run_snapshot_scenario_is_deterministic() {
 
 /// INV8: any two nodes agree on the `(index, data)` of every log index they
 /// both applied.
-fn assert_log_matching(committed: &[Vec<(arachne::LogIndex, Vec<u8>)>]) {
-    let maps: Vec<BTreeMap<arachne::LogIndex, Vec<u8>>> = committed
+fn assert_log_matching(committed: &[Vec<(arachne_kv::LogIndex, Vec<u8>)>]) {
+    let maps: Vec<BTreeMap<arachne_kv::LogIndex, Vec<u8>>> = committed
         .iter()
         .map(|log| log.iter().cloned().collect())
         .collect();

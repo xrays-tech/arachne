@@ -10,8 +10,8 @@
 //! fast peer cannot push unbounded memory into a slow node: when the queue is
 //! full the server answers `resource_exhausted` and raft retransmits.
 
-use arachne_seam::seam::{TransportMessage, TransportRx};
-use arachne_seam::types::NodeId;
+use arachne_kv_seam::seam::{TransportMessage, TransportRx};
+use arachne_kv_seam::types::NodeId;
 use tokio::sync::mpsc::Receiver;
 
 /// The inbound half for one node.

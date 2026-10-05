@@ -9,5 +9,5 @@
 //! text, because Gate C is a plain text scan of `*sim*` paths.
 
 fn main() {
-    println!("arachne-sim {}", arachne::version());
+    println!("arachne-sim {}", arachne_kv::version());
 }

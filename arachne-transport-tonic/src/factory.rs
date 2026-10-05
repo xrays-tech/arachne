@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arachne_seam::seam::{TransportFactory, TransportMessage};
-use arachne_seam::types::NodeId;
+use arachne_kv_seam::seam::{TransportFactory, TransportMessage};
+use arachne_kv_seam::types::NodeId;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;

@@ -6,7 +6,7 @@
 //! variant here. Genuine transport failures (connection refused, RST, …) surface
 //! as [`TransportError::Send`] wrapping a `tonic::Status`.
 
-use arachne_seam::types::NodeId;
+use arachne_kv_seam::types::NodeId;
 use thiserror::Error;
 use tonic::Status;
 

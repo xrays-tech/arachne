@@ -40,7 +40,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use arachne_seam::types::{LogIndex, Term};
+use arachne_kv_seam::types::{LogIndex, Term};
 
 use crate::storage::crc32c::crc32c;
 

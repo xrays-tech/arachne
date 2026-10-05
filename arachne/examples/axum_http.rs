@@ -1,4 +1,4 @@
-//! An axum HTTP wrapper around the [`arachne::server`] facade.
+//! An axum HTTP wrapper around the [`arachne_kv::server`] facade.
 //!
 //! The companion to [`facade`](crate::examples::facade): instead of a caller
 //! hand-rolling a tokio runtime and calling `.block_on(...)` to drive the four
@@ -51,7 +51,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
+use arachne_kv::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 
 use axum::body::Body;
 use axum::extract::{Path, Request};

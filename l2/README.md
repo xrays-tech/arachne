@@ -11,7 +11,7 @@ L2 的目标（`test-plan` §1/§2）：在 **真实 tokio（以及 M1 起的真
 - `turmoil` 及其整棵依赖树是 **dev-only 工具**。把它们放在生产 workspace 之外，保证模拟器 **绝不** 泄漏进任何生产 crate 的正常依赖树（`scripts/check-deps.sh` 只扫描 workspace 成员，天然看不到 `l2/`）。
 - 产品核心经 path 依赖引入，且一律 **`default-features = false`**（精简核心，不拉 tonic）——与生产 sim 构建规则一致（D-ART-rev1 / `test-plan` §3.2）。
 
-> 依赖：`turmoil = "0.7"`、`tokio = "1"`、`arachne`（path，`default-features = false`）、`arachne-seam`（path）。
+> 依赖：`turmoil = "0.7"`、`tokio = "1"`、`arachne-kv`（path，`default-features = false`）、`arachne-kv-seam`（path）。
 
 ## 现在能做什么（M0 骨架）
 
@@ -28,7 +28,7 @@ cd l2
 cargo build
 cargo run
 # => arachne-l2 skeleton OK: seed 0x005eed42 -> 3 echoes, elapsed 188ms (deterministic across two same-seed runs)
-#    linked product core: arachne 0.1.0
+#    linked product core: arachne-kv 0.1.0
 ```
 
 不同种子产生不同模拟耗时（0x5EED_43→384ms、0xDEAD_BEEF→127ms…），证明耗时信号确由种子化调度驱动，而非常量。
@@ -39,7 +39,7 @@ cargo run
 
 | 里程碑 | 交付 | 说明 |
 |---|---|---|
-| **M1** ✅ | 真实 tonic 接线 + SimNetwork 全原语 + ClientOracle v1 | 让 `turmoil` 承载 **真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配），把真实 `arachne` 节点（多实例）跑在模拟网络上；`SimNetwork` 补齐 `partition_oneway`/`hold`/`release`/`set_fail_rate`/链路延迟抖动（`test-plan` §6.1）；ClientOracle 做 G1/G2 判定（§6.4）。**此时才把 `arachne` 的 `transport-tonic` 显式启用**（D-ART-rev1：sim 的 tonic 仅在 L2 落地时显式开） |
+| **M1** ✅ | 真实 tonic 接线 + SimNetwork 全原语 + ClientOracle v1 | 让 `turmoil` 承载 **真实 tonic**（`turmoil::net::TcpListener` + `serve_with_incoming` + 自定义 connector/`Connected` 适配），把真实 `arachne-kv` 节点（多实例）跑在模拟网络上；`SimNetwork` 补齐 `partition_oneway`/`hold`/`release`/`set_fail_rate`/链路延迟抖动（`test-plan` §6.1）；ClientOracle 做 G1/G2 判定（§6.4）。**此时才把 `arachne-kv` 的 `transport-tonic` 显式启用**（D-ART-rev1：sim 的 tonic 仅在 L2 落地时显式开） |
 | **M2** 🚧 | FaultyStorage + INV1–INV6 | `FaultyStorage` 包装自有 `WalStorage`/`StateMachine` 缝，注入 fsync 失败/撕裂写/截断/位翻转/慢盘，并维护 **fsync 台账** 事后对账断言 I1–I4（§6.2）；INV1–INV6 逐条可执行断言（§7）。**进行中**：`DurabilityLedger`（条目 fsync + HardState 持久化）与 `FaultyStorage` 扩展已落地，INV1 的 **I1+I2/I4 两半**已在 `arachne/tests/m2_durability.rs` 的 3 节点 L2 场景中闭合（含崩溃重启与注入 fsync 失败）；字节级故障（活 WAL 的截断/位翻转、`META` 变异、撕裂尾恢复）已在 `arachne/tests/m2_wal_faults.rs` 落地（`wal_mutation.rs` 已有合成 WAL 的 INV6 变异电池）。**剩余**：`slow_fsync`（属 L4/文件层时序）、快照路径（I3） |
 | **M2+** | 双跑复现门禁 + 线性化检查 | 每个场景同种子连跑两次，比对 ①故障调度序列 ②各节点 apply 序列哈希 ③预言机判定（§5）；自建 Wing–Gong 检查器 + stateright 交叉验证（T2，D-T2） |
 | **M3/M4** | 全场景矩阵 + 两阶段模糊器 | S01–S20 场景矩阵（§8）、safe/liveness 两阶段模型、`--reproduce` 重放（§9） |

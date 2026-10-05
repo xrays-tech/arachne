@@ -91,7 +91,7 @@ raft 节点（`consensus/node.rs`）**已内置** offloaded 处理：`persist_re
 故 node 侧仅需"开启"，轮询/失败停机制无需新增代码。
 
 **为何默认开**：库 `WalStorage` 默认仍为同步路径（不动，`enable_offloaded_durability`
-显式开启），保证库级测试与逐字节兼容；**生产二进制**（`arachne-node`）则默认走流水线
+显式开启），保证库级测试与逐字节兼容；**生产二进制**（`arachne-kv-node`）则默认走流水线
 以拿到组提交收益。二者一致：库安全默认 + 生产优化默认。
 
 ## 5. 行为契约（可测试断言）
@@ -130,8 +130,8 @@ TDD 基线（改前）：测试 1/2 各差多倍（5 vs 1、6 vs 2）、测试 3
 ### 6.2 回归（§2 回归门）
 
 - `cargo build --workspace` ✅
-- `cargo test -p arachne`（含全集成/不变式）✅；`--features fault-injection` ✅
-- `cargo test -p arachne-node`（生产节点现在默认走 offloaded 流水线）✅
+- `cargo test -p arachne-kv`（含全集成/不变式）✅；`--features fault-injection` ✅
+- `cargo test -p arachne-kv-node`（生产节点现在默认走 offloaded 流水线）✅
 - 门禁：`check-entropy.sh`、`check-deps.sh`、`check-profile-knobs.sh`、`check-release-features.sh`（见 §7）
 
 **注**：本批未新增 profile 旋钮（`wal_offloaded` 字段），故 `check-profile-knobs.sh`

@@ -5,8 +5,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne_testsupport::{FaultSchedule, FaultyStorage, run_storage_suite};
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv_testsupport::{FaultSchedule, FaultyStorage, run_storage_suite};
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 

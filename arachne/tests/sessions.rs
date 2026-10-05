@@ -22,11 +22,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::runtime::{Runtime, RuntimeConfig, RuntimeThread};
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
-use arachne_testsupport::{InMemoryTransportFactory, ManualClock};
+use arachne_kv::runtime::{Runtime, RuntimeConfig, RuntimeThread};
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
+use arachne_kv_testsupport::{InMemoryTransportFactory, ManualClock};
 use slog::{o, Drain, Logger};
 
 const TTL_MS: u64 = 100;
@@ -94,14 +94,14 @@ async fn session_bands_dedup_then_expire_then_forget() {
         self_node_id: NodeId::from("n1"),
         peers: HashMap::new(),
         addresses: HashMap::new(),
-        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        raft: arachne_kv::consensus::RaftNodeConfig::from_profile(&profile),
         profile: profile.clone(),
         metrics: Arc::clone(&metrics),
     };
     // A manual clock, so `ttl`/`grace` are driven deterministically.
     let clock = Arc::new(ManualClock::new(1_000_000));
     let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger()).expect("runtime");
-    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne::Clock>);
+    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne_kv::Clock>);
     let thread: RuntimeThread = runtime.spawn_dedicated().expect("spawn");
     until_leader(&metrics).await;
 
@@ -223,13 +223,13 @@ async fn session_gc_prunes_and_relieves_the_session_cap() {
         self_node_id: NodeId::from("n1"),
         peers: HashMap::new(),
         addresses: HashMap::new(),
-        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        raft: arachne_kv::consensus::RaftNodeConfig::from_profile(&profile),
         profile,
         metrics: Arc::clone(&metrics),
     };
     let clock = Arc::new(ManualClock::new(2_000_000));
     let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger()).expect("runtime");
-    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne::Clock>);
+    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne_kv::Clock>);
     let thread: RuntimeThread = runtime.spawn_dedicated().expect("spawn");
     until_leader(&metrics).await;
 
@@ -308,7 +308,7 @@ async fn single_node(
     tag: &str,
     max_sessions: u64,
 ) -> (
-    arachne::client::Handle,
+    arachne_kv::client::Handle,
     Arc<Metrics>,
     Arc<ManualClock>,
     RuntimeThread,
@@ -344,13 +344,13 @@ async fn single_node(
         self_node_id: NodeId::from("n1"),
         peers: HashMap::new(),
         addresses: HashMap::new(),
-        raft: arachne::consensus::RaftNodeConfig::from_profile(&profile),
+        raft: arachne_kv::consensus::RaftNodeConfig::from_profile(&profile),
         profile,
         metrics: Arc::clone(&metrics),
     };
     let clock = Arc::new(ManualClock::new(5_000_000));
     let (runtime, handle) = Runtime::new(config, wal, tx, rx, &logger()).expect("runtime");
-    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne::Clock>);
+    let runtime = runtime.with_session_clock(Arc::clone(&clock) as Arc<dyn arachne_kv::Clock>);
     let thread = runtime.spawn_dedicated().expect("spawn");
     until_leader(&metrics).await;
     (handle, metrics, clock, thread, dir)

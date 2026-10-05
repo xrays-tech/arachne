@@ -29,9 +29,9 @@
 //!   largest `index` (falling back to an earlier one if the newest is
 //!   corrupt) and replay the WAL tail from `index + 1` (propsol §5.5.3).
 
-use arachne_seam::RaftId;
-use arachne_seam::storage::{ConfState, Snapshot, SnapshotMeta};
-use arachne_seam::types::{LogIndex, Term};
+use arachne_kv_seam::RaftId;
+use arachne_kv_seam::storage::{ConfState, Snapshot, SnapshotMeta};
+use arachne_kv_seam::types::{LogIndex, Term};
 
 use crate::storage::crc32c::crc32c;
 use crate::storage::meta::FORMAT_VERSION;

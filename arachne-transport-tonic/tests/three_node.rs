@@ -20,14 +20,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne::consensus::{NodeError, RaftNode};
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{
+use arachne_kv::consensus::{NodeError, RaftNode};
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{
     LogIndex, NodeId, RaftId, StateMachine, Transport, TransportFactory, TransportMessage,
     TransportRx,
 };
-use arachne_transport_tonic::{TonicRx, TonicTransport, TonicTransportFactory, TransportError};
+use arachne_kv_transport_tonic::{TonicRx, TonicTransport, TonicTransportFactory, TransportError};
 use slog::{o, Drain, Logger};
 
 type TestNode = RaftNode<WalStorage, TonicTransport, TonicRx>;

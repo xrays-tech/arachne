@@ -19,7 +19,7 @@ stateright = "0.31"
 # The Arachne core (lean: no transport). The model itself is an abstraction of
 # the design, but it is checked against the real crate so the harness is
 # guaranteed to build against the shipped API.
-arachne = { path = "../arachne", default-features = false }
+arachne-kv = { path = "../arachne", default-features = false }
 
 # Standalone package root: this crate is deliberately not part of the root
 # workspace (see the note above).

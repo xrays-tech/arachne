@@ -39,13 +39,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::consensus::RaftNodeConfig;
-use arachne::runtime::{Runtime, RuntimeConfig};
-use arachne::storage::{WalConfig, WalOptions, WalStorage};
-use arachne::{
+use arachne_kv::consensus::RaftNodeConfig;
+use arachne_kv::runtime::{Runtime, RuntimeConfig};
+use arachne_kv::storage::{WalConfig, WalOptions, WalStorage};
+use arachne_kv::{
     LogEntry, Metrics, NodeId, Profile, ProfileConfig, Storage, StorageError, TransportFactory,
 };
-use arachne_testsupport::InMemoryTransportFactory;
+use arachne_kv_testsupport::InMemoryTransportFactory;
 use slog::Drain;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -53,7 +53,7 @@
       <h1>一分钟跑起来</h1>
       <p class="lede">
         把 Arachne 作为库嵌进你的 Rust 程序：加一行依赖，用
-        <code>arachne::server</code> 的 facade 就能得到可线性化的写入与读取。
+        <code>arachne_kv::server</code> 的 facade 就能得到可线性化的写入与读取。
         本节与你自己的 <code>Cargo.toml</code> 同步推进。
       </p>
 
@@ -66,13 +66,13 @@
       <div class="code-block">
         <div class="code-head"><span class="code-lang">Cargo.toml</span></div>
 <pre><code data-lang="toml">[dependencies]
-arachne = { path = "…/arachne" }            # default: pulls tonic transport
+arachne-kv = { path = "…/arachne" }            # default: pulls tonic transport
 # or a transport-free build:
-# arachne = { path = "…/arachne", default-features = false }
+# arachne-kv = { path = "…/arachne", default-features = false }
 </code></pre>
       </div>
       <p>
-        一个进程内单节点时，<code>arachne::server</code> 提供最小 facade —— 不需要 tokio
+        一个进程内单节点时，<code>arachne_kv::server</code> 提供最小 facade —— 不需要 tokio
         runtime 轮询，不需要任何 <code>Runtime</code> / <code>Handle</code> 装配。facade
         自己持有独立线程的 runtime。
       </p>
@@ -86,7 +86,7 @@ arachne = { path = "…/arachne" }            # default: pulls tonic transport
       </p>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">rust</span></div>
-<pre><code data-lang="rust">use arachne::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
+<pre><code data-lang="rust">use arachne_kv::server::{Arachne, ArachneError, ClusterConfig, WalConfig};
 use axum::{routing::{delete, get, put}, Router, extract::Path, http::StatusCode};
 
 #[tokio::main]
@@ -210,7 +210,7 @@ $ cargo run --example facade      # CLI 形态：直接 block_on facade 方法
       </p>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">console</span></div>
-<pre><code data-lang="console">$ cargo build --release -p arachne-node
+<pre><code data-lang="console">$ cargo build --release -p arachne-kv-node
 $ arachne-node --config path/to/node.toml
 </code></pre>
       </div>

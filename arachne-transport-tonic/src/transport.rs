@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
-use arachne_seam::seam::{Transport, TransportMessage};
-use arachne_seam::types::NodeId;
+use arachne_kv_seam::seam::{Transport, TransportMessage};
+use arachne_kv_seam::types::NodeId;
 use tokio::io::AsyncWriteExt;
 use tonic::transport::{Channel, Endpoint};
 

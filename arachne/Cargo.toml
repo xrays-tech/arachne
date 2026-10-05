@@ -1,16 +1,17 @@
 [package]
-name = "arachne"
+name = "arachne-kv"
 description = "Arachne: transport-agnostic product core (consensus, WAL storage, KV state machine)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [features]
 # The default build pulls the tonic transport through an optional dependency.
 # Build with `--no-default-features` for a "lean" core with no transport at all.
 default = ["transport-tonic"]
-transport-tonic = ["dep:arachne-transport-tonic"]
+transport-tonic = ["dep:arachne-kv-transport-tonic"]
 # Test-only crash injection at `RaftNode::step`'s ready-stage boundaries
 # (propsol v0.2.9 L / INV2). NOT a default feature and excluded from
 # release/publish builds (enforced by `scripts/check-release-features.sh`); when
@@ -18,11 +19,11 @@ transport-tonic = ["dep:arachne-transport-tonic"]
 fault-injection = []
 
 [dependencies]
-# The seam traits and shared value types live in the leaf `arachne-seam` crate.
-# This is a normal (always-on) dependency: the core re-exports those items so
-# its public API is unchanged. `arachne-seam` is a leaf (no deps), so it adds
-# nothing to the dependency tree beyond itself.
-arachne-seam = { workspace = true }
+# The seam traits and shared value types live in the leaf `arachne-kv-seam`
+# crate. This is a normal (always-on) dependency: the core re-exports those
+# items so its public API is unchanged. `arachne-kv-seam` is a leaf (no deps),
+# so it adds nothing to the dependency tree beyond itself.
+arachne-kv-seam = { workspace = true }
 
 # The raft consensus library. `raft` 0.7 is the pinned version for the
 # consensus core (P4a). It pulls in `protobuf` for message serialization.
@@ -36,7 +37,7 @@ protobuf = "2"
 # NOT a network dependency, so the lean core (`--no-default-features`) still
 # builds without the tonic transport (check-deps Gate B is unaffected). Both
 # `tokio` and `tokio-util` are already in the dependency tree (via
-# `arachne-transport-tonic`/`arachne-node`), so this adds no new external crate.
+# `arachne-kv-transport-tonic`/`arachne-kv-node`), so this adds no new external crate.
 # `rt-multi-thread` is also enabled because the multi-node embedding facade
 # (`Arachne::start`) drives the tonic gRPC server on a private *multithread*
 # tokio runtime (`Builder::new_multi_thread`); the actor thread itself still
@@ -52,7 +53,7 @@ futures-util = "0.3"
 # Optional: only compiled when the `transport-tonic` feature is enabled.
 # This is the sole edge from the core to a concrete transport, and it is the
 # only crate allowed to reference tonic/rustls types.
-arachne-transport-tonic = { workspace = true, optional = true }
+arachne-kv-transport-tonic = { workspace = true, optional = true }
 
 # B4 / U2-bis: WAL segment extent pre-allocation (fallocate(2) with
 # FALLOC_FL_KEEP_SIZE) needs a thin C binding on Linux. `libc` is already in
@@ -65,14 +66,14 @@ libc = "0.2"
 # Test-only: the test support crate provides the FsyncLedger and FaultyStorage
 # for integration tests. This is a dev-dependency only (enforced by
 # scripts/check-deps.sh Gate A: production crates may only pull in
-# arachne-testsupport via [dev-dependencies]).
-        arachne-testsupport = { workspace = true }
+# arachne-kv-testsupport via [dev-dependencies]).
+         arachne-kv-testsupport = { workspace = true }
         # The client/runtime integration tests are async (`#[tokio::test]`) and await
         # commands against a running runtime actor; `tokio` is dev-only (the core itself
         # is runtime-agnostic).
         tokio = { version = "1", features = ["rt", "macros", "time", "net", "rt-multi-thread", "signal"] }
-        # Dev-only: the `axum_http` example (examples/axum_http.rs) wraps the
-        # `arachne::server` facade in an axum HTTP service. axum is already in the
+         # Dev-only: the `axum_http` example (examples/axum_http.rs) wraps the
+         # `arachne-kv::server` facade in an axum HTTP service. axum is already in the
         # lock (transitively via the tonic edge); listing it here adds no new
         # external crate. It is dev-dependency-only, so the production
         # `cargo tree -e normal` (check-deps Gates A/B/C) is unaffected. A plain

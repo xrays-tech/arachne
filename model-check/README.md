@@ -40,7 +40,7 @@ properties above are **unfalsifiable by construction** — the model can never
 produce a counterexample, so "no counterexample found" currently validates the
 **stateright wiring only** (D-T2), not Arachne's real consensus logic.
 
-> Note: the harness does **not** exercise the real `arachne` crate — its only
+> Note: the harness does **not** exercise the real `arachne-kv` crate — its only
 > use is a `version()` banner in the startup line. It does *not* build against
 > the shipped API in any meaningful sense at this stage.
 

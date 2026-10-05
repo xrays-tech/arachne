@@ -40,12 +40,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arachne"
+name = "arachne-kv"
 version = "0.1.0"
 dependencies = [
- "arachne-seam",
- "arachne-testsupport",
- "arachne-transport-tonic",
+ "arachne-kv-seam",
+ "arachne-kv-testsupport",
+ "arachne-kv-transport-tonic",
  "axum",
  "futures-util",
  "libc",
@@ -58,11 +58,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "arachne-node"
+name = "arachne-kv-node"
 version = "0.1.0"
 dependencies = [
- "arachne",
- "arachne-transport-tonic",
+ "arachne-kv",
+ "arachne-kv-transport-tonic",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -73,33 +73,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "arachne-seam"
+name = "arachne-kv-seam"
 version = "0.1.0"
 
 [[package]]
-name = "arachne-sim"
+name = "arachne-kv-sim"
 version = "0.1.0"
 dependencies = [
- "arachne",
- "arachne-seam",
- "arachne-testsupport",
+ "arachne-kv",
+ "arachne-kv-seam",
+ "arachne-kv-testsupport",
 ]
 
 [[package]]
-name = "arachne-testsupport"
+name = "arachne-kv-testsupport"
 version = "0.1.0"
 dependencies = [
- "arachne-seam",
+ "arachne-kv-seam",
  "stateright",
  "tokio",
 ]
 
 [[package]]
-name = "arachne-transport-tonic"
+name = "arachne-kv-transport-tonic"
 version = "0.1.0"
 dependencies = [
- "arachne",
- "arachne-seam",
+ "arachne-kv",
+ "arachne-kv-seam",
  "http",
  "hyper",
  "hyper-util",

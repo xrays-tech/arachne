@@ -20,10 +20,10 @@
 
 use std::sync::Arc;
 
-use arachne_seam::storage::{
+use arachne_kv_seam::storage::{
     ConfState, HardState, LogEntry, RaftState, Snapshot, Storage, StorageError,
 };
-use arachne_seam::types::{LogIndex, Term};
+use arachne_kv_seam::types::{LogIndex, Term};
 
 use crate::durability::DurabilityLedger;
 
@@ -250,7 +250,7 @@ impl<S: Storage> Storage for FaultyStorage<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arachne_seam::storage::{ConfState, EntryType};
+    use arachne_kv_seam::storage::{ConfState, EntryType};
 
     /// A minimal in-memory storage double for testing.
     struct MemStorage {

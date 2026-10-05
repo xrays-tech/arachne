@@ -20,9 +20,9 @@
 
 use std::sync::Mutex;
 
-use arachne_seam::RaftId;
-use arachne_seam::storage::FsyncObserver;
-use arachne_seam::types::{LogIndex, Term};
+use arachne_kv_seam::RaftId;
+use arachne_kv_seam::storage::FsyncObserver;
+use arachne_kv_seam::types::{LogIndex, Term};
 
 use crate::fsync_ledger::{FsyncEvent, FsyncLedger};
 

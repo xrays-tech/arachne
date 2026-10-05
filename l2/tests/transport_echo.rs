@@ -45,9 +45,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arachne::seam::TransportMessage;
-use arachne::{NodeId, Transport, TransportFactory, TransportRx};
-use arachne_transport_tonic::TonicTransportFactory;
+use arachne_kv::seam::TransportMessage;
+use arachne_kv::{NodeId, Transport, TransportFactory, TransportRx};
+use arachne_kv_transport_tonic::TonicTransportFactory;
 
 use arachne_l2::io::TurmoilIo;
 use arachne_l2::net::SimNetwork;

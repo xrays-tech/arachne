@@ -35,8 +35,8 @@ jobs:
           cargo --version
           rustc --version
 
-      # `raft-proto`'s `protobuf-build` (a dependency of the `arachne` core)
-      # requires a `protoc` whose version is 3.x and rejects the newer
+       # `raft-proto`'s `protobuf-build` (a dependency of the `arachne-kv` core)
+       # requires a `protoc` whose version is 3.x and rejects the newer
       # calendar-versioned releases modern distros ship. Install a pinned 3.x
       # and put it on PATH; `scripts/find-protoc.sh` (pointed at by PROTOC in
       # .cargo/config.toml) then resolves it.
@@ -83,12 +83,12 @@ jobs:
         # durability pipeline is for (with a slow disk the actor must keep
         # serving instead of waiting for its own flush).
         run: |
-          cargo test -p arachne --features fault-injection --test m2_durability
-          cargo test -p arachne --features fault-injection --test slow_fsync
-          cargo test -p arachne --features fault-injection --test sessions
+          cargo test -p arachne-kv --features fault-injection --test m2_durability
+          cargo test -p arachne-kv --features fault-injection --test slow_fsync
+          cargo test -p arachne-kv --features fault-injection --test sessions
 
       - name: Build lean core (no default features)
-        run: cargo build -p arachne --no-default-features
+        run: cargo build -p arachne-kv --no-default-features
 
       - name: Dependency-boundary gate
         run: bash scripts/check-deps.sh

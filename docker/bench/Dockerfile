@@ -1,7 +1,7 @@
 # Runtime image for the statically-linked `arachne-node` binary.
 #
 # The binary is cross-compiled on the host with
-#   cargo zigbuild --release -p arachne-node --target aarch64-unknown-linux-musl
+#   cargo zigbuild --release -p arachne-kv-node --target aarch64-unknown-linux-musl
 # and copied into `bin/` before `docker build` (see the README note in this
 # directory). Alpine is the base only for a shell + busybox `wget` healthcheck;
 # the binary itself needs nothing from the image.

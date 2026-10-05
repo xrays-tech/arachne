@@ -38,7 +38,7 @@ bash l4/verify_wal.sh /path/to/data-dir ./node-bin
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ARACHNE_NODE` | 自动（`cargo metadata` 定位 target dir，缺则 `cargo build -p arachne-node`） | 节点二进制路径 |
+| `ARACHNE_NODE` | 自动（`cargo metadata` 定位 target dir，缺则 `cargo build -p arachne-kv-node`） | 节点二进制路径 |
 | `ARACHNE_L4_ITERATIONS` | `5` | `kill -9` / 重启循环次数 |
 | `ARACHNE_L4_READY_TIMEOUT` | `30` | 每次重启等 `/readyz` 的秒数上限 |
 | `ARACHNE_L4_CONFIG` | `l4/node.toml` | 模板配置路径 |

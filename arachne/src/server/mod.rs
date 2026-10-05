@@ -28,7 +28,7 @@
 //!   applied.
 //!
 //! For advanced membership control or out-of-process control, use the original
-//! `arachne::runtime::Runtime` / `arachne::client::Handle` APIs directly.
+//! `arachne_kv::runtime::Runtime` / `arachne_kv::client::Handle` APIs directly.
 
 pub use crate::client::ArachneError;
 pub use crate::client::Handle;
@@ -42,9 +42,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::SystemTime;
 
-use arachne_seam::{NodeId, RaftId, Transport, TransportMessage, TransportRx};
+use arachne_kv_seam::{NodeId, RaftId, Transport, TransportMessage, TransportRx};
 #[cfg(feature = "transport-tonic")]
-use arachne_seam::TransportFactory;
+use arachne_kv_seam::TransportFactory;
 
 use crate::consensus::RaftNodeConfig;
 use crate::metrics::Metrics;
@@ -60,7 +60,7 @@ use slog::{o, Drain, Logger};
 pub mod snapshot_source;
 
 #[cfg(feature = "transport-tonic")]
-use arachne_transport_tonic::{PROTOCOL_MAJOR, PROTOCOL_MINOR, TonicTransportFactory};
+use arachne_kv_transport_tonic::{PROTOCOL_MAJOR, PROTOCOL_MINOR, TonicTransportFactory};
 
 /// Global, single-instance holder for the embedded node.
 ///
@@ -695,7 +695,7 @@ fn start_multi_node(_config: ClusterConfig) -> Result<FacadeState, ArachneError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arachne_seam::Transport;
+    use arachne_kv_seam::Transport;
 
     /// `PeerlessTx::send` must resolve to `Ok(())` immediately.
     ///

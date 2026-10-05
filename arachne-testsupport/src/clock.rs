@@ -1,4 +1,4 @@
-//! A deterministic, manually-advanced [`Clock`](arachne_seam::Clock) for tests and
+//! A deterministic, manually-advanced [`Clock`](arachne_kv_seam::Clock) for tests and
 //! the simulator.
 //!
 //! It starts at a chosen millisecond and only moves forward when the test
@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne_seam::{Clock, Timestamp};
+use arachne_kv_seam::{Clock, Timestamp};
 
 /// A clock that only advances when the test says so.
 ///

@@ -1,5 +1,5 @@
 //! The Arachne storage module: the seam types (re-exported from
-//! [`arachne_seam::storage`]) plus the on-disk WAL format, segment
+//! [`arachne_kv_seam::storage`]) plus the on-disk WAL format, segment
 //! management, META file, and the WAL-backed [`WalStorage`] implementation.
 //!
 //! # Layout
@@ -19,8 +19,8 @@
 //! # Re-exported seam types
 //!
 //! The [`Storage`], [`LogEntry`], [`HardState`], and other value types from
-//! [`arachne_seam::storage`] are re-exported here so that the public path
-//! `arachne::storage::*` remains stable.
+//! [`arachne_kv_seam::storage`] are re-exported here so that the public path
+//! `arachne_kv::storage::*` remains stable.
 
 mod crc32c;
 mod format;
@@ -32,9 +32,9 @@ mod prealloc;
 mod sync;
 mod wal;
 
-// Re-export the seam's storage types so `arachne::storage::Storage` etc.
+// Re-export the seam's storage types so `arachne_kv::storage::Storage` etc.
 // continue to work.
-pub use arachne_seam::storage::{
+pub use arachne_kv_seam::storage::{
     ConfState, EntryType, FsyncObserver, HardState, LogEntry, RaftId, RaftState, Snapshot,
     SnapshotMeta, Storage, StorageError,
 };

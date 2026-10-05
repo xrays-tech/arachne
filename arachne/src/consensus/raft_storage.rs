@@ -1,4 +1,4 @@
-//! Adapter: implements `raft::storage::Storage` over `arachne_seam::Storage`.
+//! Adapter: implements `raft::storage::Storage` over `arachne_kv_seam::Storage`.
 //!
 //! The adapter is a thin, single-instance wrapper around the caller's durable
 //! [`SeamStorage`]. There is no second cache: the `RawNode` reads through this
@@ -27,15 +27,15 @@ use raft::eraftpb::{
 use raft::storage::{GetEntriesContext, RaftState, Storage as RaftStorageTrait};
 use raft::{Error as RaftError, Result as RaftResult, StorageError as RaftStorageError};
 
-use arachne_seam::storage::{
+use arachne_kv_seam::storage::{
     ConfState as SeamConfState, EntryType as SeamEntryType, FlushToken,
     HardState as SeamHardState, LogEntry, PersistSubmit, Snapshot as SeamSnapshot,
     SnapshotMeta as SeamSnapshotMeta, Storage as SeamStorage, StorageError as SeamStorageError,
 };
-use arachne_seam::types::LogIndex;
+use arachne_kv_seam::types::LogIndex;
 use crate::storage::WalStorage;
 
-/// A `raft::storage::Storage` adapter over an `arachne_seam::Storage`.
+/// A `raft::storage::Storage` adapter over an `arachne_kv_seam::Storage`.
 pub struct RaftStorage<S: SeamStorage> {
     inner: S,
     /// Whether snapshots are transferred by streaming their bytes separately
@@ -65,14 +65,14 @@ impl<S: SeamStorage> RaftStorage<S> {
     /// membership write has to be visible here rather than on `S` directly.
     pub fn save_conf_state(
         &mut self,
-        conf_change_index: arachne_seam::types::LogIndex,
+        conf_change_index: arachne_kv_seam::types::LogIndex,
         conf_state: &SeamConfState,
-    ) -> Result<(), arachne_seam::storage::StorageError> {
+    ) -> Result<(), arachne_kv_seam::storage::StorageError> {
         self.inner.save_conf_state(conf_change_index, conf_state)
     }
 
     /// Delegate the seam's replay boundary to the wrapped storage (rev S).
-    pub fn conf_change_index(&self) -> arachne_seam::types::LogIndex {
+    pub fn conf_change_index(&self) -> arachne_kv_seam::types::LogIndex {
         self.inner.conf_change_index()
     }
 
@@ -378,8 +378,8 @@ fn map_error(e: SeamStorageError) -> RaftError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arachne_seam::storage::{EntryType, RaftState};
-    use arachne_seam::types::LogIndex;
+    use arachne_kv_seam::storage::{EntryType, RaftState};
+    use arachne_kv_seam::types::LogIndex;
 
     /// A small in-memory seam storage double that can be pre-populated and
     /// optionally forced to report a specific error. Test-only.
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn snapshot_conversion_preserves_metadata() {
         let snap = SeamSnapshot {
-            meta: arachne_seam::storage::SnapshotMeta {
+            meta: arachne_kv_seam::storage::SnapshotMeta {
                 index: 9,
                 term: 4,
                 conf_state: SeamConfState {

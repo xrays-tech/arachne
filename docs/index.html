@@ -71,7 +71,7 @@
   <section class="trait-strip">
     <h3 style="font-family:var(--font-display);font-size:20px;margin:0 0 6px;">核心是传输无关的</h3>
     <p style="color:var(--muted);margin:0 0 16px;max-width:70ch;">
-      共识、WAL 与 KV 状态机构成 <code>arachne</code> 核心。它只面向 <em>seam</em> 特征编程，核心内没有具体的时钟、
+      共识、WAL 与 KV 状态机构成 <code>arachne-kv</code> 核心。它只面向 <em>seam</em> 特征编程，核心内没有具体的时钟、
       RNG、网络代码或文件 I/O；<code>--no-default-features</code> 时以零外部 crate 编译为精简核心。
     </p>
     <div class="trait-grid">
@@ -111,23 +111,23 @@
     <div class="fact-grid">
       <div class="card">
         <span class="card-tag">可嵌入核心</span>
-        <p><code>arachne</code> —— <code>src/consensus</code>、<code>src/storage</code>、<code>src/runtime</code>、<code>src/client</code>、<code>src/state_machine</code>、<code>src/profile</code> 与 seam 特征。</p>
+        <p><code>arachne-kv</code> —— <code>src/consensus</code>、<code>src/storage</code>、<code>src/runtime</code>、<code>src/client</code>、<code>src/state_machine</code>、<code>src/profile</code> 与 seam 特征。</p>
       </div>
       <div class="card">
         <span class="card-tag">叶子 crate</span>
-        <p><code>arachne-seam</code> —— seam 特征与共享值类型，自身无任何依赖。</p>
+        <p><code>arachne-kv-seam</code> —— seam 特征与共享值类型，自身无任何依赖。</p>
       </div>
       <div class="card">
         <span class="card-tag">传输实现</span>
-        <p><code>arachne-transport-tonic</code> —— tonic / rustls 传输，由 <code>transport-tonic</code> 特性启用。</p>
+        <p><code>arachne-kv-transport-tonic</code> —— tonic / rustls 传输，由 <code>transport-tonic</code> 特性启用。</p>
       </div>
       <div class="card">
         <span class="card-tag">参考节点</span>
-        <p><code>arachne-node</code> —— HTTP 服务器、配置加载、成员管理运维面。</p>
+        <p><code>arachne-kv-node</code> —— HTTP 服务器、配置加载、成员管理运维面。</p>
       </div>
       <div class="card">
         <span class="card-tag">测试支撑</span>
-        <p><code>arachne-testsupport</code>、<code>arachne-sim</code> —— 测试与仿真支撑；<code>l2/</code>、<code>l4/</code>、<code>fuzz/</code>、<code>model-check/</code> 为独立确定性测试框架。</p>
+        <p><code>arachne-kv-testsupport</code>、<code>arachne-kv-sim</code> —— 测试与仿真支撑；<code>l2/</code>、<code>l4/</code>、<code>fuzz/</code>、<code>model-check/</code> 为独立确定性测试框架。</p>
       </div>
       <div class="card">
         <span class="card-tag">设计记录</span>

@@ -5,7 +5,7 @@
 # Why this exists
 # ===============
 # `protobuf-build` (the codegen used by `raft-proto`, a dependency of the
-# `arachne` core) only accepts a `protoc` whose version string is `3.x` — it
+# `arachne-kv` core) only accepts a `protoc` whose version string is `3.x` — it
 # rejects the calendar-versioned `25.x`/`31.x` that modern distributions ship.
 # On a machine where the only system `protoc` is too new (as here), the whole
 # workspace cannot build.
@@ -13,7 +13,7 @@
 # This wrapper is pointed at by `PROTOC` (see `.cargo/config.toml`, set with
 # `relative = true` so it resolves against the workspace root regardless of the
 # build script's CWD). Both `protobuf-build` (for `raft-proto`) and
-# `tonic-build` (for `arachne-transport-tonic`) invoke it exactly like `protoc`
+# `tonic-build` (for `arachne-kv-transport-tonic`) invoke it exactly like `protoc`
 # (e.g. `protoc --version`, or the usual `-I ... -o ...` codegen arguments), so
 # it simply locates a suitable `protoc` and `exec`s it with the same arguments.
 #

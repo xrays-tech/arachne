@@ -177,7 +177,7 @@ else
   else
     info "  (reusing cached binary in ${CARGO_TARGET_DIR}/aarch64-unknown-linux-musl/release/)"
   fi
-  if cargo zigbuild --release -p arachne-node --target aarch64-unknown-linux-musl \
+  if cargo zigbuild --release -p arachne-kv-node --target aarch64-unknown-linux-musl \
       2>&1 | tail -n 25; then
     :
   else

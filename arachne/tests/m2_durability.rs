@@ -32,14 +32,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{
+use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{
     FsyncObserver, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportFactory,
     TransportMessage,
 };
-use arachne_testsupport::{
+use arachne_kv_testsupport::{
     block_on, DurabilityLedger, FaultSchedule, FaultyStorage, InMemoryRx, InMemoryTransportFactory,
     InMemoryTx, TransportError,
 };
@@ -407,10 +407,10 @@ impl Cluster {
     /// crash); nothing is applied, because the crash precedes the caller's
     /// apply step.
     #[cfg(feature = "fault-injection")]
-    fn drive_one_armed(&mut self, i: RaftId, stage: arachne::fault_injection::Stage) -> bool {
+    fn drive_one_armed(&mut self, i: RaftId, stage: arachne_kv::fault_injection::Stage) -> bool {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         let idx = (i - 1) as usize;
-        arachne::fault_injection::arm(stage);
+        arachne_kv::fault_injection::arm(stage);
         let node = self.nodes[idx].as_mut().expect("node present");
         node.tick();
         match catch_unwind(AssertUnwindSafe(|| block_on(node.step()))) {
@@ -421,13 +421,13 @@ impl Cluster {
                     self.committed[idx].push((ix, data));
                 }
                 self.nodes[idx].as_mut().expect("node present").advance_apply();
-                arachne::fault_injection::disarm();
+                arachne_kv::fault_injection::disarm();
                 false
             }
             Ok(Err(e)) => {
                 self.dead[idx] = true;
                 self.step_errors[idx] = Some(e.to_string());
-                arachne::fault_injection::disarm();
+                arachne_kv::fault_injection::disarm();
                 false
             }
         }
@@ -746,7 +746,7 @@ fn inv2_crash_sweep_replays_the_committed_prefix() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn inv2_precise_ready_stage_crash_replays_the_durable_prefix() {
-    use arachne::fault_injection::Stage;
+    use arachne_kv::fault_injection::Stage;
 
     let cases: &[(&str, Stage)] = &[
         ("leader", Stage::AfterPersist),

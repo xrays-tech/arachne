@@ -51,13 +51,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{
+use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{
     FsyncObserver, NodeId, RaftId, StateMachine, Transport, TransportFactory, TransportMessage,
 };
-use arachne_testsupport::{
+use arachne_kv_testsupport::{
     block_on, FsyncLedger, InMemoryRx, InMemoryTransportFactory, InMemoryTx, TransportError,
 };
 use protobuf::Message as _;

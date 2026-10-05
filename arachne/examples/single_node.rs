@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
-use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{NodeId, StateMachine, Transport, TransportMessage, TransportRx};
+use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{NodeId, StateMachine, Transport, TransportMessage, TransportRx};
 use slog::{o, Drain, Logger};
 
 type Node = RaftNode<WalStorage, NullTx, NullRx>;

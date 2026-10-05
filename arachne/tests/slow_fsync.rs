@@ -24,12 +24,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne::consensus::RaftNodeConfig;
-use arachne::runtime::{Runtime, RuntimeConfig};
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::TransportFactory;
-use arachne::{Metrics, NodeId, Profile, ProfileConfig};
-use arachne_testsupport::InMemoryTransportFactory;
+use arachne_kv::consensus::RaftNodeConfig;
+use arachne_kv::runtime::{Runtime, RuntimeConfig};
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::TransportFactory;
+use arachne_kv::{Metrics, NodeId, Profile, ProfileConfig};
+use arachne_kv_testsupport::InMemoryTransportFactory;
 use slog::{o, Drain, Logger};
 use tokio::time::Instant;
 

@@ -38,8 +38,8 @@ mod cluster {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use arachne::server::{AssembledClusterNode, ClusterConfig};
-    use arachne::NodeId;
+    use arachne_kv::server::{AssembledClusterNode, ClusterConfig};
+    use arachne_kv::NodeId;
 
     // Unique per-process sequence so `process::id()` (shared across all tests in
     // one binary) is disambiguated without reaching for real time.
@@ -130,7 +130,7 @@ mod cluster {
                     m
                 },
             );
-            let node = arachne::server::assemble_cluster(cfg)
+            let node = arachne_kv::server::assemble_cluster(cfg)
                 .await
                 .unwrap_or_else(|e| panic!("assemble node {id}: {e:?}"));
             nodes.push(node);
@@ -268,8 +268,8 @@ mod no_tonic {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use arachne::server::{Arachne, ArachneError, ClusterConfig};
-    use arachne::NodeId;
+    use arachne_kv::server::{Arachne, ArachneError, ClusterConfig};
+    use arachne_kv::NodeId;
 
     #[tokio::test]
     async fn multi_node_requires_tonic_feature() {

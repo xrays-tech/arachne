@@ -16,12 +16,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arachne::client::Handle;
-use arachne::consensus::RaftNodeConfig;
-use arachne::runtime::{Runtime, RuntimeConfig};
-use arachne::storage::{WalConfig, WalOptions, WalStorage};
-use arachne::{Metrics, RaftId, StorageError, TransportFactory};
-use arachne_transport_tonic::{
+use arachne_kv::client::Handle;
+use arachne_kv::consensus::RaftNodeConfig;
+use arachne_kv::runtime::{Runtime, RuntimeConfig};
+use arachne_kv::storage::{WalConfig, WalOptions, WalStorage};
+use arachne_kv::{Metrics, RaftId, StorageError, TransportFactory};
+use arachne_kv_transport_tonic::{
     TonicRx, TonicTransport, TonicTransportFactory, TransportError, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
 };
@@ -73,7 +73,7 @@ pub struct Arachne {
     /// The tonic transport factory; [`Arachne::shutdown`] stops its server and
     /// closes the inbound channels before the runtime actor is aborted.
     factory: TonicTransportFactory,
-    task: arachne::RuntimeThread,
+    task: arachne_kv::RuntimeThread,
     handle: Handle,
     metrics: Arc<Metrics>,
 }
@@ -83,7 +83,7 @@ impl Arachne {
     /// and spawn its actor.
     ///
     /// Both the WAL (`fsync_policy`, `segment_bytes`) and the raft tick/flow
-    /// timings are driven by the validated [`arachne::ProfileConfig`] (propsol §7).
+    /// timings are driven by the validated [`arachne_kv::ProfileConfig`] (propsol §7).
     /// The tonic factory binds **only** this node's `listen` address: in a
     /// multi-process cluster a process must never bind its peers' ports, so it
     /// calls `start_with_bind` (not `start`) for its own node id.

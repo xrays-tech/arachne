@@ -8,18 +8,18 @@ set -euo pipefail
 # "no test code in production" rule, changes nothing but test instrumentation,
 # and must be opt-in only:
 #
-#   * `arachne-node` / `test-observability` — structured stdout markers
+#   * `arachne-kv-node` / `test-observability` — structured stdout markers
 #     (`ready` / `shutdown`) for the L4 fault injector.
-#   * `arachne` / `fault-injection` — a crash hook at `RaftNode::step`'s
+#   * `arachne-kv` / `fault-injection` — a crash hook at `RaftNode::step`'s
 #     ready-stage boundaries for INV2's precise crash sweep (propsol v0.2.9 L).
 #
 # This gate proves the **default** (release / publish) artifacts exclude both:
 #
 #   Gate A — feature resolution: neither feature is a default feature.
-#   Gate B — artifact check: `arachne-node`'s default release binary does not
+#   Gate B — artifact check: `arachne-kv-node`'s default release binary does not
 #            contain the observability marker, while a build with the feature
 #            does (so the flag is not a no-op and the shipped binary is clean).
-#   Gate C — artifact check: `arachne`'s default release rlib does not contain
+#   Gate C — artifact check: `arachne-kv`'s default release rlib does not contain
 #            the fault-injection sentinel, while a build with the feature does.
 #
 # Degrades gracefully: a missing/renamed package fails loudly rather than
@@ -46,29 +46,29 @@ else:
 ' "$1"
 }
 
-node_defaults="$(default_features_of arachne-node)"
+node_defaults="$(default_features_of arachne-kv-node)"
 if [ "${node_defaults}" = "<<missing>>" ]; then
-  echo "FAIL (Gate A): no `arachne-node` package in the workspace metadata"
+  echo "FAIL (Gate A): no `arachne-kv-node` package in the workspace metadata"
   exit 1
 fi
 if [ -n "${node_defaults}" ]; then
-  echo "FAIL (Gate A): arachne-node has non-empty default features: ${node_defaults}"
+  echo "FAIL (Gate A): arachne-kv-node has non-empty default features: ${node_defaults}"
   exit 1
 fi
 
-core_defaults="$(default_features_of arachne)"
+core_defaults="$(default_features_of arachne-kv)"
 if [ "${core_defaults}" = "<<missing>>" ]; then
-  echo "FAIL (Gate A): no `arachne` package in the workspace metadata"
+  echo "FAIL (Gate A): no `arachne-kv` package in the workspace metadata"
   exit 1
 fi
 case ",${core_defaults}," in
   *,fault-injection,*)
-    echo "FAIL (Gate A): `fault-injection` is a default feature of arachne (${core_defaults})"
+    echo "FAIL (Gate A): `fault-injection` is a default feature of arachne-kv (${core_defaults})"
     exit 1
     ;;
 esac
 echo "PASS (Gate A): neither test-only feature is a default feature"
-echo "        arachne-node defaults: [${node_defaults}]; arachne defaults: [${core_defaults}]"
+echo "        arachne-kv-node defaults: [${node_defaults}]; arachne-kv defaults: [${core_defaults}]"
 
 # --- 2. Artifact check ------------------------------------------------------
 target_dir="$(printf '%s' "${metadata}" | python3 -c '
@@ -90,7 +90,7 @@ hash_file() {
 
 echo ""
 echo "== check-release-features: Gate B (release artifact must exclude the markers) =="
-cargo build -p arachne-node --release >/dev/null
+cargo build -p arachne-kv-node --release >/dev/null
 if [ ! -f "${binary}" ]; then
   echo "FAIL (Gate B): release binary not found at ${binary}"
   exit 1
@@ -101,7 +101,7 @@ if grep -a -q -F "${marker}" "${binary}"; then
 fi
 default_hash="$(hash_file "${binary}")"
 
-cargo build -p arachne-node --release --features test-observability >/dev/null
+cargo build -p arachne-kv-node --release --features test-observability >/dev/null
 if ! grep -a -q -F "${marker}" "${binary}"; then
   echo "FAIL (Gate B): the feature build lacks the marker (the feature is a no-op?)"
   exit 1
@@ -114,12 +114,12 @@ if [ "${default_hash}" = "${feature_hash}" ]; then
 fi
 
 # Leave a clean (default-feature) artifact on disk.
-cargo build -p arachne-node --release >/dev/null
+cargo build -p arachne-kv-node --release >/dev/null
 echo "PASS (Gate B): default release binary excludes the markers (sha256 ${default_hash:0:12}…)"
 
 # --- 3. Core release artifact: the fault-injection hook ---------------------
 #
-# Build `arachne` and print the rlib cargo reports for it. The JSON stream is
+# Build `arachne-kv` and print the rlib cargo reports for it. The JSON stream is
 # emitted even when the unit is fresh, and it names the artifact for the feature
 # set just built — mtime is unreliable because the default and feature variants
 # coexist in `release/deps/`.
@@ -131,8 +131,8 @@ build_core_rlib() {
   local err
   err="$(mktemp)"
   local out
-  if ! out="$(cargo build -p arachne --release "$@" --message-format=json 2>"${err}")"; then
-    echo "FAIL (Gate C): cargo build -p arachne --release $* failed" >&2
+  if ! out="$(cargo build -p arachne-kv --release "$@" --message-format=json 2>"${err}")"; then
+    echo "FAIL (Gate C): cargo build -p arachne-kv --release $* failed" >&2
     cat "${err}" >&2
     printf '%s\n' "${out}" | grep -F '"reason":"compiler-message"' >&2 || true
     rm -f "${err}"
@@ -151,7 +151,9 @@ for line in sys.stdin:
         continue
     if msg.get("reason") != "compiler-artifact":
         continue
-    if msg.get("target", {}).get("name") != "arachne":
+    # Cargo names the artifact target after the underscored lib name (the crate
+    # is `arachne-kv`; the lib target is `arachne_kv`).
+    if msg.get("target", {}).get("name") != "arachne_kv":
         continue
     for f in msg.get("filenames", []):
         if f.endswith(".rlib"):
@@ -162,13 +164,13 @@ for line in sys.stdin:
 }
 
 echo ""
-echo "== check-release-features: Gate C (arachne release artifact must exclude the fault-injection hook) =="
+echo "== check-release-features: Gate C (arachne-kv release artifact must exclude the fault-injection hook) =="
 hook_sentinel="arachne-fault-injection-hook"
 
 # Default (release/publish) build: the hook must be absent.
 rlib="$(build_core_rlib)"
 if [ -z "${rlib}" ] || [ ! -f "${rlib}" ]; then
-  echo "FAIL (Gate C): could not locate the arachne release rlib"
+  echo "FAIL (Gate C): could not locate the arachne-kv release rlib"
   exit 1
 fi
 if grep -a -q -F "${hook_sentinel}" "${rlib}"; then
@@ -189,7 +191,7 @@ echo "PASS (Gate C): default release rlib excludes the slow-disk injection"
 # Feature build: the hook must be present (proves the gate is not vacuous).
 rlib="$(build_core_rlib --features fault-injection)"
 if [ -z "${rlib}" ] || [ ! -f "${rlib}" ]; then
-  echo "FAIL (Gate C): could not locate the arachne feature rlib"
+  echo "FAIL (Gate C): could not locate the arachne-kv feature rlib"
   exit 1
 fi
 if ! grep -a -q -F "${hook_sentinel}" "${rlib}"; then

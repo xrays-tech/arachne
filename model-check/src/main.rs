@@ -213,7 +213,7 @@ fn main() {
     let model = Cluster::new();
     println!(
         "model-check: arachne {} — bounded {NODES}-node replicated log (max_log={MAX_LOG}, depth={DEPTH})",
-        arachne::version()
+        arachne_kv::version()
     );
     let checker = model
         .checker()

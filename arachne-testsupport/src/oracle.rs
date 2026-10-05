@@ -139,7 +139,7 @@ impl Op {
 /// The kind of a failed operation.
 ///
 /// Mirrors the subset of the client error model ([`ArachneError`](the
-/// production `arachne::client`) is *not* depended on by this crate) that
+/// production `arachne_kv::client`) is *not* depended on by this crate) that
 /// represents a non-linearization-point failure: the op did not take effect
 /// (or its effect is unknown) and must not be treated as a linearization point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

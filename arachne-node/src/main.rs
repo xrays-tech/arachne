@@ -25,13 +25,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arachne::client::Handle;
-use arachne::ArachneError;
-use arachne_node::config::{parse_config, Config};
-use arachne_node::force_recovery;
-use arachne_node::http::{self, HttpHandler, HttpResponse};
-use arachne_node::metrics::Metrics;
-use arachne_node::node::Arachne;
+use arachne_kv::client::Handle;
+use arachne_kv::ArachneError;
+use arachne_kv_node::config::{parse_config, Config};
+use arachne_kv_node::force_recovery;
+use arachne_kv_node::http::{self, HttpHandler, HttpResponse};
+use arachne_kv_node::metrics::Metrics;
+use arachne_kv_node::node::Arachne;
 
 const USAGE: &str = "usage: arachne-node --config <path.toml>\n       \
 arachne-node force-recovery --config <path.toml> --i-know-data-loss \
@@ -288,9 +288,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exit codes (0/1/2).
     if args
         .get(1)
-        .is_some_and(|name| arachne_node::members::Op::from_name(name).is_some())
+        .is_some_and(|name| arachne_kv_node::members::Op::from_name(name).is_some())
     {
-        std::process::exit(arachne_node::members::main(&args));
+        std::process::exit(arachne_kv_node::members::main(&args));
     }
 
     // The `force-recovery` subcommand (propsol §6.1) is dispatched before the

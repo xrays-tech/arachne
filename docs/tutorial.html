@@ -60,11 +60,11 @@
 
       <h2>1. 它由什么组成</h2>
       <p>
-        Arachne 首先是一个<strong>库</strong>。共识、WAL 和 KV 状态机构成 <code>arachne</code> 核心；
+        Arachne 首先是一个<strong>库</strong>。共识、WAL 和 KV 状态机构成 <code>arachne-kv</code> 核心；
         核心只面向 <em>seam</em> 特征（<code>Transport</code>、<code>Storage</code>、
         <code>StateMachine</code>、<code>Clock</code>、<code>Rng</code>、
         <code>FsyncObserver</code>……）编程，核心内没有任何具体时钟、RNG、网络代码或文件 I/O。
-        具象的传输由嵌入方插进来——生产环境用 <code>arachne-transport-tonic</code>，测试用内存传输。
+        具象的传输由嵌入方插进来——生产环境用 <code>arachne-kv-transport-tonic</code>，测试用内存传输。
       </p>
       <div class="card-grid">
         <div class="card">
@@ -74,12 +74,12 @@
         </div>
         <div class="card">
           <span class="card-tag">核心</span>
-          <h3>arachne</h3>
-          <p>raft 共识 + WAL + KV 状态机。传输无关，<code>--no-default-features</code> 时零外部 crate。</p>
+         <h3>arachne-kv</h3>
+         <p>raft 共识 + WAL + KV 状态机。传输无关，<code>--no-default-features</code> 时零外部 crate。</p>
         </div>
         <div class="card">
           <span class="card-tag">传输</span>
-          <h3>arachne-transport-tonic</h3>
+          <h3>arachne-kv-transport-tonic</h3>
           <p>tonic / HTTP-2 / rustls。由 <code>transport-tonic</code> 特性启用的具象传输。</p>
         </div>
         <div class="card">
@@ -144,8 +144,8 @@
       </p>
 
       <h2>3. 嵌入：facade 生命周期</h2>
-      <p>
-        <code>arachne::server</code> 提供一个“零 tokio、单实例”的 facade：进程内一个节点，
+        <p>
+        <code>arachne_kv::server</code> 提供一个“零 tokio、单实例”的 facade：进程内一个节点，
         挂在全局静态槽上。完整程序在 Quick Start，这里拆开生命周期讲每一步的<strong>为什么</strong>。
       </p>
 
@@ -388,10 +388,10 @@ $ arachne-node transfer-leader --config node3.toml --id 1
       </p>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">rust</span></div>
-<pre><code data-lang="rust">use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{StateMachine, Transport, TransportRx};
+<pre><code data-lang="rust">use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{StateMachine, Transport, TransportRx};
 
 type Node = RaftNode&lt;WalStorage, NullTx, NullRx&gt;;
 

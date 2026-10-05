@@ -14,13 +14,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arachne::consensus::RaftNode;
-use arachne::state_machine::KvStateMachine;
-use arachne::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne::{
+use arachne_kv::consensus::RaftNode;
+use arachne_kv::state_machine::KvStateMachine;
+use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
+use arachne_kv::{
     LogEntry, NodeId, RaftId, StateMachine, Storage, TransportFactory, TransportMessage,
 };
-use arachne_testsupport::{block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx};
+use arachne_kv_testsupport::{block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx};
 use slog::{o, Drain, Logger};
 
 type TestNode = RaftNode<WalStorage, InMemoryTx, InMemoryRx>;

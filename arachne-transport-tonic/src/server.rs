@@ -10,8 +10,8 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arachne_seam::seam::TransportMessage;
-use arachne_seam::types::NodeId;
+use arachne_kv_seam::seam::TransportMessage;
+use arachne_kv_seam::types::NodeId;
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
