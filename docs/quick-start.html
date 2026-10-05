@@ -65,10 +65,17 @@
       </p>
       <div class="code-block">
         <div class="code-head"><span class="code-lang">Cargo.toml</span></div>
+<pre><code data-lang="shell">$ cargo add arachne-kv        # crates.io 上 v0.1；默认拉 tonic 传输
+</code></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">Cargo.toml</span></div>
 <pre><code data-lang="toml">[dependencies]
-arachne-kv = { path = "…/arachne" }            # default: pulls tonic transport
-# or a transport-free build:
-# arachne-kv = { path = "…/arachne", default-features = false }
+arachne-kv = "0.1"                            # 默认：拉 tonic 传输
+# 只要无传输的精简核心（零外部 crate）：
+# arachne-kv = { version = "0.1", default-features = false }
+# 或本地 checkout / workspace member（代替 crates.io）：
+# arachne-kv = { path = "../arachne" }
 </code></pre>
       </div>
       <p>

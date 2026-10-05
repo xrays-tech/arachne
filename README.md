@@ -10,13 +10,22 @@ The consensus, WAL and KV state machine form the `arachne-kv` core. By design th
 
 ## Embedding
 
-Add the core with the transport you want:
+Add the core with the transport you want (published to
+[crates.io](https://crates.io/crates/arachne-kv), v0.1):
+
+```shell
+$ cargo add arachne-kv
+```
+
+or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-arachne-kv = { path = "…/arachne" }            # default: pulls tonic transport
-# or a transport-free build:
-# arachne-kv = { path = "…/arachne", default-features = false }
+arachne-kv = "0.1"                            # default: pulls tonic transport
+# or a transport-free lean core (zero external crates):
+# arachne-kv = { version = "0.1", default-features = false }
+# or a local checkout / workspace member instead of crates.io:
+# arachne-kv = { path = "../arachne" }
 ```
 
 For a single in-process node, `arachne_kv::server` gives you a minimal facade —
