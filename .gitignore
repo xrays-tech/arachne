@@ -16,3 +16,4 @@
 # docker/bench transient cross-compiled binary
 /docker/bench/bin/
 /.dsh-target/
+/.dsh-target-fork/

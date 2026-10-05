@@ -1,4 +1,4 @@
-//! Adapter: implements `raft::storage::Storage` over `arachne_kv_seam::Storage`.
+//! Adapter: implements `raft_seedable::storage::Storage` over `arachne_kv_seam::Storage`.
 //!
 //! The adapter is a thin, single-instance wrapper around the caller's durable
 //! [`SeamStorage`]. There is no second cache: the `RawNode` reads through this
@@ -21,11 +21,11 @@
 //! are **fail-start** conditions: raft's `Unavailable` is exactly "the storage
 //! is broken, the node must stop participating", so that is where they map.
 
-use raft::eraftpb::{
+use raft_seedable::eraftpb::{
     ConfState, Entry, EntryType as RaftEntryType, HardState, Snapshot,
 };
-use raft::storage::{GetEntriesContext, RaftState, Storage as RaftStorageTrait};
-use raft::{Error as RaftError, Result as RaftResult, StorageError as RaftStorageError};
+use raft_seedable::storage::{GetEntriesContext, RaftState, Storage as RaftStorageTrait};
+use raft_seedable::{Error as RaftError, Result as RaftResult, StorageError as RaftStorageError};
 
 use arachne_kv_seam::storage::{
     ConfState as SeamConfState, EntryType as SeamEntryType, FlushToken,
@@ -35,7 +35,7 @@ use arachne_kv_seam::storage::{
 use arachne_kv_seam::types::LogIndex;
 use crate::storage::WalStorage;
 
-/// A `raft::storage::Storage` adapter over an `arachne_kv_seam::Storage`.
+/// A `raft_seedable::storage::Storage` adapter over an `arachne_kv_seam::Storage`.
 pub struct RaftStorage<S: SeamStorage> {
     inner: S,
     /// Whether snapshots are transferred by streaming their bytes separately
@@ -681,7 +681,7 @@ mod tests {
         }
     }
 
-    /// `Io` errors pass through as `raft::Error::Io`.
+    /// `Io` errors pass through as `raft_seedable::Error::Io`.
     #[test]
     fn io_error_maps_to_raft_io() {
         let mut inner = Double::new();

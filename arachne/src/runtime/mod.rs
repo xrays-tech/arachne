@@ -57,7 +57,7 @@ use crate::{
 use arachne_kv_seam::storage::{
     EntryType as SeamEntryType, Snapshot as SeamSnapshot, Storage as _,
 };
-use raft::eraftpb::ConfChangeType;
+use raft_seedable::eraftpb::ConfChangeType;
 
 /// How many times a streamed snapshot transfer is retried before giving up
 /// (propsol rev T). Each retry re-asks for the same snapshot; a newer snapshot

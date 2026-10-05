@@ -1,6 +1,6 @@
 //! The consensus core: raft-rs integration.
 //!
-//! * [`raft_storage`] — adapter implementing `raft::storage::Storage` over
+//! * [`raft_storage`] — adapter implementing `raft_seedable::storage::Storage` over
 //!   `arachne_kv_seam::Storage`.
 //! * [`node`] — `RaftNode`: drives the `RawNode` Ready loop with the frozen
 //!   persist/send ordering (I1–I4).

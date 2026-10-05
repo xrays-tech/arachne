@@ -9,7 +9,7 @@
 //! byte-identical.
 //!
 //! Everything runs on turmoil's seeded simulated network + clock, and the raft
-//! election RNG is seeded via the stage-2 `raft::set_election_rng_seed` hook.
+//! election RNG is seeded via the stage-2 `raft_seedable::set_election_rng_seed` hook.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -118,7 +118,7 @@ pub fn run_three_node(seed: u64) -> Vec<NodeObservation> {
     let addrs_cell: Arc<Mutex<Option<AddrMap>>> = Arc::new(Mutex::new(None));
 
     // Seed the patched raft election RNG on this (single) sim thread.
-    raft::set_election_rng_seed(seed);
+    raft_seedable::set_election_rng_seed(seed);
 
     let mut sim = SimNetwork::with_seed(seed);
     for i in 1..=3u64 {

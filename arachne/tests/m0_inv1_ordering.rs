@@ -61,7 +61,7 @@ use arachne_kv_testsupport::{
     block_on, FsyncLedger, InMemoryRx, InMemoryTransportFactory, InMemoryTx, TransportError,
 };
 use protobuf::Message as _;
-use raft::eraftpb::{Entry, Message as RaftMessage, MessageType};
+use raft_seedable::eraftpb::{Entry, Message as RaftMessage, MessageType};
 use slog::{o, Drain, Logger};
 
 type TestNode = RaftNode<WalStorage, RecordingTx, InMemoryRx>;

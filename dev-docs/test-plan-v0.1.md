@@ -15,7 +15,7 @@
 | D-T1 | 确定性模拟器 | **turmoil 0.7.2 锁定为 L2 主选**；madsim 为记录在案的否决项（磁盘故障 TODO 桩 + `[patch.crates-io]` 版本追高） | 跑真实 tokio/tonic、crash/bounce 语义与进程边界要求对齐 | §4 T1、§6.1；上游 §9.1 |
 | D-T2 | 线性化检查器 | **stateright 0.31.0 锁定为 `dev-dependency`**（仅测试依赖，不进生产依赖树）：作 T3 有界模型检查引擎 + 自建 Wing–Gong 检查器的交叉验证参照。**"去掉参照检查器"不是选项**——检查器自身的正确性门禁依赖它（§11 缺口 8） | 自建检查器是新代码，必须有独立参照兜底；stateright 另承担设计层模型检查 | §4 T2/T3、§11；上游 §9.1 |
 | D-L4 | L4 真机持久性门禁 | **专用真实磁盘 CI runner 现在即立项建设**（M0 起配置、M1 起可用、M4 出全量门禁）；"发版前手工执行"与"延后到 M2"两个备选已评审**否决**——fsync 语义不能等到 M4 才第一次被真实验证 | INV2/INV6 的真盘复验不可替代（模拟 fsync 是"撒谎的"）；自动化 runner 是唯一可重复的证明方式 | §2 L4 行、§10、§12 M0/M4；上游 §9.4 |
-| D-S1 | raft-rs 选举 RNG 不可注入时的响应 | **锁定方案：workspace `[patch.crates-io]` 携带一行 RNG 注入改动，以上游化为目标**；补丁进 cargo-deny/vendor 审计清单跟踪。S1 spike 只核验"是否需要补丁"，不再决定"要不要补丁" | 双跑复现门禁是整个确定性体系的根基（§5），不能留缺口；一行 patch 成本远低于失去可复现性 | §5 E3、§13 S1；上游 §9.5、§13 R3 |
+| D-S1 | raft-rs 选举 RNG 不可注入时的响应 | **锁定方案：workspace `[patch.crates-io]` 携带一行 RNG 注入改动，以上游化为目标**；补丁进 cargo-deny/vendor 审计清单跟踪。S1 spike 只核验"是否需要补丁"，不再决定"要不要补丁"。v0.2.25：本路线已演进——raft 经 `[patch.crates-io]` 的本地补丁已替换为独立发布的 fork crate `raft-seedable` 0.7.0（registry，含 seedable 选举 RNG hook；未设 seed 时与上游 raft 0.7 等价） | 双跑复现门禁是整个确定性体系的根基（§5），不能留缺口；一行 patch 成本远低于失去可复现性 | §5 E3、§13 S1；上游 §9.5、§13 R3 |
 | D-ART-names | 工件与 crate 命名 | **锁定**：`arachne-kv`（lib）、`arachne-kv-transport-tonic`、`arachne-kv-node`（bin，二进制名仍为 `arachne-node`）、`arachne-kv-testsupport`、`arachne-kv-sim`，外加 `examples/`、`fuzz/`、`model-check/` | 名称即职责：lib 产品主体 / 生产传输隔离 / 运维 bin / 测试支撑 dev-only / 测试 bin 不发布 | §3.2；上游 §4 工件边界 |
 | D-ART-feature | `arachne-kv` 默认 feature 拉入 tonic | **锁定：默认 feature `transport-tonic` 经 `arachne-kv-transport-tonic` 拉入**，嵌入者单依赖即得完整栈；**代价**：默认依赖树更重（tonic/rustls）——精简核心可用 `default-features = false` 自选传输；sim 测试构建一律 `default-features = false` | 嵌入者工效学优先；代价由 embedder 显式选择规避，且 tonic 类型仍被隔离在单一 crate | §3.2；上游 §4 |
 | D-ART-config | 节点配置文件格式 | **锁定 TOML**：`arachne-node --config node.toml`，字段 = 上游 §7 Profile + 覆盖项 + §5.7 `initial_cluster`；CLI 单项覆盖为辅；测试 harness 复用同一 TOML 配置面，不引入第二格式 | TOML 与 §7 配置预设表同构、可注释、diff 友好；单一格式避免"文档一处、文件一处"漂移 | §3.3；上游 §7 |
@@ -332,7 +332,7 @@ S2–S5 为待核验 API 事实：M0 第一周以最小 spike 钉死，每项附
 
 | # | 待核验项 | 默认决策（若核验不利） |
 |---|---|---|
-| S1 | `raft` 0.7.0 选举超时 RNG 是否可注入/播种 | **已锁定（D-S1）**：若核验确认不可注入，即采用 workspace `[patch.crates-io]` 携带一行 RNG 注入改动，**以上游化为目标**，补丁进 cargo-deny/vendor 审计清单跟踪；双跑门禁在补丁后全量生效。spike 只核验"是否需要补丁"，不重开"要不要补丁" |
+| S1 | `raft` 0.7.0 选举超时 RNG 是否可注入/播种 | **已锁定（D-S1）**：若核验确认不可注入，即采用 workspace `[patch.crates-io]` 携带一行 RNG 注入改动，**以上游化为目标**，补丁进 cargo-deny/vendor 审计清单跟踪；双跑门禁在补丁后全量生效。spike 只核验"是否需要补丁"，不重开"要不要补丁"。v0.2.25：raft 经 `[patch.crates-io]` 的本地补丁已替换为独立发布的 fork crate `raft-seedable` 0.7.0，双跑门禁改依赖其 `set_election_rng_seed`/`clear_election_rng_seed` hook |
 | S2 | `tokio::select!` 无 `biased;` 时分支轮询 RNG 是否可被 `rng_seed` 覆盖 | 一律 `biased;` 或禁用宏，改手写选择 |
 | S3 | tokio `Builder::rng_seed` 覆盖范围与最低版本 | 覆盖不足的熵源（如 watch 唤醒）→ 对应原语在 sim 路径替换为确定性封装 |
 | S4 | turmoil `unstable-fs` FsCorruption 能力面（撕裂写/位翻转/fsync 失败/记账） | 能力不足 → 磁盘故障全部由 FaultyStorage 台账实现（本方案默认如此设计，不依赖 sim FS 的记账，turmoil FS 仅作补充） |

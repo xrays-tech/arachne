@@ -45,9 +45,9 @@ use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne_kv::TransportFactory;
 use arachne_kv::{ArachneError, Metrics, NodeId, Profile, ProfileConfig};
 use arachne_kv_testsupport::InMemoryTransportFactory;
-use raft::eraftpb::ConfState;
-use raft::storage::MemStorage;
-use raft::{Config, RawNode};
+use raft_seedable::eraftpb::ConfState;
+use raft_seedable::storage::MemStorage;
+use raft_seedable::{Config, RawNode};
 use slog::{o, Drain, Logger};
 use tokio::time::Instant;
 

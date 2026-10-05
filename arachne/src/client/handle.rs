@@ -37,7 +37,7 @@ use crate::client::ArachneError;
 use crate::runtime::Command;
 use crate::state_machine::KvStateMachine;
 use crate::{NodeId, ProfileConfig, RaftId};
-use raft::eraftpb::ConfChangeType;
+use raft_seedable::eraftpb::ConfChangeType;
 
 /// The maximum number of client-side redirects (propsol §3.3: "default 3").
 const MAX_REDIRECTS: u32 = 3;

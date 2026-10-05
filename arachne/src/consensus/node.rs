@@ -23,12 +23,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use protobuf::Message as _;
-use raft::eraftpb::{ConfChange, ConfChangeType, ConfChangeV2, Message};
+use raft_seedable::eraftpb::{ConfChange, ConfChangeType, ConfChangeV2, Message};
 // For `RaftStorage`'s raft `Storage` impl (`initial_state` reads the applied
 // membership), which is otherwise not in scope for method resolution.
-use raft::storage::Storage as _;
-use raft::ReadOnlyOption;
-use raft::{Config as RaftConfig, RawNode};
+use raft_seedable::storage::Storage as _;
+use raft_seedable::ReadOnlyOption;
+use raft_seedable::{Config as RaftConfig, RawNode};
 use slog::Logger;
 
 use arachne_kv_seam::seam::{Transport, TransportMessage, TransportRx};
@@ -53,7 +53,7 @@ use crate::storage::WalStorage;
 pub enum NodeError<T: Transport> {
     /// An error from the raft core or the durable storage.
     #[error("{0}")]
-    Raft(raft::Error),
+    Raft(raft_seedable::Error),
     /// An error from the transport while delivering a message.
     #[error("{0}")]
     Transport(T::Error),
@@ -418,7 +418,7 @@ where
     ) -> Result<Self, NodeError<T>> {
         if self_raft_id == 0 {
             return Err(NodeError::Raft(
-                raft::Error::ConfigInvalid("node id must be non-zero".into()),
+                raft_seedable::Error::ConfigInvalid("node id must be non-zero".into()),
             ));
         }
 
@@ -907,9 +907,9 @@ where
             .merge_from_bytes(&bytes)
             .map_err(|e| NodeError::Codec(e.to_string()))?;
         raft_msg.set_from(from);
-        if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapStatus {
+        if raft_msg.get_msg_type() == raft_seedable::eraftpb::MessageType::MsgSnapStatus {
         }
-        if raft_msg.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
+        if raft_msg.get_msg_type() == raft_seedable::eraftpb::MessageType::MsgSnapshot {
             // A metadata-only snapshot in streamed mode is held back: the
             // runtime fetches the bytes, installs them, and only then steps the
             // message (with the data in place). See [`HeldSnapshot`].
@@ -1014,7 +1014,7 @@ where
     pub fn peer_progress(
         &self,
         node_id: RaftId,
-    ) -> Option<(raft::ProgressState, bool, u64, u64, u64, bool)> {
+    ) -> Option<(raft_seedable::ProgressState, bool, u64, u64, u64, bool)> {
         let status = self.raw.status();
         let progress = status.progress?.get(node_id)?;
         Some((
@@ -1239,7 +1239,7 @@ mod tests {
         block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx,
     };
     use crate::state_machine::KvStateMachine;
-    use raft::eraftpb::{Message as RaftMsg, MessageType};
+    use raft_seedable::eraftpb::{Message as RaftMsg, MessageType};
     use slog::{o, Drain};
 
     /// A no-op logger for tests (production code never reads ambient logs).
@@ -1557,7 +1557,7 @@ mod tests {
         let err = node
             .on_message(1, TransportMessage::Raft(bytes))
             .expect_err("local msg type must be rejected");
-        assert!(matches!(err, NodeError::Raft(raft::Error::StepLocalMsg)));
+        assert!(matches!(err, NodeError::Raft(raft_seedable::Error::StepLocalMsg)));
     }
 
     #[test]

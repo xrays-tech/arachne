@@ -26,7 +26,7 @@ use arachne_kv::runtime::{Runtime, RuntimeConfig, RuntimeThread};
 use arachne_kv::storage::{FsyncPolicy, Storage, WalConfig, WalOptions, WalStorage};
 use arachne_kv::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
 use arachne_kv_testsupport::InMemoryTransportFactory;
-use raft::eraftpb::ConfChangeType;
+use raft_seedable::eraftpb::ConfChangeType;
 use slog::{o, Drain, Logger};
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);

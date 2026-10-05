@@ -40,14 +40,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arachne"
-version = "0.1.0"
+name = "arachne-kv"
+version = "0.1.1"
 dependencies = [
- "arachne-seam",
+ "arachne-kv-seam",
  "futures-util",
  "libc",
  "protobuf",
- "raft",
+ "raft-seedable",
  "slog",
  "thiserror",
  "tokio",
@@ -55,7 +55,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "arachne-seam"
+name = "arachne-kv-seam"
 version = "0.1.0"
 
 [[package]]
@@ -404,7 +404,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "model-check"
 version = "0.1.0"
 dependencies = [
- "arachne",
+ "arachne-kv",
  "stateright",
 ]
 
@@ -534,10 +534,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "raft"
+name = "raft-proto"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12688b23a649902762d4c11d854d73c49c9b93138f2de16403ef9f571ad5bae"
+checksum = "fb6884896294f553e8d5cfbdb55080b9f5f2f43394afff59c9f077e0f4b46d6b"
+dependencies = [
+ "bytes",
+ "protobuf",
+ "protobuf-build",
+]
+
+[[package]]
+name = "raft-seedable"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7577ddfa37993fe36dbfbcebf604e5fcbf6f86ac8af5935ec2d4b34863749a99"
 dependencies = [
  "bytes",
  "fxhash",
@@ -550,17 +561,6 @@ dependencies = [
  "slog-stdlog",
  "slog-term",
  "thiserror",
-]
-
-[[package]]
-name = "raft-proto"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb6884896294f553e8d5cfbdb55080b9f5f2f43394afff59c9f077e0f4b46d6b"
-dependencies = [
- "bytes",
- "protobuf",
- "protobuf-build",
 ]
 
 [[package]]

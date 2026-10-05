@@ -27,12 +27,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arachne"
-version = "0.1.0"
+name = "arachne-kv"
+version = "0.1.1"
 dependencies = [
- "arachne-seam",
+ "arachne-kv-seam",
+ "futures-util",
+ "libc",
  "protobuf",
- "raft",
+ "raft-seedable",
  "slog",
  "thiserror",
  "tokio",
@@ -40,35 +42,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "arachne-l2"
-version = "0.0.0"
-dependencies = [
- "arachne",
- "arachne-seam",
- "arachne-transport-tonic",
- "async-stream",
- "http",
- "hyper",
- "hyper-util",
- "prost",
- "raft",
- "slog",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower 0.4.13",
- "turmoil",
-]
-
-[[package]]
-name = "arachne-seam"
+name = "arachne-kv-seam"
 version = "0.1.0"
 
 [[package]]
-name = "arachne-transport-tonic"
+name = "arachne-kv-transport-tonic"
 version = "0.1.0"
 dependencies = [
- "arachne-seam",
+ "arachne-kv-seam",
  "http",
  "hyper",
  "hyper-util",
@@ -81,6 +62,27 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tower 0.4.13",
+]
+
+[[package]]
+name = "arachne-l2"
+version = "0.0.0"
+dependencies = [
+ "arachne-kv",
+ "arachne-kv-seam",
+ "arachne-kv-transport-tonic",
+ "async-stream",
+ "http",
+ "hyper",
+ "hyper-util",
+ "prost",
+ "raft-seedable",
+ "slog",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.4.13",
+ "turmoil",
 ]
 
 [[package]]
@@ -1006,8 +1008,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "raft"
+name = "raft-proto"
 version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb6884896294f553e8d5cfbdb55080b9f5f2f43394afff59c9f077e0f4b46d6b"
+dependencies = [
+ "bytes",
+ "protobuf",
+ "protobuf-build",
+]
+
+[[package]]
+name = "raft-seedable"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7577ddfa37993fe36dbfbcebf604e5fcbf6f86ac8af5935ec2d4b34863749a99"
 dependencies = [
  "bytes",
  "fxhash",
@@ -1020,17 +1035,6 @@ dependencies = [
  "slog-stdlog",
  "slog-term",
  "thiserror",
-]
-
-[[package]]
-name = "raft-proto"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb6884896294f553e8d5cfbdb55080b9f5f2f43394afff59c9f077e0f4b46d6b"
-dependencies = [
- "bytes",
- "protobuf",
- "protobuf-build",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ use arachne_kv_testsupport::{
     InMemoryTransportFactory, InMemoryTx, Invariant, KvState, Op, OpResult, OracleErrorKind,
     SeqNo, ValueId,
 };
-use raft::{clear_election_rng_seed, set_election_rng_seed};
+use raft_seedable::{clear_election_rng_seed, set_election_rng_seed};
 use slog::{o, Drain, Logger};
 
 type TestNode = RaftNode<WalStorage, InMemoryTx, InMemoryRx>;

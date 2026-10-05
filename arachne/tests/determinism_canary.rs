@@ -8,7 +8,7 @@
 //!
 //! This canary is the *gate* for the D-S1 `[patch.crates-io]` RNG hook
 //! (`third_party/raft/ARACHNE-PATCH.md`): it proves that, once a seed is set
-//! via `raft::set_election_rng_seed`, a fixed schedule of rounds over a 3-node
+//! via `raft_seedable::set_election_rng_seed`, a fixed schedule of rounds over a 3-node
 //! cluster reproduces **exactly**, run after run. It is the smallest thing that
 //! would fail if the election RNG were not injectable.
 //!
@@ -42,9 +42,9 @@ use arachne_kv::state_machine::KvStateMachine;
 use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
 use arachne_kv::{NodeId, RaftId, StateMachine, TransportFactory, TransportMessage};
 use arachne_kv_testsupport::{block_on, InMemoryRx, InMemoryTransportFactory, InMemoryTx};
-use raft::prelude::{ConfState, Config, Raft};
-use raft::storage::MemStorage;
-use raft::{clear_election_rng_seed, set_election_rng_seed};
+use raft_seedable::prelude::{ConfState, Config, Raft};
+use raft_seedable::storage::MemStorage;
+use raft_seedable::{clear_election_rng_seed, set_election_rng_seed};
 use slog::{o, Drain, Logger};
 
 type TestNode = RaftNode<WalStorage, InMemoryTx, InMemoryRx>;

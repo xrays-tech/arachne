@@ -1,7 +1,11 @@
 [package]
 name = "arachne-kv"
 description = "Arachne: transport-agnostic product core (consensus, WAL storage, KV state machine)"
-version.workspace = true
+# 0.1.1: switches the consensus dependency from registry `raft` 0.7 to the
+# Arachne-maintained fork crate `raft-seedable` (see `raft-seedable` dep below).
+# 0.1.0 depended on the plain registry crate; this version is the first released
+# artifact built against `raft-seedable`.
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -25,9 +29,13 @@ fault-injection = []
 # so it adds nothing to the dependency tree beyond itself.
 arachne-kv-seam = { workspace = true }
 
-# The raft consensus library. `raft` 0.7 is the pinned version for the
-# consensus core (P4a). It pulls in `protobuf` for message serialization.
-raft = "0.7"
+# The raft consensus library. This is `raft-seedable` 0.7: the Arachne-maintained
+# fork crate of the registry `raft` 0.7 that carries one added API — the
+# D-S1 seedable election-RNG hooks `set_election_rng_seed` /
+# `clear_election_rng_seed` (thread-local, no seed set => byte-for-byte
+# equivalent to upstream raft 0.7, so no behavior change for unseeded runs).
+# It pulls in `protobuf` for message serialization (unchanged from raft 0.7).
+raft-seedable = "0.7"
 slog = "2"
 thiserror = "1"
 protobuf = "2"
@@ -82,5 +90,5 @@ libc = "0.2"
         # *state* (here the default `()`, trivially `Clone`/`Send`), not the body.
         axum = "0.7"
         # NOTE: integration tests (`tests/`) are part of this package and can therefore
-        # use the normal `[dependencies]` directly (`slog`, `raft`, ...). No extra
-        # dev-dependency entries are needed for those.
+        # use the normal `[dependencies]` directly (`slog`, `raft-seedable`, ...).
+        # No extra dev-dependency entries are needed for those.

@@ -51,18 +51,17 @@ async-stream = "0.3"
 tokio-stream = "0.1"
 # The node runtime actor is driven by a `slog::Logger`.
 slog = "2"
-# The raft consensus library — needed directly only for the stage-2 hook
-# `raft::set_election_rng_seed`, which seeds the election-timeout RNG so the
-# election is deterministic under a fixed seed.
-raft = "0.7"
+# The raft consensus library — needed directly only for the D-S1 hook
+# `raft-seedable::set_election_rng_seed`, which seeds the election-timeout
+# RNG so the election is deterministic under a fixed seed. This matches the
+# fork crate the core depends on, so the seed lands in the same crate's
+# thread-local RNG the node uses.
+raft-seedable = "0.7"
 
 # Standalone workspace root (keeps `l2/` out of the root Arachne workspace).
 [workspace]
 
-# l2 is its OWN workspace, so it needs its OWN copy of the root's raft patch:
-# `[patch]` does not propagate through path dependencies. Without this, l2 would
-# resolve `raft` to crates.io's 0.7 (which lacks `set_election_rng_seed`) and the
-# harness could not seed the election RNG. This points at the same vendored copy
-# the root workspace patches to.
-[patch.crates-io]
-raft = { path = "../third_party/raft" }
+# (In the published form, no `[patch.crates-io]` is needed here: `raft-seedable`
+# is a real registry crate with the hook baked in, so the standalone harness
+# resolves it directly and must match the version the core resolves to, so the
+# seed lands in one crate.)

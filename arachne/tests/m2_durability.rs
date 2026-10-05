@@ -44,7 +44,7 @@ use arachne_kv_testsupport::{
     InMemoryTx, TransportError,
 };
 use protobuf::Message as _;
-use raft::eraftpb::{Entry, Message as RaftMessage, MessageType};
+use raft_seedable::eraftpb::{Entry, Message as RaftMessage, MessageType};
 use slog::{o, Drain, Logger};
 
 /// A node whose storage has faults injected and whose outbound messages are
