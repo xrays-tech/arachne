@@ -5,7 +5,11 @@ description = "Arachne: transport-agnostic product core (consensus, WAL storage,
 # Arachne-maintained fork crate `raft-seedable` (see `raft-seedable` dep below).
 # 0.1.0 depended on the plain registry crate; this version is the first released
 # artifact built against `raft-seedable`.
-version = "0.1.1"
+# 0.1.2: library-level remote forwarding (Forward RPC) + fixes — follower nodes'
+#   Handles transparently forward commands to the leader over tonic; peerless
+#   `Arachne::start` no longer requires an ambient tokio runtime; new leaders
+#   self-report in `leader_hint()` immediately.
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
