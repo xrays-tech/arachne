@@ -860,6 +860,16 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         if let Some(task) = self.apply_task.take() {
             tokio::spawn(task.run());
         }
+        // 4.2: start the per-node outbound sender task. It drains the per-peer
+        // bounded queues the actor's commit path enqueues into, so the actor
+        // tick never `await`s a per-peer send inline (which serialises every
+        // heartbeat/replication message behind the slowest peer on the tonic
+        // edge). The task is spawned on this runtime (the node's), and captures
+        // owned clones of `transport`/`peers`/queue/counter — it never borrows
+        // `self.node`, so it coexists with the actor's `&mut self.node` usage.
+        // Raw-`#[test]` harnesses (which have no persistent runtime) never call
+        // this path, so the node's fallback inline-send gate keeps them working.
+        self.node.start_outbound_sender();
         loop {
             let outcome = tokio::select! {
                 biased;
