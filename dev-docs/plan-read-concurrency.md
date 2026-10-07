@@ -76,7 +76,7 @@ updated: 2026-10-07
 - [x] 3.0 前置绿门：2.0 INV14 sim 在改动前全绿（已随 Phase-2 落地，重复确认通过）
 - [ ] 3.1 (TDD) 重设计实现 cohort 屏障 → **NOT DONE — A 按 §3.5 证伪标准判定预证伪，见下方证伪结论**；不实现，避免高风险 INV14 敏感读路径重写验证已知先验
 - [ ] 3.2 (TDD) 重试/超时 cohort 语义 → **NOT DONE — 依赖 A，随 A 一并证伪关闭**
-- [x] 3.3 (TDD) E 簿记：token 匹配改 `HashMap`、`Option<NonZeroU64>` token（消除 `token:0` 占位脆弱性）、去 `pending_reads` 每轮 drain/重分配 → commit（见 Notes），**声明范围 = token 脆弱性修复 + 高 pending 尾部风险（O(pending²)），非基准性能**
+- [x] 3.3 (TDD) E 簿记：`Option<NonZeroU64>` token（消除 `token:0` 占位脆弱性 + 删冗余 `read_index_issued`）、`next_read_token` 起于 1、read_states 直接按 `Option<NonZeroU64>` 匹配 → commit `bca9412`，**声明范围 = token 脆弱性修复 + 高 pending 尾部风险（O(pending²)），非基准性能**；`cargo test -p arachne-kv` 全绿（含 INV14）
 - [x] 3.4 回归：INV14 绿 + workspace/l2/model-check/fuzz + 编译（随 E 执行）
 - [ ] 3.5 bench A/B 证伪 → **以预注册标准 + 已有证据判定 A 无操作（不跑 A/B——A 未实现，判据由基线 §7 + Phase-2 机制表 + 上限核算闭合）**
 - [ ] 3.6 cohort 指标（released-per-round、attach rate）→ **NOT DONE — YAGNI，A 证伪后无需新增指标；`read_index_rounds_total` 语义不变（E 为内部重构）**
