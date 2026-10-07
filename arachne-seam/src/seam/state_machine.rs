@@ -31,35 +31,37 @@ pub enum ApplyOutcome {
 ///   session table), so a node can be rebuilt from a snapshot and then replay
 ///   the log from `applied_index`.
 ///
-/// The trait is `Send` (not `Sync`): a state machine is owned and mutated by a
-/// single apply task.
-pub trait StateMachine: Send + 'static {
-    /// The error type reported by this state machine.
-    type Error: core::error::Error + Send + Sync + 'static;
+ /// The trait is `Send + Sync`: the state machine is *shared* (owned by the
+ /// apply task but read by the read path across tasks) — its data is wrapped
+ /// in an `Arc<RwLock<_>>` so the read path can take a read lock while the
+ /// apply task holds the write lock.
+ pub trait StateMachine: Send + Sync + 'static {
+     /// The error type reported by this state machine.
+     type Error: core::error::Error + Send + Sync + 'static;
 
-    /// Apply the committed `command` at `index`.
-    ///
-    /// MUST be deterministic and MUST NOT read the clock or any ambient state.
-    ///
-    /// # Error semantics (fail-stop)
-    ///
-    /// An `Err` from `apply` signals a **state-machine invariant violation** —
-    /// the machine's state and the log have diverged in a way that cannot be
-    /// repaired by retrying. The caller MUST **fail-stop** (abort the node); it
-    /// must never retry the entry or degrade to a fallback. Re-application is
-    /// undefined because the machine is already inconsistent.
-    fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error>;
+     /// Apply the committed `command` at `index`.
+     ///
+     /// MUST be deterministic and MUST NOT read the clock or any ambient state.
+     ///
+     /// # Error semantics (fail-stop)
+     ///
+     /// An `Err` from `apply` signals a **state-machine invariant violation** —
+     /// the machine's state and the log have diverged in a way that cannot be
+     /// repaired by retrying. The caller MUST **fail-stop** (abort the node); it
+     /// must never retry the entry or degrade to a fallback. Re-application is
+     /// undefined because the machine is already inconsistent.
+     fn apply(&self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error>;
 
-    /// Read the value for `key` from the applied state, if present.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+     /// Read the value for `key` from the applied state, if present.
+     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Produce an atomic, consistent snapshot of ALL state, including any
-    /// idempotency session table.
-    fn snapshot(&self) -> Result<Vec<u8>, Self::Error>;
+     /// Produce an atomic, consistent snapshot of ALL state, including any
+     /// idempotency session table.
+     fn snapshot(&self) -> Result<Vec<u8>, Self::Error>;
 
-    /// Restore state from a byte string produced by [`snapshot`](StateMachine::snapshot).
-    fn restore(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+     /// Restore state from a byte string produced by [`snapshot`](StateMachine::snapshot).
+     fn restore(&self, bytes: &[u8]) -> Result<(), Self::Error>;
 
-    /// The highest log index applied so far (0 if none).
-    fn applied_index(&self) -> LogIndex;
-}
+     /// The highest log index applied so far (0 if none).
+     fn applied_index(&self) -> LogIndex;
+ }

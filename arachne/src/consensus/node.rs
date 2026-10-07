@@ -20,7 +20,10 @@
 //! state and no second cache that could diverge.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use protobuf::Message as _;
 use raft_seedable::eraftpb::{ConfChange, ConfChangeType, ConfChangeV2, Message};
@@ -177,6 +180,12 @@ impl<T: Transport, Tr: TransportRx> RaftNode<WalStorage, T, Tr> {
 /// able to take a `Ready` for a ReadIndex round, or reads would queue behind
 /// durability again (propsol v0.2.13 P).
 const MAX_IN_FLIGHT_READIES: usize = 8;
+
+/// Per-peer outbound queue depth cap (4.2). Bounded per peer so a slow peer's
+/// backlog cannot grow without limit (raft retransmits dropped messages on a
+/// later tick). Kept small: a full queue means the peer is falling behind and
+/// we prefer to drop (and retransmit) over holding unbounded memory.
+const OUTBOUND_QUEUE_DEPTH: usize = 32;
 
 /// A cycle whose records are written, waiting for durability (propsol P).
 struct PendingPersist {
@@ -350,16 +359,48 @@ where
     snapshot_from: Option<RaftId>,
     /// A streamed snapshot message waiting for its bytes (rev T, T2b).
     held_snapshot: Option<HeldSnapshot>,
-    /// Outbound raft messages dropped because their transport `send` failed.
-    /// A failed send is non-fatal (raft retransmits on a later tick), so it is
-    /// counted — not surfaced — making a permanently dead transport visible as
-    /// a rising gauge instead of a silent liveness loss (P4 gate, propsol §8).
-    dropped_sends: u64,
+    /// Outbound raft messages dropped because their transport `send` failed **or
+    /// because the per-peer queue was full** (4.2). A dropped send is non-fatal
+    /// (raft retransmits on a later tick), so it is counted — not surfaced —
+    /// making a permanently dead transport *or* an overloaded one visible as a
+    /// rising gauge instead of a silent liveness loss (P4 gate, propsol §8).
+    /// `Arc` so the background sender task (which owns the queue) and the actor
+    /// share the same counter.
+    dropped_sends: Arc<AtomicU64>,
+    /// Per-peer bounded outbound queues (4.2). Each peer gets its own
+    /// `VecDeque<Message>` (per-peer FIFO, raft invariant I2). The actor
+    /// enqueues messages non-blockingly ([`enqueue_outbound`]); a single background
+    /// sender task ([`start_outbound_sender`]) drains each peer's FIFO sequentially
+    /// and concurrently across peers. Depth per peer is capped at
+    /// [`OUTBOUND_QUEUE_DEPTH`]; when a queue is full, the excess message is
+    /// dropped and counted in [`Self::dropped_send_count`].
+    outbound: Arc<Mutex<HashMap<RaftId, VecDeque<Message>>>>,
+    /// Background task that drains the per-peer outbound queues. `None` when no
+    /// sender task is running (raw `#[test]` harness, or before
+    /// [`start_outbound_sender`). The actor's fallback path
+    /// ([`deliver_grouped`]/[`deliver`]) is used when this is `None`.
+    outbound_sender: Option<JoinHandle<()>>,
+    /// Send-half of the stop channel. Dropping it closes the receiver in the
+    /// sender task ([`run_outbound_sender`]), so that task exits when the node is
+    /// dropped — no leaked task, even on hard shutdown.
+    outbound_stop: Option<mpsc::UnboundedSender<()>>,
+    /// Send-half of the **drain-wake** channel. The actor signals it (via
+    /// [`enqueue_outbound`]) whenever it enqueues a message, so the sender task
+    /// wakes and drains the per-peer FIFOs instead of polling. Dropping the
+    /// node (with this half) is not the task's wake; the task is woken only by
+    /// the drain-wake signal or by the stop channel closing.
+    outbound_drain: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl<S, T, Tr> RaftNode<S, T, Tr>
 where
     S: SeamStorage,
+    // NOTE (4.2): only `start_outbound_sender` needs `T: Clone` (it holds a
+    // clone of the outbound transport half for the background sender task); the
+    // core `tick`/`step`/`propose`/read paths and `enqueue_outbound` are
+    // `T: Transport` only, so non-`Clone` test transports (e.g. `RecordingTx`)
+    // keep compiling. `start_outbound_sender` therefore lives in its own
+    // `impl` block below with the narrower `+ Clone` bound.
     T: Transport,
     Tr: TransportRx,
 {
@@ -487,7 +528,11 @@ where
             peers,
             snapshot_from: None,
             held_snapshot: None,
-            dropped_sends: 0,
+            dropped_sends: Arc::new(AtomicU64::new(0)),
+            outbound: Arc::new(Mutex::new(HashMap::new())),
+            outbound_sender: None,
+            outbound_stop: None,
+            outbound_drain: None,
         })
     }
 
@@ -626,10 +671,17 @@ where
         // ReadIndex round from queueing behind the device. A follower's
         // messages are all "persisted messages" and wait below.
         if offloaded {
-            // C1: deliver the fast-path immediate batch grouped by peer — in
-            // order within each peer, concurrently across peers. The batch is
-            // taken so the queued cycle below carries an empty `immediate`.
-            self.deliver_grouped(std::mem::take(&mut immediate)).await;
+            // C1/4.2: deliver the fast-path immediate batch. When the outbound
+            // sender task is running, enqueue non-blockingly (it drains each
+            // peer's FIFO in order, concurrently across peers); otherwise fall
+            // back to the synchronous grouped delivery (raw `#[test]` harness,
+            // or any context without a persistent runtime). The batch is taken
+            // so the queued cycle below carries an empty `immediate`.
+            if self.outbound_sender.is_some() {
+                self.enqueue_outbound(std::mem::take(&mut immediate));
+            } else {
+                self.deliver_grouped(std::mem::take(&mut immediate)).await;
+            }
         }
         self.pending.push_back(PendingPersist {
             number,
@@ -698,11 +750,22 @@ where
         #[cfg(feature = "fault-injection")]
         crate::fault_injection::check(crate::fault_injection::Stage::AfterPersist);
 
-        for msg in &pending.immediate {
-            self.deliver(msg).await;
-        }
-        for msg in &pending.persisted {
-            self.deliver(msg).await;
+        // 4.2: when the outbound sender task is running, hand the messages to
+        // its per-peer bounded queues (non-blocking, FIFO preserved by the
+        // task); otherwise fall back to the synchronous per-message delivery
+        // (raw `#[test]` harness, or any context without a persistent runtime).
+        // `immediate` precedes `persisted` in the per-peer FIFO to match the
+        // synchronous ordering (raft requires per-peer FIFO).
+        if self.outbound_sender.is_some() {
+            self.enqueue_outbound(pending.immediate.iter().cloned());
+            self.enqueue_outbound(pending.persisted.iter().cloned());
+        } else {
+            for msg in &pending.immediate {
+                self.deliver(msg).await;
+            }
+            for msg in &pending.persisted {
+                self.deliver(msg).await;
+            }
         }
 
         let mut committed = pending.committed;
@@ -949,7 +1012,7 @@ where
     /// rising count rather than a silent liveness loss; the node runtime
     /// exposes it as the `arachne_dropped_sends` metric.
     pub fn dropped_send_count(&self) -> u64 {
-        self.dropped_sends
+        self.dropped_sends.load(Ordering::Relaxed)
     }
 
     /// The current **in-memory** hard state (term, vote, commit).
@@ -1132,7 +1195,7 @@ where
         let self_id = self.raw.raft.id;
         let outcome = send_one(&self.transport, &self.peers, self_id, msg).await;
         if outcome.is_err() {
-            self.dropped_sends += 1;
+            self.dropped_sends.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1167,7 +1230,233 @@ where
         .await
         .into_iter()
         .sum();
-        self.dropped_sends += dropped;
+        self.dropped_sends.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Enqueue outgoing raft messages on the per-peer bounded queues (4.2).
+    ///
+    /// **Non-blocking**: the actor appends to each peer's `VecDeque` and, if the
+    /// queue is at [`OUTBOUND_QUEUE_DEPTH`], the excess messages are dropped and
+    /// counted in [`Self::dropped_send_count`] (raft retransmits on a later
+    /// tick). Local messages (`to == self_id`) and messages for peers not yet in
+    /// the membership are skipped (the same semantics as [`Self::send_one`]).
+    ///
+    /// The messages are owned `Message`s (the caller must have moved them out of
+    /// the `Ready`).
+    pub fn enqueue_outbound(&self, messages: impl IntoIterator<Item = Message>) {
+        let self_id = self.raw.raft.id;
+        let mut dropped = 0u64;
+        let mut enqueued = false;
+        for msg in messages {
+            let to = msg.get_to();
+            if to == self_id {
+                continue;
+            }
+            if !self.peers.contains_key(&to) {
+                // Peer not yet in membership: raft re-sends on the next tick.
+                dropped += 1;
+                continue;
+            }
+            let mut guard = match self.outbound.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    // Poisoned lock means another task panicked while holding it
+                    // (should not happen: enqueuing never awaits). Count and move
+                    // on.
+                    dropped += 1;
+                    continue;
+                }
+            };
+            let queue = guard.entry(to).or_insert_with(VecDeque::new);
+            if queue.len() >= OUTBOUND_QUEUE_DEPTH {
+                // Queue full: drop this message (raft retransmits on a later
+                // tick) and count it.
+                dropped += 1;
+                continue;
+            }
+            queue.push_back(msg);
+            enqueued = true;
+        }
+        if dropped > 0 {
+            self.dropped_sends.fetch_add(dropped, Ordering::Relaxed);
+        }
+        if enqueued {
+            if let Some(tx) = &self.outbound_drain {
+                // One wake signal per enqueue batch (not per message): the task
+                // drains every peer's FIFO on each wake, coalescing the whole
+                // batch. The channel is unbounded, so a burst of enqueues simply
+                // queues multiple wake signals — harmless (extra wakes find an
+                // empty queue and bail out quickly).
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// `T: Clone` outbound-sender construction (4.2). This is the **only** method
+/// that needs the transport clonable (it hands a clone to the background
+/// sender task); the core read/write/`enqueue_outbound` paths are
+/// `T: Transport` only, so non-`Clone` test transports (e.g. `RecordingTx`)
+/// keep compiling.
+impl<S, T, Tr> RaftNode<S, T, Tr>
+where
+    S: SeamStorage,
+    T: Transport + Clone,
+    Tr: TransportRx,
+{
+    /// Start the background sender task that drains the per-peer outbound
+    /// queues (4.2). Idempotent: a second call is a no-op (the raw `#[test]`
+    /// harnesses and any context without a persistent tokio runtime rely on the
+    /// `outbound_sender.is_some()` gate to use the synchronous fallback).
+    ///
+    /// Must be called from within a tokio runtime (the node's runtime, per
+    /// `Runtime::run`). The task captures owned clones of `transport`, `peers`,
+    /// the queue, the drop counter and the peer id — it never borrows `self`,
+    /// so it can coexist with the actor loop's `&mut self` usage.
+    pub fn start_outbound_sender(&mut self) {
+        if self.outbound_sender.is_some() {
+            return;
+        }
+        let transport = self.transport.clone();
+        let peers = self.peers.clone();
+        let dropped = Arc::clone(&self.dropped_sends);
+        let outbound = Arc::clone(&self.outbound);
+        let (stop_tx, stop_rx) = mpsc::unbounded_channel::<()>();
+        let (drain_tx, drain_rx) = mpsc::unbounded_channel::<()>();
+        self.outbound_stop = Some(stop_tx);
+        self.outbound_drain = Some(drain_tx);
+        self.outbound_sender = Some(tokio::spawn(async move {
+            run_outbound_sender(
+                transport,
+                peers,
+                dropped,
+                outbound,
+                stop_rx,
+                drain_rx,
+            )
+                .await;
+        }));
+    }
+}
+
+/// Body of the per-node outbound sender task (4.2).
+///
+/// It captures **owned** values — never borrows the node — so it runs on the
+/// node's runtime in parallel with the actor loop's `&mut self` usage:
+///
+/// * `transport` — a clone of the node's outbound transport half, used to
+///   deliver drained messages;
+    /// * `peers` — a clone of the raft-id → `NodeId` map for outbound resolution;
+    /// * `dropped` — the shared drop counter (also owned by the node);
+/// * `outbound` — the shared per-peer FIFO queues (an `Arc` owned here and by
+///   the node);
+/// * `stop_rx` — the stop channel; when the node is dropped its send-half is
+///   dropped and this receiver closes, terminating the loop;
+/// * `drain_rx` — the drain-wake channel; the node signals it on each enqueue
+///   batch so this task wakes and drains (rather than polling).
+///
+/// Each wake drains **every** peer's FIFO to zero and sends each peer's
+/// messages sequentially (per-peer FIFO, raft invariant I2), polling the peers
+/// together (concurrent across peers, C1). A failed `send` is counted in
+/// `dropped` (raft retransmits on a later tick).
+async fn run_outbound_sender<T: Transport>(
+    transport: T,
+    peers: HashMap<RaftId, NodeId>,
+    dropped: Arc<AtomicU64>,
+    outbound: Arc<Mutex<HashMap<RaftId, VecDeque<Message>>>>,
+    mut stop_rx: mpsc::UnboundedReceiver<()>,
+    mut drain_rx: mpsc::UnboundedReceiver<()>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop_rx.recv() => {
+                // Stop channel closed (node dropped) — exit.
+                break;
+            }
+            _ = drain_rx.recv() => {
+                // Wake (a node enqueue): drain every peer's FIFO to zero, then
+                // send.
+                let by_peer: Vec<(RaftId, Vec<Message>)> = {
+                    let mut guard = match outbound.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            // Poisoned lock (a previous drain panicked). Give up
+                            // rather than spin; the node's fallback path will
+                            // keep delivering.
+                            return;
+                        }
+                    };
+                    let mut result = Vec::new();
+                    for (peer, queue) in guard.iter_mut() {
+                        if queue.is_empty() {
+                            continue;
+                        }
+                        let mut msgs = Vec::with_capacity(queue.len());
+                        while let Some(m) = queue.pop_front() {
+                            msgs.push(m);
+                        }
+                        if !msgs.is_empty() {
+                            result.push((*peer, msgs));
+                        }
+                    }
+                    drop(guard);
+                    result
+                };
+
+                if by_peer.is_empty() {
+                    // Nothing to send (stale wake): fall through to the next
+                    // select iteration.
+                    continue;
+                }
+
+                // Send each peer's FIFO sequentially; poll the peers together so
+                // their I/O overlaps (concurrent across peers, C1). Each future
+                // borrows `peers`, `transport`, and `dropped` (local to this task
+                // and outliving `futures`), so the shared `T: Transport` is sent
+                // on concurrently without moving it into N futures.
+                let futures: Vec<_> = by_peer
+                    .into_iter()
+                    .map(|(peer, msgs)| {
+                        let peers = &peers;
+                        let transport = &transport;
+                        let dropped = &dropped;
+                        async move {
+                            let node_id = peers.get(&peer).cloned();
+                            match node_id {
+                                Some(node_id) => {
+                                    for msg in msgs {
+                                        let bytes = msg
+                                            .write_to_bytes()
+                                            .unwrap_or_default();
+                                        if transport
+                                            .send(
+                                                node_id.clone(),
+                                                TransportMessage::Raft(bytes),
+                                            )
+                                            .await
+                                            .is_err()
+                                        {
+                                            dropped.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Peer removed from membership since
+                                    // enqueuing: the drained messages are already
+                                    // popped (dropped) — count them; raft
+                                    // retransmits on a later tick if the peer is
+                                    // still expected.
+                                    dropped.fetch_add(msgs.len() as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+
+                futures_util::future::join_all(futures).await;
+            }
+        }
     }
 }
 

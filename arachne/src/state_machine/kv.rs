@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
+use std::sync::{Arc, RwLock};
 
 use arachne_kv_seam::seam::{ApplyOutcome, StateMachine};
 use arachne_kv_seam::types::LogIndex;
@@ -33,6 +34,10 @@ pub enum KvError {
     /// Index ordering violation (the entry is not `applied_index + 1`).
     #[error("index ordering violation at {index}")]
     IndexViolation { index: LogIndex },
+    /// The store lock is poisoned (a thread panicked while holding it).
+    /// Unrecoverable — fail-stop.
+    #[error("state machine store lock poisoned")]
+    PoisonedLock,
 }
 
 /// Command opcodes (part of the wire format; fixed).
@@ -63,22 +68,43 @@ struct SessionKey {
 }
 
 /// The in-memory KV + session-table state machine.
+///
+/// `Clone` is cheap (clones the `Arc<RwLock<Store>>` reference, not the data)
+/// so the machine can be shared across tasks (apply task + read path).
+#[derive(Clone)]
 pub struct KvStateMachine {
+    /// Single lock over the store (map + sessions + version) — D-Arc. A writer
+    /// holds the write lock and mutates the maps FIRST, then bumps `applied`
+    /// LAST; a reader holds the read lock and reads `applied` FIRST, then the
+    /// map (D-Ord). The `Arc` makes the machine shareable across tasks.
+    store: Arc<RwLock<Store>>,
+}
+
+/// The data guarded by the state machine's single lock.
+struct Store {
+    /// Monotonic applied-version. Must be bumped *after* the maps mutate
+    /// (D-Ord) so a reader never sees `version >= C` with entry `C` missing.
+    applied: LogIndex,
     kv: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Session table: `(client_id, seq_no)` → the cached apply result.
     sessions: BTreeMap<SessionKey, ApplyOutcome>,
-    applied: LogIndex,
 }
 
 impl KvStateMachine {
     /// Create a fresh, empty state machine.
     pub fn new() -> Self {
         Self {
-            kv: BTreeMap::new(),
-            sessions: BTreeMap::new(),
-            applied: 0,
+            store: Arc::new(RwLock::new(Store {
+                applied: 0,
+                kv: BTreeMap::new(),
+                sessions: BTreeMap::new(),
+            })),
         }
     }
+
+    // Lock access is inlined per method below (no generic helper): a poisoned
+    // lock means a thread panicked holding it, so the only correct response is
+    // to fail-stop, which the `?`/`.expect` below express directly.
 
     // ---- command codec ----------------------------------------------------
 
@@ -227,7 +253,11 @@ impl KvStateMachine {
 
     /// How many sessions the table holds (propsol §8 `session_count`).
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        let guard = self
+            .store
+            .read()
+            .expect("state machine read lock should never be poisoned");
+        guard.sessions.len()
     }
 
     /// Whether the session `(client_id, seq_no)` has been applied, i.e. its
@@ -239,8 +269,24 @@ impl KvStateMachine {
     /// A replayed (deduped) session is reported as applied as soon as it was
     /// first applied, which is exactly the semantics a waiting caller wants.
     pub fn applied_session(&self, client_id: u64, seq_no: u64) -> bool {
-        self.sessions
-            .contains_key(&SessionKey { client_id, seq_no })
+        let guard = self
+            .store
+            .read()
+            .expect("state machine read lock should never be poisoned");
+        guard.sessions.contains_key(&SessionKey { client_id, seq_no })
+    }
+
+    /// Read the applied version and the kv map under a *single* read lock,
+    /// returning a coherent copy. This is the D-Arc invariant in one shot: the
+    /// version and the map are always observed together (no torn read). The
+    /// torn-read TDD test asserts the linear invariant on this atomic snapshot.
+    #[cfg(test)]
+    fn read_store_copy(&self) -> (LogIndex, BTreeMap<Vec<u8>, Vec<u8>>) {
+        let guard = self
+            .store
+            .read()
+            .expect("state machine read lock should never be poisoned");
+        (guard.applied, guard.kv.clone())
     }
 }
 
@@ -253,26 +299,33 @@ impl Default for KvStateMachine {
 impl StateMachine for KvStateMachine {
     type Error = KvError;
 
-    fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error> {
+    fn apply(&self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error> {
+        // The write lock is held for the whole apply. We mutate the maps FIRST
+        // and bump `applied` LAST (D-Ord), so a reader never sees `version >= C`
+        // with entry `C` missing.
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| KvError::PoisonedLock)?;
         // Strict ordering: an entry must be exactly `applied + 1` (a duplicate
         // or a gap is an invariant violation => fail-stop).
-        if index != self.applied + 1 {
+        if index != guard.applied + 1 {
             return Err(KvError::IndexViolation { index });
         }
 
         // A no-op entry (empty payload) is how a leader records its term; it
         // advances the index but changes no state.
         if command.is_empty() {
-            self.applied = index;
+            guard.applied = index;
             return Ok(ApplyOutcome::None);
         }
 
         if command.first() == Some(&OP_SESSION_GC) {
             let sessions = Self::parse_session_gc(command)?;
             for session in sessions {
-                self.sessions.remove(&session);
+                guard.sessions.remove(&session);
             }
-            self.applied = index;
+            guard.applied = index;
             return Ok(ApplyOutcome::None);
         }
 
@@ -280,46 +333,61 @@ impl StateMachine for KvStateMachine {
 
         // Idempotency: a replayed session returns its cached result without
         // re-mutating the store.
-        let outcome = match self.sessions.get(&session) {
+        let outcome = match guard.sessions.get(&session) {
             Some(cached) => cached.clone(),
             None => {
                 let outcome = match op {
                     Op::Put => {
-                        self.kv.insert(key.clone(), val.clone());
+                        guard.kv.insert(key.clone(), val.clone());
                         ApplyOutcome::Value(val)
                     }
                     Op::Delete => {
-                        self.kv.remove(&key);
+                        guard.kv.remove(&key);
                         ApplyOutcome::None
                     }
                 };
-                self.sessions.insert(session, outcome.clone());
+                guard.sessions.insert(session, outcome.clone());
                 outcome
             }
         };
 
-        self.applied = index;
+        // Version is bumped LAST (D-Ord).
+        guard.applied = index;
         Ok(outcome)
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self.kv.get(key).cloned())
+        // Read lock; the version and the map are read atomically (D-Arc/D-Ord).
+        // The version is read before the map, so a reader never sees a map entry
+        // from a future version.
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| KvError::PoisonedLock)?;
+        // Read the version (D-Arc: version-first) then the map, atomically.
+        let _version = guard.applied;
+        Ok(guard.kv.get(key).cloned())
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        // Read lock; the version and the maps are read atomically (D-Arc/D-Ord).
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| KvError::PoisonedLock)?;
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.applied.to_le_bytes());
+        buf.extend_from_slice(&guard.applied.to_le_bytes());
 
-        buf.extend_from_slice(&(self.kv.len() as u32).to_le_bytes());
-        for (k, v) in &self.kv {
+        buf.extend_from_slice(&(guard.kv.len() as u32).to_le_bytes());
+        for (k, v) in &guard.kv {
             buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
             buf.extend_from_slice(k);
             buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
             buf.extend_from_slice(v);
         }
 
-        buf.extend_from_slice(&(self.sessions.len() as u32).to_le_bytes());
-        for (session, outcome) in &self.sessions {
+        buf.extend_from_slice(&(guard.sessions.len() as u32).to_le_bytes());
+        for (session, outcome) in &guard.sessions {
             buf.extend_from_slice(&session.client_id.to_le_bytes());
             buf.extend_from_slice(&session.seq_no.to_le_bytes());
             match outcome {
@@ -334,48 +402,30 @@ impl StateMachine for KvStateMachine {
         Ok(buf)
     }
 
-    fn restore(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        let mut cursor = Cursor::new(bytes);
-        self.applied = read_u64(&mut cursor)?;
-
-        let kv_len = read_u32(&mut cursor)? as usize;
-        self.kv.clear();
-        for _ in 0..kv_len {
-            let klen = read_u32(&mut cursor)? as usize;
-            let key = read_bytes(&mut cursor, klen)?;
-            let vlen = read_u32(&mut cursor)? as usize;
-            let val = read_bytes(&mut cursor, vlen)?;
-            self.kv.insert(key, val);
-        }
-
-        let sess_len = read_u32(&mut cursor)? as usize;
-        self.sessions.clear();
-        for _ in 0..sess_len {
-            let client_id = read_u64(&mut cursor)?;
-            let seq_no = read_u64(&mut cursor)?;
-            let tag = read_u8(&mut cursor)?;
-            let outcome = match tag {
-                0 => ApplyOutcome::None,
-                1 => {
-                    let vlen = read_u32(&mut cursor)? as usize;
-                    let val = read_bytes(&mut cursor, vlen)?;
-                    ApplyOutcome::Value(val)
-                }
-                _ => return Err(KvError::MalformedSnapshot),
-            };
-            self.sessions
-                .insert(SessionKey { client_id, seq_no }, outcome);
-        }
-
-        // A well-formed snapshot has no trailing bytes.
-        if cursor.position() != bytes.len() as u64 {
-            return Err(KvError::MalformedSnapshot);
+    fn restore(&self, bytes: &[u8]) -> Result<(), Self::Error> {
+        // The parse is done *outside* the write lock (2.4): a large snapshot's
+        // decode cost never blocks concurrent reads. The write lock is then
+        // held only for the swap of the fully-decoded Store, bounding the
+        // critical section to the assignment rather than the decode. `bytes`
+        // is fully validated before any mutation, so a malformed snapshot is
+        // rejected without touching state (fail-stop, no partial restore).
+        let next = decode_store(bytes)?;
+        {
+            let mut guard = self
+                .store
+                .write()
+                .map_err(|_| KvError::PoisonedLock)?;
+            *guard = next;
         }
         Ok(())
     }
 
     fn applied_index(&self) -> LogIndex {
-        self.applied
+        let guard = self
+            .store
+            .read()
+            .expect("state machine read lock should never be poisoned");
+        guard.applied
     }
 }
 
@@ -415,6 +465,51 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<Vec<u8>, KvError
         .read_exact(&mut out)
         .map_err(|_| KvError::MalformedSnapshot)?;
     Ok(out)
+}
+
+/// Decode a snapshot byte string into a fresh [`Store`], entirely outside the
+/// write lock (called by [`restore`](StateMachine::restore)). A malformed
+/// snapshot yields [`KvError::MalformedSnapshot`] without touching existing
+/// state. Keeping this out of the critical section bounds the write-lock hold
+/// to the swap itself, so a large snapshot restore does not tail concurrent
+/// reads (2.4).
+fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
+    let mut cursor = Cursor::new(bytes);
+    let applied = read_u64(&mut cursor)?;
+
+    let kv_len = read_u32(&mut cursor)? as usize;
+    let mut kv = BTreeMap::new();
+    for _ in 0..kv_len {
+        let klen = read_u32(&mut cursor)? as usize;
+        let key = read_bytes(&mut cursor, klen)?;
+        let vlen = read_u32(&mut cursor)? as usize;
+        let val = read_bytes(&mut cursor, vlen)?;
+        kv.insert(key, val);
+    }
+
+    let sess_len = read_u32(&mut cursor)? as usize;
+    let mut sessions = BTreeMap::new();
+    for _ in 0..sess_len {
+        let client_id = read_u64(&mut cursor)?;
+        let seq_no = read_u64(&mut cursor)?;
+        let tag = read_u8(&mut cursor)?;
+        let outcome = match tag {
+            0 => ApplyOutcome::None,
+            1 => {
+                let vlen = read_u32(&mut cursor)? as usize;
+                let val = read_bytes(&mut cursor, vlen)?;
+                ApplyOutcome::Value(val)
+            }
+            _ => return Err(KvError::MalformedSnapshot),
+        };
+        sessions.insert(SessionKey { client_id, seq_no }, outcome);
+    }
+
+    // A well-formed snapshot has no trailing bytes.
+    if cursor.position() != bytes.len() as u64 {
+        return Err(KvError::MalformedSnapshot);
+    }
+    Ok(Store { applied, kv, sessions })
 }
 
 #[cfg(test)]
@@ -589,6 +684,81 @@ mod tests {
         // Session table survived: replaying session (1,1) still dedups.
         let replay = sm2.apply(4, &KvStateMachine::encode_put(1, 1, b"a", b"1"));
         assert_eq!(replay.unwrap(), ApplyOutcome::Value(b"1".to_vec()));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2.1 TDD: the state machine must be *shareable* (Send + Sync, Arc-backed
+    // data) and torn-read free under concurrent access. One writer applies a
+    // monotonic sequence while several readers sample version + map atomically
+    // (a single read lock), and the linear invariant holds for every sample.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_shared_sm_never_serves_torn_read() {
+        const n_entries: u64 = 1024;
+        const num_readers: usize = 8;
+        const reads_per_reader: u64 = 500;
+
+        // Empty sm; the writer (below) applies 1..=n_entries over time, so
+        // readers observe it in flight.
+        let shared: Arc<KvStateMachine> = Arc::new(KvStateMachine::new());
+        let mut handles = Vec::new();
+
+        // Writer: applies 1..=n_entries monotonically (map-then-version).
+        let writer = Arc::clone(&shared);
+        handles.push(tokio::spawn(async move {
+            for i in 1..=n_entries {
+                writer
+                    .apply(
+                        i,
+                        &KvStateMachine::encode_put(
+                            1,
+                            i,
+                            format!("k{i}").as_bytes(),
+                            format!("v{i}").as_bytes(),
+                        ),
+                    )
+                    .unwrap();
+            }
+        }));
+
+        // Each reader loops: atomically read (version, kv) under one read lock
+        // via read_store_copy, then assert the no-torn-read invariant — for
+        // every key k_i with i <= version, the value present is exactly "v_i".
+        for _ in 0..num_readers {
+            let shared = Arc::clone(&shared);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..reads_per_reader {
+                    let (version, kv) = shared.read_store_copy();
+                    for i in 1..=version {
+                        let kstr = format!("k{i}");
+                        let got = kv
+                            .get(kstr.as_bytes())
+                            .expect("torn read: key missing from the map at this version");
+                        assert_eq!(
+                            got.as_slice(),
+                            format!("v{i}").as_bytes(),
+                            "torn read: version={version}, key k{i} = {:?}",
+                            got.as_slice()
+                        );
+                    }
+                }
+            }));
+        }
+
+        // Drain all tasks (writer + readers).
+        for handle in handles {
+            handle.await.expect("spawned task panicked");
+        }
+
+        // Final: all keys hold their final values (writer reached n_entries).
+        for i in 1..=n_entries {
+            assert_eq!(
+                shared.get(&format!("k{i}").as_bytes()).unwrap(),
+                Some(format!("v{i}").as_bytes().to_vec()),
+                "key k{i} wrong after write storm"
+            );
+        }
     }
 
     #[test]

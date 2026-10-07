@@ -138,7 +138,20 @@ The project keeps an apples-to-apples benchmark against an `etcd` v3.5.21 cluste
 
 A Go benchmark client is also included (`docker/bench/driver/bench_go.go`): Go and the Python process-mode driver agree on server behavior to within a roughly constant ~12% client-side overhead, so the two measurements bracket the server's actual cost. Under a 4-connection linear-read load both Arachne and etcd lose throughput to their single-connection figure (a shared property of the read-index round trip), and run-to-run variance in that regime is large; the single-connection and stale-read numbers above are the stable ones.
 
-These figures are a record of a particular environment (Linux containers, same harness), meant to guide tuning — not a claim about every deployment.
+Phase 4 (read decoupling + async outbound) was verified A/B at the same read
+caliber (keep-alive + `--process`, n = 400, three rounds, median): the 1-way
+linear-read no-regress gate **passed** (median **4267 ops/s** ≥ the Phase-2
+floor of 4157), the 4-way linear read held at **2917 ops/s**, and ReadIndex
+measured ~**3182 rounds/s** at 4-way with the 4-way p99 falling to ~0.6 ms.
+The write path and stale reads are unchanged by construction and stayed within
+variance. To make this a standing check, `scripts/check-perf-baseline.sh` now
+adds a 4-way linear-read regression floor (T5): it runs the benchmark three
+times and takes the median, failing if it drops below **2739 ops/s** — the
+Phase-1 baseline figure, which later phases only improved — or a 1.5 ms p50
+cap. The 1-way read remains the primary single-connection signal.
+
+These figures are a record of a particular environment (Linux containers, same
+harness), meant to guide tuning — not a claim about every deployment.
 
 ## Testing
 

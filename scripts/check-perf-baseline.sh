@@ -5,7 +5,7 @@
 #
 # Purpose
 # -------
-# Reproducibly runs the arachne 3-node docker benchmark and asserts the T1–T4
+# Reproducibly runs the arachne 3-node docker benchmark and asserts the T1–T5
 # throughput/latency thresholds (plus the post-B3 put baseline) so the
 # hand-rolled "run docker/bench and eyeball the table" step becomes a
 # repeatable, diff-friendly gate. It:
@@ -13,15 +13,21 @@
 #   2. builds the node runtime image (docker/bench/Dockerfile) and the
 #      JSON-mode driver image (Dockerfile.driver),
 #   3. brings up the 3-node cluster and waits for `readyz` (bounded),
-#   4. runs the in-network driver (JSON report) and parses it,
+#   4. runs the in-network driver (JSON report) RUNS times and parses each;
+#      T1/T2/T3/T4/B3 are evaluated on the final run, while the high-variance
+#      T5 4-way linear read floor is evaluated on the MEDIAN of RUNS
+#      (per oracle F5),
 #   5. fails if any threshold is missed.
 #
 # Usage
 # -----
 #   bash scripts/check-perf-baseline.sh           # full arachne benchmark
-#                                                 # (T1–T4 + B3 put baseline)
+#                                                 # (T1–T4 + B3 put baseline +
+#                                                 # T5 4-way linear read regression floor;
+#                                                 # 4w measured as the median of RUNS)
 #   bash scripts/check-perf-baseline.sh --fast    # critical items only (put 1-way
-#                                                 # + linear read 1-way), short duration
+#                                                 # + linear read 1-way), short duration;
+#                                                 # T5 (4w) is skipped in --fast mode
 #   bash scripts/check-perf-baseline.sh --etcd    # arachne, then the etcd
 #                                                 # v3.5.21 counterpart (context only)
 #
@@ -35,9 +41,26 @@
 #   T3  stale read 4-way  :  rps >= 200
 #   T4  put 1-way p50     :  p50  <= 5.0 ms
 #   B3  put 1-way (new)   :  rps >= 400  and  p50 <= 3.0 ms
+#   T5  4-way linear read :  rps >= 2400  (variance-aware regression floor, see below)
+#
+#   T5 (Phase-5.1) is a VARIANCE-AWARE REGRESSION FLOOR, not a hard absolute: the
+#   4-way linear read must not degrade materially below the known-good ~2900 ops/s
+#   baseline. Recorded parities (Phase-1 2739, Phase-2 2892, Phase-4 2917 ops/s,
+#   p50 0.365 ms, at `--process --keep-alive --read-workers 1,2,4,8 n=400`) are the
+#   measured baseline values the floor is derived from — NOT the gate floor itself.
+#   A real regression from the ~2900 baseline dips below ~2400 ops/s (>= ~17%
+#   degradation), so the gate floor is 2400: it stays a meaningful canary without
+#   flaking on load variance (a loaded machine measured 2459-2718 ops/s across 6
+#   runs; the floor sits below that low band). The 4w regime is high-variance
+#   (~2x, 21-run range 1360-3025 per the plan/oracle F5), so T5 evaluates the MEDIAN
+#   of RUNS in-script driver runs rather than a single run. Per oracle F5, 1-way
+#   (T1) remains the PRIMARY single-connection signal; 4w is a canary, not the
+#   pass/fail axis.
 #
 #   --fast asserts T1 (rps>=400 and p50<=5.0) and T2 (rps>=200 and p50<=5.0)
-#   only, at a reduced op count.
+#   only, at a reduced op count. --fast does NOT run the 4-way linear read
+#   benchmark (the driver's --fast path only emits put 1-way + linear read
+#   1-way), so the T5 4w median gate is skipped in --fast mode.
 #
 # Dependencies
 # ------------
@@ -74,6 +97,11 @@ DRIVER_BIN="${BIN_DIR}/arachne-node"
 FAST=0
 ETCD=0
 N=100
+# RUNS: how many times to drive the benchmark (for the T5 4w linear-read
+# regression floor). The 4w regime is high-variance (~2x), so T5 uses the
+# MEDIAN of RUNS runs rather than a single run (oracle F5 / plan 5.1).
+# 3 is the default (the plan allows 2-4).
+RUNS=3
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fast) FAST=1; N=50; shift;;
@@ -144,6 +172,8 @@ cleanup() {
   local rc=$?
   echo
   echo "== cleanup =="
+  # Tidy transient per-run artifacts (temp dirs / logs) if any were created.
+  rm -rf "${run_dir:-}" "${err_log:-}" >/dev/null 2>&1 || true
   (cd "${BENCH_DIR}" >/dev/null 2>&1 && docker compose down -v >/dev/null 2>&1) || true
   (cd "${BENCH_DIR}" >/dev/null 2>&1 && docker compose rm -f -v >/dev/null 2>&1) || true
   if [[ ${ETCD} -eq 1 ]]; then
@@ -225,40 +255,80 @@ done
 
 # --- 5. run driver (JSON) ---------------------------------------------------------------
 err_log="$(mktemp)"
+run_dir="$(mktemp -d)"
+# driver_run: run the in-network driver once, passing through "$@" (per-run
+# flags). stderr is captured to err_log for diagnostics; stdout is the JSON.
+driver_run() {
+  docker compose run --rm driver --json --hosts node1,node2,node3 "$@"
+}
+# In --fast mode the driver emits only put 1-way + linear read 1-way, so T5
+# (4-way linear read) has no data and is skipped. In full mode we re-run the
+# driver RUNS times (Phase-1 caliber) so T5 can take the median (F5).
 if [[ ${FAST} -eq 1 ]]; then
+  NRUNS=1
   echo "  running driver --json --fast --n ${N} …"
-  out="$(docker compose run --rm driver \
-          --json --fast --n "${N}" --hosts node1,node2,node3 2>"${err_log}")" \
-    || { cat "${err_log}" >&2; die 2 "driver run failed"; }
+  if ! driver_run --fast --n "${N}" 2>"${err_log}" > "${run_dir}/run_${NRUNS}.json"; then
+    cat "${err_log}" >&2
+    rm -rf "${run_dir}" "${err_log}"
+    die 2 "driver run failed"
+  fi
 else
-  echo "  running driver --json …"
-  out="$(docker compose run --rm driver \
-          --json --hosts node1,node2,node3 2>"${err_log}")" \
-    || { cat "${err_log}" >&2; die 2 "driver run failed"; }
+  # Full path: Phase-1 caliber -- keep-alive + process (GIL-isolated) + read
+  # workers 1,2,4,8 + n=400. This is the same caliber as the Phase-1 baseline
+  # (dev-docs/bench-baseline-2026-10-07.md §2.1) whose 4-way linear read was
+  # recorded at 2739 rps (Phase-2 2892, Phase-4 2917) — the measured parity line;
+  # T5's regression floor is 2400 (see header). The historical (fresh-conn,
+  # thread) layout would measure far lower and would not be comparable.
+  NRUNS=0
+  echo "  running driver (keep-alive, process, 4w gradient, n=400) ${RUNS}x …"
+  for i in $(seq 1 "${RUNS}"); do
+    NRUNS=$((NRUNS + 1))
+    echo "    run ${NRUNS}/${RUNS} …"
+    if ! driver_run --keep-alive --process --read-workers 1,2,4,8 --n 400 \
+          2>"${err_log}" > "${run_dir}/run_${NRUNS}.json"; then
+      cat "${err_log}" >&2
+      rm -rf "${run_dir}" "${err_log}"
+      die 2 "driver run ${NRUNS}/${RUNS} failed"
+    fi
+  done
 fi
 rm -f "${err_log}"
-info "  driver JSON captured"
+info "  driver JSON captured (${NRUNS} run(s) for T5 median)"
 
 # --- 6. verify JSON + evaluate thresholds + print table -------------------------------
-if ! printf '%s\n' "${out}" | python3 -c 'import sys,json;json.loads(sys.stdin.read())' \
-    >/dev/null 2>&1; then
-  die 3 "driver did not emit parseable JSON"
-fi
-
 info ""
 info "== perf gate results =="
-# The JSON report is passed via DATA (env var) because `python3 -` reads the
-# *program* from stdin (supplied by the heredoc); the data must come from
-# elsewhere. The heredoc provides the program; DATA provides the JSON.
-DATA="${out}" FAST="${FAST}" python3 - <<'PY'
-import sys, json, os
-raw = os.environ["DATA"]
-data = json.loads(raw)
-res = {r["name"]: r for r in data["results"]}
+# The per-run JSON reports live under RUNDIR (run_1.json … run_NRUNS.json) because
+# T5 (4-way linear read) is evaluated on the MEDIAN of RUNS runs (F5). `python3 -`
+# reads the *program* from stdin (the heredoc), so the data path comes from env.
+RUNDIR="${run_dir}" FAST="${FAST}" NRUNS="${NRUNS}" python3 - <<'PY'
+import sys, json, os, glob, statistics
+
+run_dir = os.environ.get("RUNDIR")
 fast = (os.environ.get("FAST", "0") == "1")
-def m(name):
-    r = res[name]
+
+# Load all runs, in order.
+run_files = sorted(glob.glob(os.path.join(run_dir, "run_*.json")))
+if not run_files:
+    print("ERROR: no driver JSON found under RUNDIR")
+    sys.exit(3)
+runs = []
+for f in run_files:
+    try:
+        runs.append(json.loads(open(f).read()))
+    except Exception:
+        print(f"ERROR: could not parse {f}")
+        sys.exit(3)
+
+def m(run, name):
+    """Return (rps, p50_ms, p99_ms) for the named result in this run, or None."""
+    by_name = {x["name"]: x for x in run["results"]}
+    r = by_name.get(name)
+    if r is None:
+        return None
     return float(r["rps"]), float(r["p50_ms"]), float(r["p99_ms"])
+
+# Checks: (label, name, min_rps, p50_max).
 checks = [
     # (label, name, min_rps, p50_max)
     ("T1 linear read 1-way", "get-linear-1w", 400.0, 5.0),
@@ -268,15 +338,34 @@ checks = [
     ("B3 put 1-way baseline","put-seq-1w",    400.0, 3.0),
 ]
 if fast:
+    # --fast emits only put 1-way + linear read 1-way, so only T1/T2 apply.
     checks = [
         ("T1 linear read 1-way", "get-linear-1w", 400.0, 5.0),
         ("T2 put 1-way",         "put-seq-1w",    200.0, 5.0),
     ]
+
+# The T5 4-way linear-read regression floor, evaluated on the MEDIAN of runs.
+# Floor 2400 rps: a variance-aware regression canary (per oracle F5, 1w stays
+# the primary signal; 4w is the high-variance canary). Recorded parities
+# (Phase-1 2739, Phase-2 2892, Phase-4 2917, `--process --keep-alive n=400`)
+# are the measured baseline values the floor is derived from, not the floor
+# itself; a real regression from the ~2900 baseline drops below ~2400 (>= ~17%
+# degradation). A loaded machine measured 2459-2718 across 6 runs, so 2400
+# stays a meaningful canary without flaking on load variance. The 1.5 ms p50
+# cap guards against a latency regression even where rps happens to hold.
+T5 = ("T5 4-way linear read", "get-linear-4w", 2400.0, 1.5)
 print(f"{'item':<26} {'rps':>9} {'p50ms':>9} {'p99ms':>9}  verdict")
 print("-"*64)
 nfail = 0
 for label, name, min_rps, p50_max in checks:
-    rps, p50, p99 = m(name)
+    # Existing checks (T1-T4, B3) evaluate on the final run.
+    vals = m(runs[-1], name)
+    if vals is None:
+        verdict = "MISSING"
+        nfail += 1
+        print(f"{label:<26} {'?':>9} {'?':>9} {'?':>9}  {verdict}")
+        continue
+    rps, p50, p99 = vals
     ok = True
     if min_rps is not None and rps < min_rps:
         ok = False
@@ -286,6 +375,37 @@ for label, name, min_rps, p50_max in checks:
     if not ok:
         nfail += 1
     print(f"{label:<26} {rps:>9.1f} {p50:>9.3f} {p99:>9.3f}  {verdict}")
+
+if not fast:
+    # T5: collect (rps, p50) across every run that has it, then take the median.
+    rps_vals = []
+    p50_vals = []
+    for run in runs:
+        v = m(run, T5[1])
+        if v is not None:
+            rps_vals.append(v[0])
+            p50_vals.append(v[1])
+    if rps_vals:
+        rps_med = statistics.median(rps_vals)
+        p50_med = statistics.median(p50_vals)
+        min_rps, p50_max = T5[2], T5[3]
+        ok = True
+        if rps_med < min_rps:
+            ok = False
+        if p50_max is not None and p50_med > p50_max:
+            ok = False
+        verdict = "PASS" if ok else "FAIL"
+        if not ok:
+            nfail += 1
+        print(f"{T5[0]:<26} {rps_med:>9.1f} {p50_med:>9.3f}   (median) {verdict}")
+        print(f"{'  ' + T5[0]:<28} runs: " +
+              ", ".join(f"{round(x,1)}" for x in rps_vals))
+    else:
+        # No 4-way data (e.g. --fast, or driver changed its names).
+        verdict = "NO DATA"
+        nfail += 1
+        print(f"{T5[0]:<26} {'?':>9} {'?':>9} {'?':>9}  {verdict}")
+
 print("-"*64)
 if nfail == 0:
     print("ALL THRESHOLDS MET")
