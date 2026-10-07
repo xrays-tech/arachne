@@ -20,10 +20,18 @@
 //! must not delay raft's ticks, inbound peer messages, or the ReadIndex round,
 //! which is what dragged read latency down under a write storm (risk R6). The
 //! actor hands committed work to the task over a bounded channel and learns
-//! progress over a `watch`. Both linear (ReadIndex) and weak (`get_stale`)
-//! reads are served directly from the shared state machine by the actor under a
-//! read lock that does not contend with the task's write lock (2.2/2.3), and
-//! proposals are backpressured with `Busy` on the byte bound Q7.
+//! progress over a `watch`.
+//!
+//! **P4 (F4) read-path seam.** Only the *read service* leaves the actor thread:
+//! the ReadIndex gate/quorum round (linear) and the version alert stay on the
+//! actor, while the final SM value-fetch + oneshot reply are handed to a
+//! spawned worker that takes a read lock on the shared state machine — the
+//! `Arc<RwLock>` seam Phase 2 established between the apply task and the read
+//! path. Applying entries stays on the actor runtime: moving *apply* off the
+//! sim runtime would break l2/model-check/turmoil determinism (F4 oracle).
+//! Linear and weak reads are therefore no longer serialised behind the actor's
+//! own current-thread tick, and proposals are backpressured with `Busy` on the
+//! byte bound Q7.
 //!
 //! The runtime is **generic over the transport** (`T`/`Tr`) so the same actor
 //! drives the in-memory transport in tests and the tonic transport in
@@ -1607,10 +1615,10 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // contend with the apply task's write lock; there is no
                 // read-index gate here (this is a *stale* read), but the same
                 // fail-stop on read failure as the linear path applies.
-                let value: Result<Option<Vec<u8>>, ArachneError> = self.sm
-                    .get(&key)
-                    .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
-                let _ = ack.send(value);
+                // P4 4.1: hand the SM read + reply to a worker, off the actor's
+                // current-thread loop (a stale read has no read-index gate, so
+                // the whole path is safe to leave the actor thread).
+                self.spawn_read_reply(key, ack);
             }
             Command::Read { key, ack } => {
                 // Only the leader can serve a linearizable read (propsol §5.4
@@ -1801,11 +1809,12 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                     // Read the value directly from the shared state machine:
                     // a read lock that does not contend with the apply task's
                     // write lock (2.2 drops the per-linear-read `reads` mpsc hop).
-                    // The failure is an invariant violation and is fail-stopped.
-                    let value: Result<Option<Vec<u8>>, ArachneError> = self.sm
-                        .get(&r.key)
-                        .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
-                    let _ = ack.send(value);
+                    // P4 4.1: the version alert (actor-side, on `applied_index`)
+                    // stays on the actor; only the `sm.get` + oneshot reply moves
+                    // to a spawned worker, so linear reads no longer serialise
+                    // behind the actor's current-thread tick.
+                    let key = std::mem::take(&mut r.key);
+                    self.spawn_read_reply(key, ack);
                 }
                 continue;
             }
@@ -1830,7 +1839,30 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
 
             still.push(r);
         }
-        self.pending_reads = still;
+         self.pending_reads = still;
+     }
+
+    /// P4 4.1 — hand a read's SM value-fetch and oneshot reply to a worker
+    /// task, off the actor's current-thread loop.
+    ///
+    /// The ReadIndex gate (`self.applied_index >= read_index`), the version
+    /// alert and the ReadIndex round all stay on the actor; only the final
+    /// `sm.get(&key)` + `ack.send(value)` moves to a spawned task. That keeps
+    /// every client-facing reply path (weak `get_stale` and linear `get`)
+    /// off the actor thread, so a write storm in the apply path no longer
+    /// serialises reads behind the actor's own tick.
+    fn spawn_read_reply(
+        &self,
+        key: Vec<u8>,
+        ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
+    ) {
+        let sm = Arc::clone(&self.sm);
+        tokio::spawn(async move {
+            let value: Result<Option<Vec<u8>>, ArachneError> = sm
+                .get(&key)
+                .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+            let _ = ack.send(value);
+        });
     }
 
     fn fail_all_pending(&mut self, message: &str) {
