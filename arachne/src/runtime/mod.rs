@@ -15,13 +15,15 @@
 //! successful reply means the write is durable and visible. Bounded by the
 //! caller's deadline (`Timeout`).
 //!
-//! Applying entries happens on a **separate task** that owns the state machine
-//! (propsol §347 / v0.2.11 N): a saturated apply path must not delay raft's
-//! ticks, inbound peer messages, or the ReadIndex round, which is what dragged
-//! read latency down under a write storm (risk R6). The actor hands committed
-//! work to the task over a bounded channel and learns progress over a `watch`;
-//! weak reads have their own channel so they never queue behind the write
-//! backlog, and proposals are backpressured with `Busy` on the byte bound Q7.
+//! Applying entries happens on a **separate task** that shares the state
+//! machine with the actor (propsol §347 / v0.2.11 N): a saturated apply path
+//! must not delay raft's ticks, inbound peer messages, or the ReadIndex round,
+//! which is what dragged read latency down under a write storm (risk R6). The
+//! actor hands committed work to the task over a bounded channel and learns
+//! progress over a `watch`. Both linear (ReadIndex) and weak (`get_stale`)
+//! reads are served directly from the shared state machine by the actor under a
+//! read lock that does not contend with the task's write lock (2.2/2.3), and
+//! proposals are backpressured with `Busy` on the byte bound Q7.
 //!
 //! The runtime is **generic over the transport** (`T`/`Tr`) so the same actor
 //! drives the in-memory transport in tests and the tonic transport in
@@ -319,13 +321,6 @@ const MAX_PENDING_READS: usize = 4096;
 /// pile up, so the actor rarely has to defer a batch at all.
 const APPLY_QUEUE_DEPTH: usize = 256;
 
-/// How many weak reads may be queued for the apply task.
-const READ_QUEUE_DEPTH: usize = MAX_PENDING_READS;
-
-/// How many queued weak reads the apply task serves before taking one unit of
-/// write work, so a read flood cannot starve apply.
-const READ_BURST: usize = 64;
-
 /// How many sessions one GC entry may name (propsol v0.2.15 R2). The list has to
 /// fit in a log entry, so the leader sweeps in bounded batches.
 const SESSION_GC_BATCH: usize = 1_000;
@@ -411,13 +406,6 @@ enum ApplyRequest {
     },
 }
 
-/// A weak read (`get_stale`, propsol N1), on its **own** channel so it never
-/// waits behind the write backlog.
-struct ReadRequest {
-    key: Vec<u8>,
-    ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
-}
-
 /// The apply task's published state.
 ///
 /// A `watch` keeps only the newest value and never blocks the apply task on a
@@ -445,33 +433,20 @@ struct ApplyProgress {
 struct ApplyTask {
     sm: Arc<KvStateMachine>,
     applies: mpsc::Receiver<ApplyRequest>,
-    reads: mpsc::Receiver<ReadRequest>,
     progress: watch::Sender<ApplyProgress>,
     applied_bytes_total: u64,
     failed: Option<String>,
 }
 
 impl ApplyTask {
-    /// Serve queued weak reads, then one unit of write work, then wait.
+    /// Apply committed work off the actor's loop.
     ///
-    /// Reads jump the queue (a weak read must not wait for the write backlog)
-    /// but are served in bounded bursts, so they cannot starve apply.
+    /// Reads are no longer served here (2.2/2.3): the linear and weak read
+    /// paths read the shared state machine directly from the actor, taking a
+    /// read lock that does not contend with this task's writes. This task
+    /// therefore applies writes only.
     async fn run(mut self) {
-        let mut reads_open = true;
         loop {
-            if reads_open {
-                for _ in 0..READ_BURST {
-                    match self.reads.try_recv() {
-                        Ok(req) => self.serve_read(req),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            reads_open = false;
-                            break;
-                        }
-                    }
-                }
-            }
-
             match self.applies.try_recv() {
                 Ok(req) => {
                     if !self.handle(req) {
@@ -484,14 +459,6 @@ impl ApplyTask {
             }
 
             tokio::select! {
-                biased;
-                maybe = self.reads.recv(), if reads_open => {
-                    match maybe {
-                        Some(req) => self.serve_read(req),
-                        // The actor dropped its read sender; keep applying.
-                        None => reads_open = false,
-                    }
-                }
                 maybe = self.applies.recv() => {
                     match maybe {
                         Some(req) => {
@@ -504,13 +471,6 @@ impl ApplyTask {
                 }
             }
         }
-    }
-
-    fn serve_read(&self, req: ReadRequest) {
-        let value = self.sm.get(&req.key).map_err(|e| {
-            ArachneError::Unrecoverable(format!("state machine read failed: {e}"))
-        });
-        let _ = req.ack.send(value);
     }
 
     /// Returns `false` when the task must stop.
@@ -600,12 +560,10 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     apply_task: Option<ApplyTask>,
     /// Committed work for the apply task (bounded; see [`APPLY_QUEUE_DEPTH`]).
     applies: mpsc::Sender<ApplyRequest>,
-    /// Weak reads, on their own channel so they never queue behind writes.
-    reads: mpsc::Sender<ReadRequest>,
-    /// The shared state machine (propsol N). The apply task writes to it; the
-    /// linear read path (2.2) reads it directly under a read lock. Held as an
-    /// `Arc` so the actor and the apply task both own a handle to the same
-    /// store.
+    /// The shared state machine (propsol N). The apply task writes to it; both
+    /// the linear (2.2) and weak (2.3) read paths read it directly under a read
+    /// lock that does not contend with writes. Held as an `Arc` so the actor and
+    /// the apply task both own a handle to the same store.
     sm: Arc<KvStateMachine>,
     /// The apply task's published progress.
     progress: watch::Receiver<ApplyProgress>,
@@ -752,7 +710,6 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         // path reads it directly under a read lock.
         let applied_index = sm.applied_index();
         let (applies, applies_rx) = mpsc::channel(APPLY_QUEUE_DEPTH);
-        let (reads, reads_rx) = mpsc::channel(READ_QUEUE_DEPTH);
         let (progress_tx, progress) = watch::channel(ApplyProgress {
             applied_index,
             applied_bytes_total: 0,
@@ -762,7 +719,6 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         let apply_task = ApplyTask {
             sm: sm.clone(),
             applies: applies_rx,
-            reads: reads_rx,
             progress: progress_tx,
             applied_bytes_total: 0,
             failed: None,
@@ -829,7 +785,6 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             node,
             apply_task: Some(apply_task),
             applies,
-            reads,
             sm,
             progress,
             durability,
@@ -1650,19 +1605,16 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 }
             }
             Command::GetStale { key, ack } => {
-                // The apply task owns the state machine. This rides its own
-                // channel, so a weak read never queues behind the write
-                // backlog (propsol N1 / v0.2.11 N).
-                if let Err(err) = self.reads.try_send(ReadRequest { key, ack }) {
-                    match err {
-                        mpsc::error::TrySendError::Full(req) => {
-                            let _ = req.ack.send(Err(ArachneError::Busy));
-                        }
-                        mpsc::error::TrySendError::Closed(req) => {
-                            let _ = req.ack.send(Err(ArachneError::ShuttingDown));
-                        }
-                    }
-                }
+                // Serve the live published state directly from the shared state
+                // machine, concurrently with the apply task's writes (propsol
+                // N1 / v0.2.11 N). A weak read takes a read lock that does not
+                // contend with the apply task's write lock; there is no
+                // read-index gate here (this is a *stale* read), but the same
+                // fail-stop on read failure as the linear path applies.
+                let value: Result<Option<Vec<u8>>, ArachneError> = self.sm
+                    .get(&key)
+                    .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+                let _ = ack.send(value);
             }
             Command::Read { key, ack } => {
                 // Only the leader can serve a linearizable read (propsol §5.4

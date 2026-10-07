@@ -209,8 +209,34 @@ async fn until_get(handle: &Handle, key: &[u8]) -> Result<Option<Vec<u8>>, Arach
         match handle.get(key).await {
             Ok(value) => return Ok(value),
             Err(ArachneError::Timeout)
-            | Err(ArachneError::QuorumUnavailable)
-            | Err(ArachneError::NotLeader { .. }) => {
+                | Err(ArachneError::QuorumUnavailable)
+                | Err(ArachneError::NotLeader { .. }) => {
+                tokio::time::sleep(core::time::Duration::from_millis(2)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(ArachneError::Timeout)
+}
+
+/// Poll `handle.get_stale` until it returns a *value*, retrying `None` and
+/// transient errors.
+///
+/// A stale read of a key that has not yet been applied returns `None`; the
+/// caller must keep polling until the entry lands. This is the same contract as
+/// [`until_get`] but for weak reads and with `None` treated as "not ready yet"
+/// rather than a final answer.
+async fn until_get_stale(handle: &Handle, key: &[u8]) -> Result<Option<Vec<u8>>, ArachneError> {
+    for _ in 0..800 {
+        match handle.get_stale(key).await {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) => {
+                tokio::time::sleep(core::time::Duration::from_millis(2)).await;
+                continue;
+            }
+            Err(ArachneError::Timeout)
+                | Err(ArachneError::QuorumUnavailable)
+                | Err(ArachneError::NotLeader { .. }) => {
                 tokio::time::sleep(core::time::Duration::from_millis(2)).await;
             }
             Err(e) => return Err(e),
@@ -639,13 +665,16 @@ async fn a_restart_rebuilds_the_state_machine_from_the_snapshot() {
         .expect("k0 must come back from the snapshot");
     assert_eq!(early, value(0), "the restored state lost a compacted write");
 
-    let tail = node
-        .handle
-        .get_stale(&key(LOCAL_WRITES))
-        .await
-        .expect("stale read after restart")
-        .expect("the newest write must have been replayed on top of the snapshot");
-    assert_eq!(tail, value(LOCAL_WRITES));
+        // The log tail (entries above the snapshot index) replays asynchronously
+        // after the snapshot is restored. The restart test must wait for it to
+        // land before asserting on a log-tail key — otherwise the assertion races
+        // raft's log-tail replay. `k0` is snapshot-derived (already restored)
+        // but `k80` is log-tail-derived, so only `k80` needs the wait.
+        let tail = until_get_stale(&node.handle, &key(LOCAL_WRITES))
+            .await
+            .expect("the restarted node replays the log tail");
+        let tail = tail.expect("k80 must be replayed on top of the snapshot");
+        assert_eq!(tail, value(LOCAL_WRITES));
 
     // A linearizable read works too, so the restarted node is fully serving.
     let read_back = until_get(&node.handle, &key(LOCAL_WRITES))
