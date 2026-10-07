@@ -403,47 +403,19 @@ impl StateMachine for KvStateMachine {
     }
 
     fn restore(&self, bytes: &[u8]) -> Result<(), Self::Error> {
-        // Write lock; we replace the whole Store (kv, sessions, applied) atomically.
-        // `bytes` is fully decoded before any mutation, so a malformed snapshot
-        // is rejected without touching state (fail-stop, no partial restore).
-        let mut guard = self
-            .store
-            .write()
-            .map_err(|_| KvError::PoisonedLock)?;
-        let mut cursor = Cursor::new(bytes);
-        guard.applied = read_u64(&mut cursor)?;
-
-        let kv_len = read_u32(&mut cursor)? as usize;
-        guard.kv.clear();
-        for _ in 0..kv_len {
-            let klen = read_u32(&mut cursor)? as usize;
-            let key = read_bytes(&mut cursor, klen)?;
-            let vlen = read_u32(&mut cursor)? as usize;
-            let val = read_bytes(&mut cursor, vlen)?;
-            guard.kv.insert(key, val);
-        }
-
-        let sess_len = read_u32(&mut cursor)? as usize;
-        guard.sessions.clear();
-        for _ in 0..sess_len {
-            let client_id = read_u64(&mut cursor)?;
-            let seq_no = read_u64(&mut cursor)?;
-            let tag = read_u8(&mut cursor)?;
-            let outcome = match tag {
-                0 => ApplyOutcome::None,
-                1 => {
-                    let vlen = read_u32(&mut cursor)? as usize;
-                    let val = read_bytes(&mut cursor, vlen)?;
-                    ApplyOutcome::Value(val)
-                }
-                _ => return Err(KvError::MalformedSnapshot),
-            };
-            guard.sessions.insert(SessionKey { client_id, seq_no }, outcome);
-        }
-
-        // A well-formed snapshot has no trailing bytes.
-        if cursor.position() != bytes.len() as u64 {
-            return Err(KvError::MalformedSnapshot);
+        // The parse is done *outside* the write lock (2.4): a large snapshot's
+        // decode cost never blocks concurrent reads. The write lock is then
+        // held only for the swap of the fully-decoded Store, bounding the
+        // critical section to the assignment rather than the decode. `bytes`
+        // is fully validated before any mutation, so a malformed snapshot is
+        // rejected without touching state (fail-stop, no partial restore).
+        let next = decode_store(bytes)?;
+        {
+            let mut guard = self
+                .store
+                .write()
+                .map_err(|_| KvError::PoisonedLock)?;
+            *guard = next;
         }
         Ok(())
     }
@@ -493,6 +465,51 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<Vec<u8>, KvError
         .read_exact(&mut out)
         .map_err(|_| KvError::MalformedSnapshot)?;
     Ok(out)
+}
+
+/// Decode a snapshot byte string into a fresh [`Store`], entirely outside the
+/// write lock (called by [`restore`](StateMachine::restore)). A malformed
+/// snapshot yields [`KvError::MalformedSnapshot`] without touching existing
+/// state. Keeping this out of the critical section bounds the write-lock hold
+/// to the swap itself, so a large snapshot restore does not tail concurrent
+/// reads (2.4).
+fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
+    let mut cursor = Cursor::new(bytes);
+    let applied = read_u64(&mut cursor)?;
+
+    let kv_len = read_u32(&mut cursor)? as usize;
+    let mut kv = BTreeMap::new();
+    for _ in 0..kv_len {
+        let klen = read_u32(&mut cursor)? as usize;
+        let key = read_bytes(&mut cursor, klen)?;
+        let vlen = read_u32(&mut cursor)? as usize;
+        let val = read_bytes(&mut cursor, vlen)?;
+        kv.insert(key, val);
+    }
+
+    let sess_len = read_u32(&mut cursor)? as usize;
+    let mut sessions = BTreeMap::new();
+    for _ in 0..sess_len {
+        let client_id = read_u64(&mut cursor)?;
+        let seq_no = read_u64(&mut cursor)?;
+        let tag = read_u8(&mut cursor)?;
+        let outcome = match tag {
+            0 => ApplyOutcome::None,
+            1 => {
+                let vlen = read_u32(&mut cursor)? as usize;
+                let val = read_bytes(&mut cursor, vlen)?;
+                ApplyOutcome::Value(val)
+            }
+            _ => return Err(KvError::MalformedSnapshot),
+        };
+        sessions.insert(SessionKey { client_id, seq_no }, outcome);
+    }
+
+    // A well-formed snapshot has no trailing bytes.
+    if cursor.position() != bytes.len() as u64 {
+        return Err(KvError::MalformedSnapshot);
+    }
+    Ok(Store { applied, kv, sessions })
 }
 
 #[cfg(test)]
