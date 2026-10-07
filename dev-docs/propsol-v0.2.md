@@ -5,7 +5,7 @@
 
 ---
 
-## 变更日志（v0.1 → v0.2.24）
+## 变更日志（v0.1 → v0.2.25）
 
 ### A. 三项待决策项已决议（见 §11）
 
@@ -642,6 +642,26 @@ Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 - 锁纪律：锁仅护 `handle.clone()` / `take()`，**不跨 await / join**。
 
 **后续**：多节点 façade（peer 注册 + `ConfChange` 桥接）留待后续 rev；`shutdown` 后重绑定重入 WAL 恢复需后续门禁验证。
+
+### AB. v0.2.25：read-concurrency Phase-3/4 结果登记（2026-10-07）
+
+**背景**：`dev-docs/plan-read-concurrency.md` 的 Phase-3（cohort ReadIndex 屏障，下称 **A**）经 @oracle 评审（`ref:ora-1`）判定**预证伪**（不实现）；Phase-4（读服务线程解耦 + 出站不内联 await）已实现并完成 A/B 基准。本 rev 登记两项结论：**A 的证伪判定**，以及**Phase-4 读解耦 + 异步出站的实测结果**。
+
+**Phase-3：A 预证伪，不再实现**（四链证据，`dev-docs/plan-read-concurrency.md` §Phase-3 证伪结论）：
+1. **C4 验尸**（`propsol-v0.2.md:553-556`，§Y）：读到达时 `rounds_in_flight`≈0；跨 cycle 时间窗口合并实测 no-op（4w/1w 0.42 < 门禁 0.9）并已回滚。
+2. **基线 §7 + Phase-2 机制表**：reads/round 0.71→0.53（轮次多于读次）、pending 峰值仅 3–8 → 基线即可观测"无排队形成"。
+3. **Phase-2 自然实验（决定性）**：B 落地使 rounds/s **+37%**（3154→4322）的同时吞吐 +5.6~14.6%、p50 全线下降 → ReadIndex 轮次发射**并非**吞吐约束；而 A 的唯一杠杆恰是减少轮次。
+4. **到达流上限核算**：A 的 cohort 上限 ≈ 1+λ·RTT ≈ 1.6×（λ=2892/s，RTT≈0.2ms），轮次减少上限 ≈ 35%，且轮中到达者多付一轮 RTT 延迟 —— 收益上限低于/紧贴阈值。
+
+→ A 关闭：3.1/3.2/3.6 记为 **NOT DONE**（YAGNI，A 证伪后无需新增 cohort 指标；`read_index_rounds_total` 语义不变，E 为内部重构）；3.3 (E) 落地为 Token/簿记瘦身（scope = 脆弱性修复 + 高 pending 尾部风险，非基准性能）。**重开触发**（基于现有指标，无需新工具）：若 `read_index_pending` 持续峰值 ≥ ~2× 基线，或 RTT 膨胀后重算上限，则重开 A。
+
+**Phase-4：读服务线程解耦 + 出站不内联 await（实现 + A/B）**（`dev-docs/bench-baseline-phase4-2026-10-07.md`；commit 链 `4be38b8`→`160d446`→`6fea0d1`）：
+- **4.1 读解耦**：ReadIndex 轮不再在热 actor 线程执行；`schedule_read_index` 交予背景 `ReadIndex` 任务，`resolve_reads`（drain+reply）独立背景任务，`refresh_metrics()` 排空 `pending_reads`。
+- **4.2 异步出站**：`SendQueue`/`Sender` per-peer 有界队列（`OUTBOUND_QUEUE_DEPTH=32`，满=丢弃+计数、follower 重传覆盖）+ 背景 sender；出站帧不再阻塞 actor 的 `send()`，`is_leader` 不再约束发射。
+- **A/B 结论**（同读口径 keep-alive+`--process`, n=400, 3 轮中位数）：1w **4267 ≥ 4157 无回归 ✓**；4w **2917 ≥ 2892 底线**（高方差 regime，min 1360）；2w/8w/stale/put 均在方差带。4w ReadIndex **rounds/s ≈ 3182**（median，1920–3257，client 侧进程池/GIL 方差，非 server）；`pending_reads` **0–4**（4.1 去 actor 后预期，Phase-1 §8 曾 1–2k）；4w p99 中位 **0.59 ms**（≤ Phase-1 ~1.1 ms）。read_latency **INV14 门绿**。
+- **5.1 门槛固化**（本 rev 随附）：`scripts/check-perf-baseline.sh` 新增 **T5（4w 线性读回归底线）**：脚本内跑 3 轮取**中位数**，阈值 = **≥ 2739 ops/s**（Phase-1 主口径 `dev-docs/bench-baseline-2026-10-07.md` §2.1，后续 phase 仅改善）+ **1.5 ms p50** 上限；1w 仍是主信号；`--fast` 模式跳过 T5（无 4w 数据）。
+
+**验证**：TDD（`tests/read_concurrency_off_actor.rs` 16 并发线性读+写风暴；`tests/outbound_queue.rs` fast 复制/慢传输溢出计数/收敛）+ workspace/l2/model-check/release 全绿；INV14 门绿（commit `6fea0d1`）；bench A/B（3 轮）记录于 `dev-docs/bench-baseline-phase4-2026-10-07.md`；`scripts/check-perf-baseline.sh` 语法 + `--fast` 流验证通过。**完整 3 轮门禁 + 合入 main（PR，含 2.0 INV14 测试与基准对照）留 Phase-5.3。**
 
 ## 1. 目标与非目标
 
