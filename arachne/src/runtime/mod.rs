@@ -436,9 +436,14 @@ struct ApplyProgress {
     sessions: u64,
 }
 
-/// Owns the state machine and applies committed work off the actor's loop.
+/// Applies committed work off the actor's loop.
+///
+/// The state machine is *shared* with the actor (propsol N): the apply task
+/// writes to it, the read path reads it. Both hold an `Arc<KvStateMachine>`,
+/// and the read path takes a read lock while the apply task takes the write
+/// lock.
 struct ApplyTask {
-    sm: KvStateMachine,
+    sm: Arc<KvStateMachine>,
     applies: mpsc::Receiver<ApplyRequest>,
     reads: mpsc::Receiver<ReadRequest>,
     progress: watch::Sender<ApplyProgress>,
@@ -597,6 +602,11 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     applies: mpsc::Sender<ApplyRequest>,
     /// Weak reads, on their own channel so they never queue behind writes.
     reads: mpsc::Sender<ReadRequest>,
+    /// The shared state machine (propsol N). The apply task writes to it; the
+    /// linear read path (2.2) reads it directly under a read lock. Held as an
+    /// `Arc` so the actor and the apply task both own a handle to the same
+    /// store.
+    sm: Arc<KvStateMachine>,
     /// The apply task's published progress.
     progress: watch::Receiver<ApplyProgress>,
     /// Woken by the storage when an offloaded flush completes (propsol P).
@@ -716,8 +726,10 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         // starts delivering entries. raft derives its applied index from
         // `first_index - 1`, which is exactly the snapshot index, so the two
         // stay in step and the log tail replays on top of the restored state
-        // (propsol §5.5.3 steps 3 and 7).
-        let sm = KvStateMachine::new();
+        // (propsol §5.5.3 steps 3 and 7). The state machine is shared with the
+        // read path (propsol N): wrap it in an `Arc` so both the apply task
+        // (writer) and the actor (reader) hold handles to the same store.
+        let sm = Arc::new(KvStateMachine::new());
         let (snapshot_index, snapshot_data) = match storage.snapshot() {
             Ok(Some(snapshot)) => (snapshot.meta.index, Some(snapshot.data)),
             Ok(None) => (0, None),
@@ -735,7 +747,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             )));
         }
 
-        // The apply task owns the state machine from here on (propsol N).
+        // The apply task and the read path both hold a handle to the same state
+        // machine (propsol N): the apply task writes to it, the linear read
+        // path reads it directly under a read lock.
         let applied_index = sm.applied_index();
         let (applies, applies_rx) = mpsc::channel(APPLY_QUEUE_DEPTH);
         let (reads, reads_rx) = mpsc::channel(READ_QUEUE_DEPTH);
@@ -746,7 +760,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             sessions: 0,
         });
         let apply_task = ApplyTask {
-            sm,
+            sm: sm.clone(),
             applies: applies_rx,
             reads: reads_rx,
             progress: progress_tx,
@@ -816,6 +830,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             apply_task: Some(apply_task),
             applies,
             reads,
+            sm,
             progress,
             durability,
             stop: Arc::clone(&stop),
@@ -1819,18 +1834,31 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             );
             if applied {
                 if let Some(ack) = r.ack.take() {
-                    // Fetch through the apply task (it owns the state machine)
-                    // and let it reply directly to the caller.
-                    if let Err(err) = self.reads.try_send(ReadRequest { key: r.key, ack }) {
-                        match err {
-                            mpsc::error::TrySendError::Full(req) => {
-                                let _ = req.ack.send(Err(ArachneError::Busy));
-                            }
-                            mpsc::error::TrySendError::Closed(req) => {
-                                let _ = req.ack.send(Err(ArachneError::ShuttingDown));
-                            }
+                    // The actor-side gate above (`self.applied_index >=
+                    // read_index`) is the authority. As a redundant safety net,
+                    // confirm the shared state machine's published version is
+                    // at least the confirmed read index — the SM's applied index
+                    // is monotonic and the gate already implies this, so the
+                    // alert must never fire.
+                    if let Some(read_index) = r.read_index {
+                        let version = self.sm.applied_index();
+                        if version < read_index {
+                            slog::warn!(
+                                self.logger,
+                                "state machine published version lags confirmed read index";
+                                "published" => version,
+                                "read_index" => read_index,
+                            );
                         }
                     }
+                    // Read the value directly from the shared state machine:
+                    // a read lock that does not contend with the apply task's
+                    // write lock (2.2 drops the per-linear-read `reads` mpsc hop).
+                    // The failure is an invariant violation and is fail-stopped.
+                    let value: Result<Option<Vec<u8>>, ArachneError> = self.sm
+                        .get(&r.key)
+                        .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+                    let _ = ack.send(value);
                 }
                 continue;
             }
