@@ -717,7 +717,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         // `first_index - 1`, which is exactly the snapshot index, so the two
         // stay in step and the log tail replays on top of the restored state
         // (propsol §5.5.3 steps 3 and 7).
-        let mut sm = KvStateMachine::new();
+        let sm = KvStateMachine::new();
         let (snapshot_index, snapshot_data) = match storage.snapshot() {
             Ok(Some(snapshot)) => (snapshot.meta.index, Some(snapshot.data)),
             Ok(None) => (0, None),

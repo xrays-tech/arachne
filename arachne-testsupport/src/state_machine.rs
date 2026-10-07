@@ -34,6 +34,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
+use std::sync::{Arc, RwLock};
 
 use arachne_kv_seam::{ApplyOutcome, LogIndex, StateMachine};
 
@@ -51,6 +52,9 @@ pub enum SmError {
     /// An entry was applied at an index other than `applied_index + 1`. This
     /// state machine enforces strictly sequential application.
     OutOfOrderIndex { expected: LogIndex, got: LogIndex },
+    /// The internal lock was poisoned. Fail-stop; a poisoned state machine can
+    /// no longer be used safely.
+    PoisonedLock,
 }
 
 impl std::fmt::Display for SmError {
@@ -61,51 +65,77 @@ impl std::fmt::Display for SmError {
             SmError::OutOfOrderIndex { expected, got } => {
                 write!(f, "out-of-order apply: expected index {expected}, got {got}")
             }
+            SmError::PoisonedLock => write!(f, "state machine lock poisoned"),
         }
     }
 }
 
 impl std::error::Error for SmError {}
 
-/// A deterministic byte-keyed value store.
-#[derive(Debug, Default)]
-pub struct InMemoryStateMachine {
+#[derive(Clone, Debug)]
+struct Store {
     data: BTreeMap<Vec<u8>, Vec<u8>>,
     applied: LogIndex,
+}
+
+/// A deterministic byte-keyed value store, shared via `Arc<RwLock<Store>>` so
+/// it satisfies the [`StateMachine`](arachne_kv_seam::StateMachine)
+/// `Send + Sync + 'static` contract and is torn-read free (D-Arc).
+#[derive(Clone, Debug)]
+pub struct InMemoryStateMachine {
+    store: Arc<RwLock<Store>>,
 }
 
 impl InMemoryStateMachine {
     /// Create an empty state machine with no applied entries.
     pub fn new() -> Self {
         Self {
-            data: BTreeMap::new(),
-            applied: 0,
+            store: Arc::new(RwLock::new(Store {
+                data: BTreeMap::new(),
+                applied: 0,
+            })),
         }
     }
 
     /// The number of keys currently stored.
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.store
+            .read()
+            .expect("state machine read lock should never be poisoned")
+            .data.len()
     }
 
     /// Whether the store holds no keys.
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.store
+            .read()
+            .expect("state machine read lock should never be poisoned")
+            .data.is_empty()
     }
 }
 
 impl StateMachine for InMemoryStateMachine {
     type Error = SmError;
 
-    fn apply(&mut self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error> {
+    fn apply(&self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error> {
+        // The write lock is held for the whole apply. We mutate the map FIRST
+        // and bump `applied` LAST (D-Ord), so a reader never sees `version >= C`
+        // with entry `C` missing.
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| SmError::PoisonedLock)?;
         // Strict sequential-apply contract: the caller MUST apply entries at
         // exactly `applied_index + 1`. Any other index is an invariant
         // violation => fail-stop. `checked_add` keeps a machine already at
         // `u64::MAX` failing cleanly instead of overflowing.
-        let expected = self.applied.checked_add(1).ok_or(SmError::OutOfOrderIndex {
-            expected: LogIndex::MAX,
-            got: index,
-        })?;
+        let expected = guard
+            .applied
+            .checked_add(1)
+            .ok_or(SmError::OutOfOrderIndex {
+                expected: LogIndex::MAX,
+                got: index,
+            })?;
         if index != expected {
             return Err(SmError::OutOfOrderIndex { expected, got: index });
         }
@@ -114,9 +144,9 @@ impl StateMachine for InMemoryStateMachine {
         let mut last_value: Option<Vec<u8>> = None;
         for (key, value) in pairs {
             last_value = Some(value.clone());
-            self.data.insert(key, value);
+            guard.data.insert(key, value);
         }
-        self.applied = index;
+        guard.applied = index;
         Ok(match last_value {
             Some(value) => ApplyOutcome::Value(value),
             None => ApplyOutcome::None,
@@ -124,22 +154,43 @@ impl StateMachine for InMemoryStateMachine {
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self.data.get(key).cloned())
+        // Read lock; the version and the map are read atomically (D-Arc/D-Ord).
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| SmError::PoisonedLock)?;
+        let _version = guard.applied;
+        Ok(guard.data.get(key).cloned())
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
-        Ok(encode_snapshot(&self.data, self.applied))
+        // Read lock; the version and the map are read atomically (D-Arc/D-Ord).
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| SmError::PoisonedLock)?;
+        Ok(encode_snapshot(&guard.data, guard.applied))
     }
 
-    fn restore(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    fn restore(&self, bytes: &[u8]) -> Result<(), Self::Error> {
+        // Write lock; we replace the whole Store atomically. `bytes` is fully
+        // decoded before any mutation, so a malformed snapshot is rejected
+        // without touching state (fail-stop, no partial restore).
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| SmError::PoisonedLock)?;
         let (data, applied) = decode_snapshot(bytes)?;
-        self.data = data;
-        self.applied = applied;
+        guard.data = data;
+        guard.applied = applied;
         Ok(())
     }
 
     fn applied_index(&self) -> LogIndex {
-        self.applied
+        self.store
+            .read()
+            .expect("state machine read lock should never be poisoned")
+            .applied
     }
 }
 
