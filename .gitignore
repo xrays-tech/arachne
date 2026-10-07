@@ -17,3 +17,9 @@
 /docker/bench/bin/
 /.dsh-target/
 /.dsh-target-fork/
+
+# docker/bench transient measurement artifacts (phase1 + phase2 runs, metrics)
+/docker/bench/bench-artifacts*/
+/docker/bench/ref.*
+/docker/bench/round*.*
+/docker/bench-etcd/bench-out/
