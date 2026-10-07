@@ -1,15 +1,15 @@
 ---
-status: phase-2-complete
-phase: 3
+status: phase-3-closed
+phase: 4
 updated: 2026-10-07
 ---
 
 # Implementation Plan: 多客户端并发读性能提升（对齐 etcd 并发读模型）
 
 ## Goal
-在不牺牲线性一致性（保留 ReadIndex Safe 模式、禁止 lease 读）的前提下，通过 (1) 单飞 **cohort** ReadIndex 屏障与 (2) 快照化并行读服务，把多客户端并发线性读的"每-RTT 放行 cohort"保持在 ≥ C3 基线并扩大、把读服务并发度从 1 提到 N、1w 无回归，并将 4w 门槛以稳健方式固化进门禁。
+在不牺牲线性一致性（保留 ReadIndex Safe 模式、禁止 lease 读）的前提下，通过快照化并行读服务（B，已落地）与读簿记瘦身（E），把读服务并发度从 1 提到 N、1w 无回归，并将 4w 门槛以稳健方式固化进门禁。ReadIndex **cohort 批量屏障（A）已按 §3.5 证伪标准判定为预证伪（见 Phase-3 证伪结论），不再实现**。
 
-> 目标措辞说明：不再以"追平 14%"为目标 —— 该数字是 §Z 记录的 cluster-state 方差内单次观测、方向可翻转（`propsol-v0.2.md:592-600`）。目标改为可证伪的机制性指标（每轮 cohort 释放数、rounds/sec、1w 无回归）。
+> 目标措辞说明：不再以"追平 14%"为目标 —— 该数字是 §Z 记录的 cluster-state 方差内单次观测、方向可翻转（`propsol-v0.2.md:592-600`）。亦不再以"扩大每-RTT cohort"为目标 —— A 已证伪。目标以可证伪的机制性指标（读服务并行度、rounds/sec、1w 无回归）为准。
 
 ## Context & Decisions
 | Decision | Rationale | Source |
@@ -72,20 +72,35 @@ updated: 2026-10-07
 - **代价/收益**：Phase-2 以更多 ReadIndex 轮（3154→4322/s）换取更高读服务并行吞吐（2156→2292 ops/s）；1w 主信号无回归，4w 底线未破。**ReadIndex 批合并的进一步收益归 Phase 3 (P2-A)**（证伪标准 §3.5：`rounds/s ≥ 0.8× reads/s` 且 `released-per-round ≤ 1.3×` 判无操作、转向读并行上限）。
 - **原始产物**：`docker/bench/bench-artifacts-phase2/round{1,2,3}.json|.txt`、`ss-metrics.txt`、`metrics-round.txt`（未入库）。
 
-## Phase 3: P2-A 单飞 cohort ReadIndex 屏障 + E 簿记瘦身 [PENDING]
-- [ ] **3.0 前置绿门：2.0 INV14 sim 在 A 改动前再次全绿**
-- [ ] 3.1 (TDD) 重设计实现：轮中到达者排队等**下一轮**；轮完成时放行**自己的 cohort**、以**自己的确认索引**为下界；同 drive_cycle 内立即发射下一轮；保留 C3 空闲单读同 cycle 发射（+10ms 回归警戒、空闲 p99≤5ms）→ `runtime/mod.rs:976-996,1800-1860`
-- [ ] 3.2 (TDD) 重试/超时（S12）：重试读加入下一 cohort、**per-read 截止时间**（不放行引入 cohort 级期限）→ `runtime/mod.rs:1838-1855`
-- [ ] 3.3 (TDD) E 簿记：token 匹配改 `HashMap`、`Option<NonZeroU64>` token（消除 `token:0` 占位脆弱性）、去 `pending_reads` 每轮 drain/重分配 → `runtime/mod.rs:850,1027-1032,1671,1804-1859`
-- [ ] 3.4 回归（含 2.0 INV14、l2/model-check/fuzz）+ 编译
-- [ ] 3.5 bench A/B + **证伪标准**：若 `rounds/sec ≥ 0.8 × reads/sec` 且 `released-per-round ≤ 1.3×`，判定 A 无操作、聚焦并行读上限（记录并转向，不返工）
-- [ ] 3.6 cohort 指标（released-per-round、attach rate）入 metrics，更新 `read_index_rounds_total` 语义
+## Phase 3: P2-A 单飞 cohort ReadIndex 屏障 + E 簿记瘦身 [CLOSED — A 预证伪，E 落地]
+- [x] 3.0 前置绿门：2.0 INV14 sim 在改动前全绿（已随 Phase-2 落地，重复确认通过）
+- [ ] 3.1 (TDD) 重设计实现 cohort 屏障 → **NOT DONE — A 按 §3.5 证伪标准判定预证伪，见下方证伪结论**；不实现，避免高风险 INV14 敏感读路径重写验证已知先验
+- [ ] 3.2 (TDD) 重试/超时 cohort 语义 → **NOT DONE — 依赖 A，随 A 一并证伪关闭**
+- [x] 3.3 (TDD) E 簿记：token 匹配改 `HashMap`、`Option<NonZeroU64>` token（消除 `token:0` 占位脆弱性）、去 `pending_reads` 每轮 drain/重分配 → commit（见 Notes），**声明范围 = token 脆弱性修复 + 高 pending 尾部风险（O(pending²)），非基准性能**
+- [x] 3.4 回归：INV14 绿 + workspace/l2/model-check/fuzz + 编译（随 E 执行）
+- [ ] 3.5 bench A/B 证伪 → **以预注册标准 + 已有证据判定 A 无操作（不跑 A/B——A 未实现，判据由基线 §7 + Phase-2 机制表 + 上限核算闭合）**
+- [ ] 3.6 cohort 指标（released-per-round、attach rate）→ **NOT DONE — YAGNI，A 证伪后无需新增指标；`read_index_rounds_total` 语义不变（E 为内部重构）**
+
+### Phase-3 证伪结论（A — cohort ReadIndex 屏障）
+
+**结论：A 预证伪，不再实现。** 四链证据，其中两条于实现后不可再得：
+
+1. **C4 验尸**（`propsol-v0.2.md:553-556`）：读到达时 in-flight≈0；时间窗口合并实测无操作并回滚。
+2. **Phase-1 基线 §7 + Phase-2 机制表**：reads/round 0.71→0.53（轮次 > 读次），pending 峰值仅 3–8 → 无排队形成，特征在基线即可观测。
+3. **Phase-2 自然实验（决定性）**：B 落地使 rounds/s **+37%**（3154→4322）的同时吞吐 +5.6~14.6%、p50 全线下降 → ReadIndex 轮次发射**不是**吞吐约束；而 A 的唯一杠杆恰是减少轮次。
+4. **到达流上限核算**：A 的 cohort 上限 ≈ 1+λ·RTT ≈ 1.6×（λ=2892/s，RTT≈0.2ms），轮次减少上限 ≈ 35%，且轮中到达者多付一轮 RTT 延迟；收益上限低于/紧贴阈值。
+
+**替代说明（预注册修订）**：§3.5 字面为"实现后 A/B 判定"（`released-per-round` 仅 A 实现后才存在）；本结论以基线 `reads/round` + pending 峰值 + Phase-2 自然实验 + 上限核算**替代**实现后判据（亦为普通 1.3 早已标注"P2-A 证伪基线"的务实解读），因自然实验与上限共同闭合了因果缺口。证伪结论注册在 `ref:ora-1` 决策。
+
+**重开触发条件**（基于现有指标，无需新工具）：若 `read_index_pending` 持续峰值 ≥ ~2× 基线（新负载形态下），或 RTT 膨胀后重算上限，则重开 A。
+
+- 佐证：fix-2 独立推演（稳态下 A 与 C3 每轮相等、无增量收益）与 @oracle 决策一致（不统计为实现，避免沉没成本推理）。
 
 ## Phase 4: P4 读服务线程解耦 + 出站不内联 await [PENDING]
-- [ ] 4.0 (构建接缝前置) 若需将 apply 移出 sim runtime，加构建接缝（构造参数/feature）保 l2/model-check 确定性；否则按"读服务移出 actor 线程"执行（B 的 `Arc<RwLock>` 支持、sim 兼容）
-- [ ] 4.1 (TDD) 读服务（SM 读侧）移出 actor 的 current-thread runtime → `runtime/mod.rs:885-886,2213-2227`
+- [ ] 4.0 (构建接缝前置) 若需将 apply 移出 sim runtime，加构建接缝（构造参数/feature）保 l2/model-check 确定性；否则按"读服务移出 actor 线程"执行（B 的 `Arc<RwLock>` 支持、sim 兼容）；**前置：E 已落地（3.3）**
+- [ ] 4.1 (TDD) 读服务（SM 读侧）移出 actor 的 current-thread runtime → `runtime/mod.rs:885-886,2213-2227`；**基于 E 精简后簿记** → `runtime/mod.rs:850,1027-1032,1671,1804-1859`
 - [ ] 4.2 (TDD) peer 出站 `Message` 改 per-peer 有界队列 + 独立发送任务：**满=丢弃+计数**、per-peer FIFO 保持（`deliver_grouped` 契约）；审计快照传输（`HeldSnapshot`/`finish_snapshot_fetch`）**不经过**该队列 → `consensus/node.rs:1124-1171,1199-1202`
-- [ ] 4.3 回归 + bench：尾延迟、并发写风暴下线性读 p99、慢 peer、快照安装场景
+- [ ] 4.3 回归 + bench：尾延迟、并发写风暴下线性读 p99、慢 peer、快照安装场景；**INV14 门（2.0）重挂为永久回归资产**
 
 ## Phase 5: 4w 门槛固化 + 文档 + 合入 [PENDING]
 - [ ] 5.1 `scripts/check-perf-baseline.sh` 增 4w 线性读门槛：脚本内 n=2–4 运行取中位数、阈值=**不劣于改动前 4w 底线**（回归式）、1w 保持主信号
@@ -101,3 +116,4 @@ updated: 2026-10-07
 
 
 - 2026-10-07: **Phase 2 完成**（commit 链 `c23430b`→`f9f45cb`→`da13a1f`→`0c2af66`→`b8c4ae7`）。读并行化 B 全部落地：去 mpsc 串行、直接 SM 服务、weak 读脱离 apply 线程、`restore()` 解码移锁外。A/B（同集群、3 轮中位数）：1w 4256≥4157 无回归；4w 2892≥2739 底线、8w +14.6%；put 不反弹；stale +3.0%。ReadIndex rounds/s 3154→4322（reads/round 0.68→0.53）为去串行副作用，机制归因见 §Phase-2 结果。Phase 3 (P2-A cohort 屏障) 可启动：2.0 INV14 门已绿.
+- 2026-10-07: **Phase 3 关闭 —— A 预证伪（`ref:ora-1` 决策），E 落地**。完整证伪结论见 §Phase-3 证伪结论块（C4 验尸 + 基线 §7 reads/round<1/pending 3–8 + Phase-2 自然实验 rounds/s+37% 而吞吐升 + 上限核算 ≤1.6×）。3.1/3.2/3.6 记为 NOT DONE（随 A 关闭，YAGNI）；3.3 (E) 落地为 Token/簿记瘦身，scope = 脆弱性修复 + 高 pending 尾部风险，非基准性能。Phase 4 启动（读服务线程解耦 + 出站不内联 await），前置 = E（已落地）+ INV14 门重挂 4.3。
