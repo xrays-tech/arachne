@@ -1,6 +1,6 @@
 ---
 status: in-progress
-phase: 1
+phase: 2
 updated: 2026-10-07
 ---
 
@@ -27,13 +27,13 @@ updated: 2026-10-07
 
 ---
 
-## Phase 1: 基线与可观测性 [IN PROGRESS]
-- [ ] **1.1 重跑 docker/bench 基线（1w/4w linear、stale、put，多轮取中位数、同集群 A/B，n=400）** ← CURRENT
-- [ ] 1.2 扩可观测性：确认 `arachne_read_index_rounds_total` / `pending` 基线，并规划新增 **cohort 指标**（released-per-round、attach rate）作为 A 阶段的评估单位
-- [ ] 1.3 录入对照表：1w/4w linear + stale + put（与 `propsol-v0.2.md:561`、报告 §2.2 对齐），顺带记录每次运行的 rounds/sec
+## Phase 1: 基线与可观测性 [COMPLETE]
+- [x] 1.1 重跑 docker/bench 基线（1w/4w linear、stale、put，多轮取中位数、同集群 A/B，n=400）→ `dev-docs/bench-baseline-2026-10-07.md`（commit 0ade947）
+- [x] 1.2 扩可观测性：确认 `arachne_read_index_rounds_total` / `pending` 基线，规划 **cohort 指标**（released-per-round、attach rate）作 A 阶段评估单位
+- [x] 1.3 录入对照表：本机 4w Arachne 2739 vs etcd 1979 ops/s（+38%，方向与 §Y"慢 14%"相反，符合 §Z 方差）；1w 4157 ≥ 4000 无回归；4w/8w `reads/round < 1`、pending 峰值 3–4 → 无 cohort 批合并收益（P2-A 证伪基线）
 
-## Phase 2: P3-B 状态机读并行化（`Arc<RwLock>` 快照 + 直接读） [PENDING]
-- [ ] **2.0 (TDD) 读路径正确性地基：INV14 分区注入测试**（旧 leader 已废黜未察觉 + `set_link_latency`/`hold` 延迟心跳 + 读在轮中途到达）→ 落库为所有后续读路径改动的绿门
+## Phase 2: P3-B 状态机读并行化（`Arc<RwLock>` 快照 + 直接读） [IN PROGRESS]
+- [ ] **2.0 (TDD) 读路径正确性地基：INV14 分区注入测试**（旧 leader 已废黜未察觉 + `set_link_latency`/`hold` 延迟心跳 + 读在轮中途到达）→ 落库为所有后续读路径改动的绿门 ← CURRENT
 - [ ] 2.1 (TDD) `KvStateMachine` 改 `Arc<RwLock<BTreeMap>>`：发布顺序 = 写锁内先改 map 后升版本、读者先读版本后读 map → `state_machine/kv.rs:66-71,301-311`
 - [ ] 2.2 (TDD) `resolve_reads` 直接内存读（去 `reads` mpsc hop）；**保留 actor 门禁 `applied ≥ read_index` + 版本断言**（P4 前以断言/告警形式存在）→ `runtime/mod.rs:1824-1833,1816-1819`
 - [ ] 2.3 (TDD) `get_stale` 读**实时最新发布态**、脱离 apply 任务并发服务；HTTP `Busy→503` 映射不变 → `runtime/mod.rs:1637-1651`
