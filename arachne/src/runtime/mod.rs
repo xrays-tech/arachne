@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -291,7 +292,9 @@ struct Pending {
 /// (propsol §5.4).
 struct PendingRead {
     /// The 8-byte token registered with raft's ReadIndex round (big-endian).
-    token: u64,
+    /// `None` = not yet stamped into a round (C3 coalescing pending); `Some(t)`
+    /// = stamped with round token `t` and awaiting quorum confirmation.
+    token: Option<NonZeroU64>,
     /// The key to read once the read index is applied.
     key: Vec<u8>,
     /// Reply channel, taken exactly once on resolution.
@@ -302,12 +305,6 @@ struct PendingRead {
     read_index: Option<LogIndex>,
     /// How many times this read has been issued (`1` initially; one retry allowed).
     attempts: u8,
-    /// Whether the ReadIndex round for this read has been fired (C3 coalescing).
-    /// A read is registered with `false` and sits in `pending_reads` until the
-    /// next `drive_cycle` stamps a shared batch token and issues the round; the
-    /// round is confirmed when `read_index` is set below. A retry resets this
-    /// to `false` so the next cycle re-fires it with a fresh token.
-    read_index_issued: bool,
 }
 
 /// Upper bound on concurrent pending ReadIndex reads (propsol §4.1/§7: 4096).
@@ -817,7 +814,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             read_index_timeout: Duration::from_millis(
                 config.profile.read_index_timeout_ms.max(1),
             ),
-            next_read_token: 0,
+            next_read_token: 1,
             propose_timeout: Duration::from_millis(config.profile.election_timeout_ms.max(1)),
             session_clock: None,
             sessions: HashMap::new(),
@@ -952,17 +949,16 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         // pay that full interval (the exact bug the `read_latency` gate caught).
         // Firing here keeps an idle linear read on the same event-driven path
         // it was on before C3.
-        if self.pending_reads.iter().any(|r| !r.read_index_issued) {
-            let token = self.next_read_token;
-            self.next_read_token += 1;
+        if self.pending_reads.iter().any(|r| r.token.is_none()) {
+            let token = NonZeroU64::new(self.next_read_token).unwrap_or(NonZeroU64::MIN);
+            self.next_read_token = self.next_read_token.wrapping_add(1);
             self.metrics.inc_read_index_rounds();
             for r in self.pending_reads.iter_mut() {
-                if !r.read_index_issued {
-                    r.token = token;
-                    r.read_index_issued = true;
+                if r.token.is_none() {
+                    r.token = Some(token);
                 }
             }
-            self.node.read_index(token.to_be_bytes().to_vec());
+            self.node.read_index(token.get().to_be_bytes().to_vec());
         }
  
         let outcome = match self.node.step().await {
@@ -992,7 +988,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
              let Ok(token_bytes) = ctx.as_slice().try_into() else {
                  continue;
              };
-             let token = u64::from_be_bytes(token_bytes);
+             let token = NonZeroU64::new(u64::from_be_bytes(token_bytes));
              let now = Instant::now();
              for r in self.pending_reads.iter_mut() {
                  if r.token == token {
@@ -1635,15 +1631,14 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // every read still waiting in this cycle and issues one quorum
                 // round for them (one `node.read_index` per cycle, not one per
                 // read). `token` is a placeholder until that commit.
-                self.pending_reads.push(PendingRead {
-                    token: 0,
-                    key,
-                    ack: Some(ack),
-                    deadline: Instant::now() + self.read_index_timeout,
-                    read_index: None,
-                    attempts: 1,
-                    read_index_issued: false,
-                });
+                 self.pending_reads.push(PendingRead {
+                     token: None,
+                     key,
+                     ack: Some(ack),
+                     deadline: Instant::now() + self.read_index_timeout,
+                     read_index: None,
+                     attempts: 1,
+                 });
             }
             Command::LeaderHint { ack } => {
                 let _ = ack.send(self.hint());
@@ -1823,9 +1818,8 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // coalescing as fresh reads).
                 r.attempts += 1;
                 r.read_index = None;
-                r.token = 0;
+                r.token = None;
                 r.deadline = now + self.read_index_timeout;
-                r.read_index_issued = false;
                 still.push(r);
             } else {
                 self.metrics.inc_read_index_timeout();
