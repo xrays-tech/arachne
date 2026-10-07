@@ -96,11 +96,12 @@ updated: 2026-10-07
 
 - 佐证：fix-2 独立推演（稳态下 A 与 C3 每轮相等、无增量收益）与 @oracle 决策一致（不统计为实现，避免沉没成本推理）。
 
-## Phase 4: P4 读服务线程解耦 + 出站不内联 await [PENDING]
-- [ ] 4.0 (构建接缝前置) 若需将 apply 移出 sim runtime，加构建接缝（构造参数/feature）保 l2/model-check 确定性；否则按"读服务移出 actor 线程"执行（B 的 `Arc<RwLock>` 支持、sim 兼容）；**前置：E 已落地（3.3）**
-- [ ] 4.1 (TDD) 读服务（SM 读侧）移出 actor 的 current-thread runtime → `runtime/mod.rs:885-886,2213-2227`；**基于 E 精简后簿记** → `runtime/mod.rs:850,1027-1032,1671,1804-1859`
-- [ ] 4.2 (TDD) peer 出站 `Message` 改 per-peer 有界队列 + 独立发送任务：**满=丢弃+计数**、per-peer FIFO 保持（`deliver_grouped` 契约）；审计快照传输（`HeldSnapshot`/`finish_snapshot_fetch`）**不经过**该队列 → `consensus/node.rs:1124-1171,1199-1202`
-- [ ] 4.3 回归 + bench：尾延迟、并发写风暴下线性读 p99、慢 peer、快照安装场景；**INV14 门（2.0）重挂为永久回归资产**
+## Phase 4: P4 读服务线程解耦 + 出站不内联 await [IN PROGRESS — 4.0/4.1/4.2 已落地，4.3 bench 进行中]
+- [x] 4.0 构建接缝前置：F4 决策落库（仅读服务移出 actor 线程，apply 留在 actor 保 l2/turmoil 确定性；Phase-2 `Arc<RwLock<Store>>` 为接缝边界）（commit `4be38b8`）
+- [x] 4.1 (TDD) 读服务（SM 读侧）移出 actor 的 current-thread runtime；线性/弱读的 `sm.get`+oneshot 交予 spawn 的 worker，ReadIndex 门/版本告警留 actor；新 TDD 门 `tests/read_concurrency_off_actor.rs`（16 并发线性读 + 写风暴，deadline 内全解析）（commit `4be38b8`）
+- [x] 4.2 (TDD) peer 出站 per-peer 有界队列 + 后台 sender 任务（`OUTBOUND_QUEUE_DEPTH=32`，满=丢弃+计数、follower 重传覆盖；仅 `start_outbound_sender` 带 `+Clone` 约束，非 Clone 测试传输可编译；快照路径已按本任务要求审计不经过该队列）；TDD `tests/outbound_queue.rs`（fast 复制 + 慢传输溢出计数 + 收敛；慢传输下 `Timeout`=文档超载语义）→ commit `160d446`（fix-3 中途取消，orchestrator 收尾完成）
+- [ ] **4.3 回归 + bench**（后台 lane fix-4 进行中：workspace 测试 全绿 + l2 确定性双跑 ✓ + model-check 无 counterexample ✓ + release 构建 ✓ + A/B 待收）→ 完成后以 `dev-docs/bench-baseline-phase4-2026-10-07.md` 为准回填
+  - 附件：4.3 完成时 INV14 门重挂已确认（读路径各改动均过 `inv14_deposed_leader`）
 
 ## Phase 5: 4w 门槛固化 + 文档 + 合入 [PENDING]
 - [ ] 5.1 `scripts/check-perf-baseline.sh` 增 4w 线性读门槛：脚本内 n=2–4 运行取中位数、阈值=**不劣于改动前 4w 底线**（回归式）、1w 保持主信号
