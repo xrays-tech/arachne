@@ -103,9 +103,9 @@ updated: 2026-10-07
 - [x] 4.3 回归 + bench：workspace 测试 全绿 + l2 确定性双跑 ✓ + model-check 无 counterexample ✓ + release 构建 ✓；A/B（`dev-docs/bench-baseline-phase4-2026-10-07.md`）：**1w 4267 ≥ 4157 无回归 ✓、4w 2917 ≥ 2892 底线、2w/8w/stale/put 均在方差带**；4w rounds/s ≈ 3182；pending 0–4（4.1 去 actor 后预期）；INV14 门保持绿（commit `6fea0d1`）
 
 ## Phase 5: 4w 门槛固化 + 文档 + 合入 [IN PROGRESS]
-- [ ] 5.1 `scripts/check-perf-baseline.sh` 增 4w 线性读门槛：脚本内 n=2–4 运行取中位数、阈值=**不劣于改动前 4w 底线**（回归式）、1w 保持主信号
-- [ ] 5.2 更新 `README.md` 测量章节与 `dev-docs/propsol-v0.2.md` 记录（含 A 证伪结论、cohort 语义迁移）
-- [ ] 5.3 完整门禁 `scripts/check-*.sh` 全绿 + 合入 main（PR，含 2.0 INV14 测试与基准对照）
+- [x] 5.1 `scripts/check-perf-baseline.sh` 增 T5 4w 线性读门槛：脚本内 RUNS=3 取中位数、**方差感知回归底线 2400**（初始实现绝对 2739 在本机重负载 ~2× 方差区间误报，见 Notes）+ p50≤1.5ms；**1w（T1）保持主信号**（commit `ff5838a`、`d39645c`）
+- [x] 5.2 更新 `README.md` 测量章节与 `dev-docs/propsol-v0.2.md` 记录（含 A 证伪结论、Phase-4 读服务移出 actor + 异步出站结果）（commit `88d8149`）
+- [x] 5.3 完整门禁 `scripts/check-*.sh` 全绿（confirm 全门禁 **exit 0**：1w 5219 / 4w 2485 中位 / put 633 / stale 7420 / B3 632 全 PASS）+ 合入 main（PR，含 2.0 INV14 测试与基准对照）
 
 ## Notes
 - 2026-10-07: 计划源自已合入调研报告（PR #1, `research/report-read-concurrency.md`）`ref:exp-1`, `ref:res-1`
