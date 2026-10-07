@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -31,6 +31,7 @@ use arachne_kv_seam::{
     NodeId, Transport, TransportFactory, TransportMessage, TransportRx,
 };
 use arachne_kv_seam::ForwardTransport;
+use std::collections::HashSet;
 
 /// Errors an in-memory transport can report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +99,14 @@ pub struct InMemoryTransportFactory {
     /// transports can fetch when streaming is on. The closure answers
     /// `(index, term)`.
     snapshot_sources: SnapshotSources,
+    /// Per-pair firewall: `(from, to)` pairs whose traffic the in-memory
+    /// switch silently drops. Used to model selective network partitions
+    /// (one-way or full) without tearing down a node's channels — a firewalled
+    /// sender still exists, so the recipient's actor keeps running (unaware)
+    /// instead of observing a closed channel and shutting down.
+    blocked: Arc<Mutex<HashSet<(NodeId, NodeId)>>>,
+    /// Test observability: number of messages silently dropped by the firewall.
+    dropped_by_firewall: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for InMemoryTransportFactory {
@@ -124,7 +133,24 @@ impl InMemoryTransportFactory {
             switch: Arc::new(Mutex::new(HashMap::new())),
             stream_snapshots: Arc::new(AtomicBool::new(false)),
             snapshot_sources: Arc::new(Mutex::new(HashMap::new())),
+            blocked: Arc::new(Mutex::new(HashSet::new())),
+            dropped_by_firewall: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Block all traffic from `from` to `to` (one-way firewall).
+    ///
+    /// Messages from `from` destined for `to` are silently dropped at the
+    /// switch; the channels stay alive so neither endpoint shuts down. Call
+    /// for both directions to fully isolate a pair.
+    pub fn firewall(&self, from: NodeId, to: NodeId) {
+        let mut set = self.blocked.lock().unwrap();
+        set.insert((from, to));
+    }
+
+    /// Test observability: number of messages the firewall dropped so far.
+    pub fn firewall_drop_count(&self) -> usize {
+        self.dropped_by_firewall.load(Ordering::Relaxed)
     }
 
     /// Make the transports this factory mints advertise snapshot streaming.
@@ -175,6 +201,8 @@ impl TransportFactory for InMemoryTransportFactory {
                 self_id: me.clone(),
                 stream_snapshots: Arc::clone(&self.stream_snapshots),
                 snapshot_sources: Arc::clone(&self.snapshot_sources),
+                blocked: Arc::clone(&self.blocked),
+                dropped_by_firewall: Arc::clone(&self.dropped_by_firewall),
             },
             InMemoryRx { receiver: rx },
         )
@@ -190,6 +218,10 @@ pub struct InMemoryTx {
     stream_snapshots: Arc<AtomicBool>,
     /// See [`InMemoryTransportFactory::set_snapshot_source`].
     snapshot_sources: SnapshotSources,
+    /// See [`InMemoryTransportFactory::firewall`].
+    blocked: Arc<Mutex<HashSet<(NodeId, NodeId)>>>,
+    /// Test observability: messages dropped by the firewall.
+    dropped_by_firewall: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for InMemoryTx {
@@ -252,11 +284,22 @@ impl Transport for InMemoryTx {
         // Delivery is synchronous and cheap, so we perform it eagerly and return
         // an already-resolved future. This keeps the `MutexGuard` from living
         // across any suspension point.
+        //
+        // A firewalled pair is dropped here *without* reporting an error: the
+        // sender must look healthy (a real partition drops packets, it does
+        // not tear down the socket), so the recipient stays alive and unaware
+        // rather than seeing a closed channel.
+        if let Ok(b) = self.blocked.lock() {
+            if b.contains(&(self.self_id.clone(), to.clone())) {
+                self.dropped_by_firewall.fetch_add(1, Ordering::Relaxed);
+                return std::future::ready(Ok(()));
+            }
+        }
         let result = {
             let guard = match self.switch.lock() {
                 Ok(g) => g,
                 // A poisoned lock means another thread panicked while holding
-                // it; we report it rather than panic here.
+                // it; we report rather than panic here.
                 Err(_) => return std::future::ready(Err(TransportError::SwitchPoisoned)),
             };
             match guard.get(&to) {
