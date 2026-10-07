@@ -96,14 +96,13 @@ updated: 2026-10-07
 
 - 佐证：fix-2 独立推演（稳态下 A 与 C3 每轮相等、无增量收益）与 @oracle 决策一致（不统计为实现，避免沉没成本推理）。
 
-## Phase 4: P4 读服务线程解耦 + 出站不内联 await [IN PROGRESS — 4.0/4.1/4.2 已落地，4.3 bench 进行中]
+## Phase 4: P4 读服务线程解耦 + 出站不内联 await [COMPLETE]
 - [x] 4.0 构建接缝前置：F4 决策落库（仅读服务移出 actor 线程，apply 留在 actor 保 l2/turmoil 确定性；Phase-2 `Arc<RwLock<Store>>` 为接缝边界）（commit `4be38b8`）
 - [x] 4.1 (TDD) 读服务（SM 读侧）移出 actor 的 current-thread runtime；线性/弱读的 `sm.get`+oneshot 交予 spawn 的 worker，ReadIndex 门/版本告警留 actor；新 TDD 门 `tests/read_concurrency_off_actor.rs`（16 并发线性读 + 写风暴，deadline 内全解析）（commit `4be38b8`）
 - [x] 4.2 (TDD) peer 出站 per-peer 有界队列 + 后台 sender 任务（`OUTBOUND_QUEUE_DEPTH=32`，满=丢弃+计数、follower 重传覆盖；仅 `start_outbound_sender` 带 `+Clone` 约束，非 Clone 测试传输可编译；快照路径已按本任务要求审计不经过该队列）；TDD `tests/outbound_queue.rs`（fast 复制 + 慢传输溢出计数 + 收敛；慢传输下 `Timeout`=文档超载语义）→ commit `160d446`（fix-3 中途取消，orchestrator 收尾完成）
-- [ ] **4.3 回归 + bench**（后台 lane fix-4 进行中：workspace 测试 全绿 + l2 确定性双跑 ✓ + model-check 无 counterexample ✓ + release 构建 ✓ + A/B 待收）→ 完成后以 `dev-docs/bench-baseline-phase4-2026-10-07.md` 为准回填
-  - 附件：4.3 完成时 INV14 门重挂已确认（读路径各改动均过 `inv14_deposed_leader`）
+- [x] 4.3 回归 + bench：workspace 测试 全绿 + l2 确定性双跑 ✓ + model-check 无 counterexample ✓ + release 构建 ✓；A/B（`dev-docs/bench-baseline-phase4-2026-10-07.md`）：**1w 4267 ≥ 4157 无回归 ✓、4w 2917 ≥ 2892 底线、2w/8w/stale/put 均在方差带**；4w rounds/s ≈ 3182；pending 0–4（4.1 去 actor 后预期）；INV14 门保持绿（commit `6fea0d1`）
 
-## Phase 5: 4w 门槛固化 + 文档 + 合入 [PENDING]
+## Phase 5: 4w 门槛固化 + 文档 + 合入 [IN PROGRESS]
 - [ ] 5.1 `scripts/check-perf-baseline.sh` 增 4w 线性读门槛：脚本内 n=2–4 运行取中位数、阈值=**不劣于改动前 4w 底线**（回归式）、1w 保持主信号
 - [ ] 5.2 更新 `README.md` 测量章节与 `dev-docs/propsol-v0.2.md` 记录（含 A 证伪结论、cohort 语义迁移）
 - [ ] 5.3 完整门禁 `scripts/check-*.sh` 全绿 + 合入 main（PR，含 2.0 INV14 测试与基准对照）
