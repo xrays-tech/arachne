@@ -130,11 +130,17 @@
       </p>
 
       <h3>get_stale 的“陈旧”是怎么回事</h3>
-      <p>
-        <code>get_stale</code> 直接读本节点的已应用状态机：任何节点都能答（无需重定向），
-        可以陈旧，而且文档明确写为<strong>不保证单调</strong>——连续两次调用可能看到乱序的值。
-        它的价值在于失去仲裁时仍可读——这是 CP 系统在一致性与可用性之间的取舍。
-      </p>
+        <p>
+          <code>get_stale</code> 直接读本节点的已应用状态机：任何节点都能答（无需重定向），
+          可以陈旧，而且文档明确写为<strong>不保证单调</strong>——连续两次调用可能看到乱序的值。
+          它的价值在于失去仲裁时仍可读——这是 CP 系统在一致性与可用性之间的取舍。
+        </p>
+        <p>
+          <strong>v0.3.0 附 index 变体</strong>：若需在失去仲裁时仍能判断“新旧”，
+          <code>get_stale_with_index</code> 在同一次本地读里返回 value 的<strong>溯源序号</strong>
+          （写入它的 log entry index；同群组跨 key/节点可比、present 时 <code>≥ 1</code>，
+          缺键 <code>None</code>）。顺序信息来自共识层、与值同源，因此无需 ReadIndex 仲裁即可排序。
+        </p>
 
       <h3>CP 语义：失去仲裁时宁可失败</h3>
       <p>

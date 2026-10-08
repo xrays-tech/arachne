@@ -128,6 +128,17 @@
 
       <div class="api-method">
         <div class="sig">
+          <code>pub async fn get_stale_with_index(key: &amp;[u8]) -&gt; Result&lt;Option&lt;(Vec&lt;u8&gt;, u64)&gt;, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-amber">本地读</span><span class="badge badge-mono">index ≥1</span></span>
+        </div>
+        <div class="desc">
+          <p>本地（弱）读 + value 的<strong>溯源序号</strong>（v0.3.0）：返回 <code>(value, index)</code>，其中 <code>index</code> 是写入该 value 的那条 log entry 的序号（同 raft 组内跨 key/节点可比、per-key 单调、present 时 <code>≥ 1</code>；缺键回 <code>None</code>）。</p>
+          <p>成本与可用性与 <code>get_stale</code> 相同（本地读、无仲裁、无额外 RTT）——但 value 与其序号同源可证，外部调用方可直接排序而不依赖线性读。滞后读取的注意点与 <code>get_stale</code> 相同（N1：值仍可能陈旧；公开 API 永不出现 index 0）。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
           <code>pub async fn delete(key: &amp;[u8]) -&gt; Result&lt;(), ArachneError&gt;</code>
           <span class="badges"><span class="badge badge-teal">async</span></span>
         </div>
@@ -198,6 +209,10 @@
             <tr>
               <td><code>get_stale(&amp;self, key: &amp;[u8]) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;, ArachneError&gt;</code></td>
               <td>任意陈旧读：直接读本节点已应用状态机。任何节点可答（无重定向），可能陈旧，且<strong>不保证单调</strong>。滞后读取：写入提交后本节点状态机在毫秒级（实测 ≤7ms）内追平；提交后紧接的一次可能返回 <code>None</code>/旧值——单次 <code>None</code> 不是该 key「不存在」的权威否证，需要权威读请用 <code>get</code>。</td>
+            </tr>
+            <tr>
+              <td><code>get_stale_with_index(&amp;self, key: &amp;[u8]) -&gt; Result&lt;Option&lt;(Vec&lt;u8&gt;, u64)&gt;, ArachneError&gt;</code></td>
+              <td>任意陈旧读 + value 的<strong>溯源序号</strong>（v0.3.0）：返回 <code>(value, index)</code>，<code>index</code> 为写入该 value 的 log entry 序号（同等 <code>get_stale</code> 的陈旧/非单调语义 N1，但值-序同源可排序；present 时 <code>index ≥ 1</code>，缺键回 <code>None</code>）。</td>
             </tr>
           </tbody>
         </table>

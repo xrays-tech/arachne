@@ -18,11 +18,11 @@
 | 5 | node HTTP 暴露/冒烟 `get_stale_with_index` | P2 | §8 承诺，改动 S；B 纯本地读、无实际消费方 → 完整性而非风险 | — | S |
 | 6 | fuzz：kv snapshot `restore`/`decode_store` target | P2 | 新格式（payload 版本字节 + 8B index）确为 panic 面，现 `fuzz_targets/` 仅 `wal_recovery` | **1**；改 `ci.yml` nightly fuzz job 目标名 | M |
 | 7 | l2 确定性 lane（`l2/tests/in_sim.rs`，turmoil）+ CI `--locked` | P2 | 实质确定性套件在此（≥core lean 已测的 l2_scenarios）；补 `--locked` 堵 drift | **1** | S–M |
-| 8 | model-check 跑通 | P3 | `model-check/src/main.rs` 系 M0 scaffold，跑通**不覆盖新编码**，勿当格式验证 | — | S |
+| 8 | model-check 跑通 | P3 | `model-check/src/main.rs` 系 M0 scaffold，跑通**不覆盖新编码**，勿当格式验证。**✓ 2026-10-08 跑通（PASS，观测完成）** | — | S |
 | 9 | `put_with_index`（Option A） | P3 | 可被「put + get_stale_with_index」覆盖；动写 ack 管线 + proto + 滚动门控，收益/成本不划算 | 下游触发 | L |
 | 10 | delete 带序号 / tombstone | P3 | 语义未定（缺键 None 冲突），需先开 API 语义设计 | 下游触发 | L+ |
-| 11 | 快照尺寸/压缩点观察 | P3 | 每 key +8B index +1B 头 → `snapshot_threshold` 触发点前移；`bench-baseline` 已有 | — | S |
-| 12 | 公开 API 站点/embedding 文档同步 | P3 | `docs/api-reference.html` 与 facade/embedding 一致性 | — | S |
+| 11 | 快照尺寸/压缩点观察 | P3 | 每 key +8B index +1B 头 → `snapshot_threshold` 触发点前移；**✓ 2026-10-08 观察已登记**（runbook §6；待真实部署量化） | — | S |
+| 12 | 公开 API 站点/embedding 文档同步 | P3 | `docs/api-reference.html` 与 facade/embedding 一致性。**✓ 2026-10-08 已补**（api-reference + tutorial） | — | S |
 
 > **评审差异说明**：原草案将 #1 标 P2、#5 标 P1、`arachne-sim` 单列——@oracle 实测改为 #1 P0（CI 已红）、#5 P2、`arachne-sim` 为 13 行 scaffold 无判定（剔除，并入 #7）。
 
@@ -72,11 +72,11 @@ Phase 3  #8/#11/#12 观察与文档项；#9/#10 下游触发
 - 验收：in_sim 套件绿；与 fuzz/model-check 同口径。
 
 ### P3（观察/触发式，不做则挂账）
-- **#8 model-check 跑通**——注意：scaffold 不验证新编码，仅作观测。
+- **#8 model-check 跑通**——注意：scaffold 不验证新编码，仅作观测。**✓ 2026-10-08 跑通 PASS。**
 - **#9 `put_with_index`**——设计 §9.1 已含并发修正；下游 `put` 后免回读需求出现才做。
 - **#10 delete tombstone**——先开 API 语义设计（缺键+序号 vs 缺键=None）；hydra 出现「删有序键」需求才做。
-- **#11 快照尺寸/压缩点观察**——记 `bench-baseline` 一条。
-- **#12 API 站点/embedding 文档同步**——`docs/api-reference.html` 补 `get_stale_with_index`。
+- **#11 快照尺寸/压缩点观察**——**✓ 2026-10-08 观察已登记**：runbook §6 写明 per-key +8B 与阈值前移；真实部署后按 `bench-baseline` 口径量化。
+- **#12 API 站点/embedding 文档同步**——**✓ 2026-10-08 已补**：`docs/api-reference.html`（facade 方法块 + Handle 表行）+ `tutorial.html` get_stale 段。
 
 ## 3. 外部挂账（不计入本仓待办，不得以内绿关闭）
 - **hydra 三方抽验**：以「head index ≥ 已应用 index 才物化」接入并按下游验收流程回执（design §8）。这是 v0.3.0 的 acceptance，由下游侧驱动，本仓侧保持开放挂账。
