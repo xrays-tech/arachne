@@ -37,6 +37,7 @@ use crate::client::ArachneError;
 use crate::runtime::Command;
 use crate::state_machine::{
     CasOp, CasPred, CasResult, KvStateMachine, MAX_MULTI_PUT_ENTRIES, MAX_MULTI_PUT_TOTAL_BYTES,
+    WatchEvent,
 };
 use crate::{
     ApplyOutcome, ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
@@ -513,6 +514,51 @@ impl Handle {
             .await
             .map_err(|_| ArachneError::ShuttingDown)?;
         self.await_oneshot(ack_rx, deadline).await?
+    }
+
+    /// Open a **watch** over a byte prefix (M4/P2, design D3/D5): a consistent
+    /// prefix snapshot at the current applied watermark + a stream of write-set
+    /// events *after* that watermark.
+    ///
+    /// The consumer reconstructs the prefix state as `snapshot ∪ events`:
+    /// every event has `event.index > snapshot_index`, so nothing is missed or
+    /// duplicated between the two (a strict `>` filter; the snapshot itself
+    /// already contains the entry at its own index). Events are ordered and
+    /// monotone in `index`.
+    ///
+    /// The subscription's receiver is **bounded** (design D2): a consumer that
+    /// does not drain fast enough is **disconnected** — the channel closes with
+    /// no silent gap — and the caller must re-`watch` (re-snapshot). `limit`
+    /// bounds the snapshot size; a prefix whose snapshot would exceed it is
+    /// rejected (`Busy`) rather than returned truncated (a truncated snapshot
+    /// would silently miss the older keys).
+    pub async fn watch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<WatchSubscription, ArachneError> {
+        self.validate_key(prefix)?;
+        let end = successor(prefix);
+        let deadline = Instant::now() + self.inner.timeout;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(Command::Watch {
+                start: prefix.to_vec(),
+                end: end.unwrap_or_default(),
+                limit,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| ArachneError::ShuttingDown)?;
+        let (snapshot, applied_index, truncated, events) =
+            self.await_oneshot(ack_rx, deadline).await??;
+        Ok(WatchSubscription {
+            snapshot,
+            applied_index,
+            truncated,
+            events,
+        })
     }
 
     /// Report this node's current leader hint: a `(NodeId, SocketAddr)` if a
@@ -1120,6 +1166,41 @@ struct HandleInner {
     /// set, a `NotLeader` whose hinted leader is not a known in-process peer is
     /// forwarded over the wire instead of collapsing to `QuorumUnavailable`.
     remote: Option<Arc<dyn RemoteForwarder>>,
+}
+
+/// The lower bound of a [`watch`](Handle::watch) subscription (M4/P2, design
+/// D5): the consistent prefix snapshot at its applied watermark plus the
+/// bounded stream of write-set events that followed. The consumer rebuilds the
+/// prefix state as `snapshot ∪ events` (every event has `index >
+/// applied_index`, so nothing is missed or duplicated).
+pub struct WatchSubscription {
+    /// The prefix snapshot as of `applied_index` (`(key, value)` pairs in byte
+    /// order), bounded by the `limit` passed to `watch`.
+    pub snapshot: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The applied watermark the snapshot was taken at. All events in `events`
+    /// have `index > applied_index`.
+    pub applied_index: u64,
+    /// Always `false` from `Handle::watch` — a truncated snapshot is rejected
+    /// at registration (design D3) rather than returned incomplete. Kept on the
+    /// type so the field is explicit and forward-compatible.
+    pub truncated: bool,
+    /// Ordered, monotone-in-`index` write-set events strictly after
+    /// `applied_index`. A consumer that falls behind is **disconnected**: the
+    /// channel closes (no silent gap) and the caller must re-`watch`.
+    pub events: mpsc::Receiver<WatchEvent>,
+}
+
+impl std::fmt::Debug for WatchSubscription {
+    /// Hand-written: `mpsc::Receiver` has no `Debug`; print the snapshot and
+    /// watermark and note the receiver is omitted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchSubscription")
+            .field("snapshot", &self.snapshot)
+            .field("applied_index", &self.applied_index)
+            .field("truncated", &self.truncated)
+            .field("events", &"<mpsc::Receiver<WatchEvent>>")
+            .finish()
+    }
 }
 
 /// The next per-handle `client_id`: the process id in the high bits (so

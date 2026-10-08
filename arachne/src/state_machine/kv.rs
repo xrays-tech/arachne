@@ -159,6 +159,44 @@ pub enum CasResult {
     },
 }
 
+/// A single write-set event produced by applying a command (M4/P2 watch).
+///
+/// Semantics (oracle D6): a **write set**, not a diff — a `delete` of an absent
+/// key still emits a `Delete` event (etcd-aligned); only the session's *first*
+/// application emits events (a deduped replay produces none). Events are a
+/// pure by-product of `apply`: they are **not persisted** (no format change),
+/// and the state machine computes them while the runtime owns their delivery
+/// (so determinism is never violated by I/O).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchEvent {
+    /// The log index of the applied entry that produced this event.
+    pub index: LogIndex,
+    /// The key that changed.
+    pub key: Vec<u8>,
+    /// The new value; `None` for a delete/miss-write event.
+    pub value: Option<Vec<u8>>,
+}
+
+impl WatchEvent {
+    /// A put-style event (value present, possibly empty).
+    fn put(index: LogIndex, key: &[u8], value: &[u8]) -> Self {
+        Self {
+            index,
+            key: key.to_vec(),
+            value: Some(value.to_vec()),
+        }
+    }
+
+    /// A delete-style event (key removed; a write-set delete even if absent).
+    fn delete(index: LogIndex, key: &[u8]) -> Self {
+        Self {
+            index,
+            key: key.to_vec(),
+            value: None,
+        }
+    }
+}
+
 /// A session key for idempotency: `(client_id, seq_no)`.
 ///
 /// `Ord` is derived so the session table can live in a `BTreeMap`, which keeps
@@ -651,149 +689,11 @@ impl StateMachine for KvStateMachine {
     type Error = KvError;
 
     fn apply(&self, index: LogIndex, command: &[u8]) -> Result<ApplyOutcome, Self::Error> {
-        // The write lock is held for the whole apply. We mutate the maps FIRST
-        // and bump `applied` LAST (D-Ord), so a reader never sees `version >= C`
-        // with entry `C` missing.
-        let mut guard = self
-            .store
-            .write()
-            .map_err(|_| KvError::PoisonedLock)?;
-        // Strict ordering: an entry must be exactly `applied + 1` (a duplicate
-        // or a gap is an invariant violation => fail-stop).
-        if index != guard.applied + 1 {
-            return Err(KvError::IndexViolation { index });
-        }
-
-        // A no-op entry (empty payload) is how a leader records its term; it
-        // advances the index but changes no state.
-        if command.is_empty() {
-            guard.applied = index;
-            return Ok(ApplyOutcome::None);
-        }
-
-        if command.first() == Some(&OP_SESSION_GC) {
-            let sessions = Self::parse_session_gc(command)?;
-            for session in sessions {
-                guard.sessions.remove(&session);
-            }
-            guard.applied = index;
-            return Ok(ApplyOutcome::None);
-        }
-
-        // Atomic multi-put (M2-P1B): one command applies a whole key set under
-        // a single lock hold and a single `(client_id, seq_no)` session. All
-        // entries share this command's log index (same atomic apply), so a
-        // reader observes either all of them or none of them at one watermark.
-        // A replayed session returns its cached `None` without re-mutating —
-        // exactly-once, like the single-key ops.
-        if command.first() == Some(&OP_MULTI_PUT) {
-            let (session, entries) = Self::parse_multi_put(command)?;
-            let cached = guard.sessions.get(&session).cloned();
-            if cached.is_none() {
-                for (key, val) in entries {
-                    guard
-                        .kv
-                        .insert(key, Entry { val, index });
-                }
-                guard.sessions.insert(session, ApplyOutcome::None);
-            }
-            guard.applied = index;
-            return Ok(ApplyOutcome::None);
-        }
-
-        // Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`.
-        // A matching predicate applies `op` (put/delete, same apply index);
-        // a miss produces `ApplyOutcome::CasFailed` carrying the state the
-        // compare saw — and the FAILED session is still recorded, so a replay
-        // returns the cached failure without recomputing the compare
-        // (exactly-once: a re-evaluation could flip an originally-failed CAS
-        // to success and break the "at most one outcome" invariant, §6.2.2).
-        if command.first() == Some(&OP_CAS) {
-            let (session, key, pred, success) = Self::parse_cas(command)?;
-            let cached = guard.sessions.get(&session).cloned();
-            let outcome = match cached {
-                Some(cached) => cached,
-                None => {
-                    // Evaluate the predicate against the CURRENT stored state
-                    // (still under the write lock; no torn read).
-                    let current = guard.kv.get(&key);
-                    let matched = match &pred {
-                        CasPred::IndexEquals(want) => {
-                            current.map(|e| e.index == *want).unwrap_or(false)
-                        }
-                        CasPred::ValueEquals(want) => {
-                            current.map(|e| e.val == *want).unwrap_or(false)
-                        }
-                        CasPred::NotExists => current.is_none(),
-                    };
-                    let outcome = if matched {
-                        match success {
-                            CasOp::Put(value) => {
-                                guard.kv.insert(key, Entry { val: value.clone(), index });
-                                ApplyOutcome::Value(value)
-                            }
-                            CasOp::Delete => {
-                                guard.kv.remove(&key);
-                                ApplyOutcome::None
-                            }
-                        }
-                    } else {
-                        let (current_index, current_value) = match current {
-                            Some(e) => (
-                                e.index,
-                                // Cloned current value for the client's retry.
-                                Some(e.val.clone()),
-                            ),
-                            None => (0, None),
-                        };
-                        ApplyOutcome::CasFailed {
-                            current_index,
-                            current_value,
-                        }
-                    };
-                    // Record BOTH outcomes — success and failure — in the
-                    // session table (failure too: §6.2.2).
-                    guard.sessions.insert(session, outcome.clone());
-                    outcome
-                }
-            };
-            guard.applied = index;
-            return Ok(outcome);
-        }
-
-        let (session, op, key, val) = Self::parse_command(command)?;
-
-        // Idempotency: a replayed session returns its cached result without
-        // re-mutating the store.
-        let outcome = match guard.sessions.get(&session) {
-            Some(cached) => cached.clone(),
-            None => {
-                let outcome = match op {
-                    Op::Put => {
-                        // D-Ord: the entry (with its origin index) lands in the
-                        // map first; `applied` is bumped last. The origin index
-                        // is this command's log index — stable across deduped
-                        // replays, which take the `Some(cached)` arm and skip
-                        // this write entirely.
-                        guard.kv.insert(
-                            key.clone(),
-                            Entry { val: val.clone(), index },
-                        );
-                        ApplyOutcome::Value(val)
-                    }
-                    Op::Delete => {
-                        guard.kv.remove(&key);
-                        ApplyOutcome::None
-                    }
-                };
-                guard.sessions.insert(session, outcome.clone());
-                outcome
-            }
-        };
-
-        // Version is bumped LAST (D-Ord).
-        guard.applied = index;
-        Ok(outcome)
+        // Delegate: the seam's `apply` returns the outcome only; watch events
+        // are a pure by-product available to the runtime via
+        // [`KvStateMachine::apply_with_events`] (M4 design D1: the state
+        // machine *computes* events, the runtime owns their *delivery*).
+        self.apply_with_events(index, command).map(|(outcome, _)| outcome)
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -895,6 +795,202 @@ impl StateMachine for KvStateMachine {
 }
 
 impl KvStateMachine {
+    /// Apply `command` at `index` and, on the session's **first** application,
+    /// produce its **write-set** watch events (M4/P2 watch, design D1/D6).
+    ///
+    /// This is the deterministic heart of watch: the state machine *computes*
+    /// what changed (put/delete/multi_put per key/CAS-success op), the runtime
+    /// owns *delivering* it. It is a pure function of `(index, command, prior
+    /// state)` — no I/O, no clock — so it is safe to call from the apply task
+    /// while the seam's [`StateMachine::apply`] keeps returning the outcome
+    /// only (this method is what the runtime's event path uses).
+    ///
+    /// Event semantics (oracle D6):
+    /// * **write set, not diff** — a `delete` emits a `Delete` event even when
+    ///   the key was already absent;
+    /// * **first application only** — a deduped replay (same `(client_id,
+    ///   seq_no)` seen before) produces no events;
+    /// * `multi_put` emits one event per key (group duplicates collapse to the
+    ///   final value);
+    /// * a successful `cas` emits its success op's event; a failed `cas`
+    ///   produces none (no mutation happened).
+    ///
+    /// Events are **not persisted** and never touch `KV_SNAPSHOT_VERSION` (a
+    /// watch rebuilds from a snapshot + live events, WAL tail aside).
+    pub fn apply_with_events(
+        &self,
+        index: LogIndex,
+        command: &[u8],
+    ) -> Result<(ApplyOutcome, Vec<WatchEvent>), KvError> {
+        // The write lock is held for the whole apply. We mutate the maps FIRST
+        // and bump `applied` LAST (D-Ord), so a reader never sees `version >= C`
+        // with entry `C` missing.
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| KvError::PoisonedLock)?;
+        // Strict ordering: an entry must be exactly `applied + 1` (a duplicate
+        // or a gap is an invariant violation => fail-stop).
+        if index != guard.applied + 1 {
+            return Err(KvError::IndexViolation { index });
+        }
+
+        // A no-op entry (empty payload) is how a leader records its term; it
+        // advances the index but changes no state.
+        if command.is_empty() {
+            guard.applied = index;
+            return Ok((ApplyOutcome::None, Vec::new()));
+        }
+
+        if command.first() == Some(&OP_SESSION_GC) {
+            let sessions = Self::parse_session_gc(command)?;
+            for session in sessions {
+                guard.sessions.remove(&session);
+            }
+            guard.applied = index;
+            return Ok((ApplyOutcome::None, Vec::new()));
+        }
+
+        // Atomic multi-put (M2-P1B): one command applies a whole key set under
+        // a single lock hold and a single `(client_id, seq_no)` session. All
+        // entries share this command's log index (same atomic apply), so a
+        // reader observes either all of them or none of them at one watermark.
+        // A replayed session returns its cached `None` without re-mutating —
+        // exactly-once, like the single-key ops. Its write-set events collapse
+        // per key to the **final** value (a group-duplicate key emits one event
+        // with the last value, not one per occurrence — design D6).
+        if command.first() == Some(&OP_MULTI_PUT) {
+            let (session, entries) = Self::parse_multi_put(command)?;
+            let cached = guard.sessions.get(&session).cloned();
+            let mut events = Vec::new();
+            if cached.is_none() {
+                // Collect final value per key (last occurrence wins), then one
+                // event per distinct key.
+                let mut keys = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+                for (key, val) in entries {
+                    guard
+                        .kv
+                        .insert(key.clone(), Entry { val: val.clone(), index });
+                    keys.insert(key, val);
+                }
+                for (key, val) in keys {
+                    events.push(WatchEvent::put(index, &key, &val));
+                }
+                guard.sessions.insert(session, ApplyOutcome::None);
+            }
+            guard.applied = index;
+            return Ok((ApplyOutcome::None, events));
+        }
+
+        // Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`.
+        // A matching predicate applies `op` (put/delete, same apply index);
+        // a miss produces `ApplyOutcome::CasFailed` carrying the state the
+        // compare saw — and the FAILED session is still recorded, so a replay
+        // returns the cached failure without recomputing the compare
+        // (exactly-once: a re-evaluation could flip an originally-failed CAS
+        // to success and break the "at most one outcome" invariant, §6.2.2).
+        if command.first() == Some(&OP_CAS) {
+            let (session, key, pred, success) = Self::parse_cas(command)?;
+            let cached = guard.sessions.get(&session).cloned();
+            let (outcome, events) = match cached {
+                Some(cached) => (cached, Vec::new()),
+                None => {
+                    // Evaluate the predicate against the CURRENT stored state
+                    // (still under the write lock; no torn read).
+                    let current = guard.kv.get(&key);
+                    let matched = match &pred {
+                        CasPred::IndexEquals(want) => {
+                            current.map(|e| e.index == *want).unwrap_or(false)
+                        }
+                        CasPred::ValueEquals(want) => {
+                            current.map(|e| e.val == *want).unwrap_or(false)
+                        }
+                        CasPred::NotExists => current.is_none(),
+                    };
+                    let (outcome, events) = if matched {
+                        match success {
+                            CasOp::Put(value) => {
+                                let event = WatchEvent::put(index, &key, &value);
+                                guard.kv.insert(key, Entry { val: value.clone(), index });
+                                (ApplyOutcome::Value(value), vec![event])
+                            }
+                            CasOp::Delete => {
+                                let event = WatchEvent::delete(index, &key);
+                                guard.kv.remove(&key);
+                                (ApplyOutcome::None, vec![event])
+                            }
+                        }
+                    } else {
+                        let (current_index, current_value) = match current {
+                            Some(e) => (
+                                e.index,
+                                // Cloned current value for the client's retry.
+                                Some(e.val.clone()),
+                            ),
+                            None => (0, None),
+                        };
+                        // A failed compare mutates nothing → no event.
+                        (
+                            ApplyOutcome::CasFailed {
+                                current_index,
+                                current_value,
+                            },
+                            Vec::new(),
+                        )
+                    };
+                    // Record BOTH outcomes — success and failure — in the
+                    // session table (failure too: §6.2.2).
+                    guard.sessions.insert(session, outcome.clone());
+                    (outcome, events)
+                }
+            };
+            guard.applied = index;
+            return Ok((outcome, events));
+        }
+
+        let (session, op, key, val) = Self::parse_command(command)?;
+
+        // Idempotency: a replayed session returns its cached result without
+        // re-mutating the store — and produces no events (first-apply only).
+        let (outcome, events) = match guard.sessions.get(&session) {
+            Some(cached) => (cached.clone(), Vec::new()),
+            None => {
+                let (outcome, event) = match op {
+                    Op::Put => {
+                        // D-Ord: the entry (with its origin index) lands in the
+                        // map first; `applied` is bumped last. The origin index
+                        // is this command's log index — stable across deduped
+                        // replays, which take the `Some(cached)` arm and skip
+                        // this write entirely.
+                        let event = WatchEvent::put(index, &key, &val);
+                        guard.kv.insert(
+                            key.clone(),
+                            Entry { val: val.clone(), index },
+                        );
+                        (ApplyOutcome::Value(val), Some(event))
+                    }
+                    Op::Delete => {
+                        // Write-set semantics: a delete emits an event even if
+                        // the key was already absent.
+                        let event = WatchEvent::delete(index, &key);
+                        guard.kv.remove(&key);
+                        (ApplyOutcome::None, Some(event))
+                    }
+                };
+                let mut events = vec![];
+                if let Some(event) = event {
+                    events.push(event);
+                }
+                guard.sessions.insert(session, outcome.clone());
+                (outcome, events)
+            }
+        };
+
+        // Version is bumped LAST (D-Ord).
+        guard.applied = index;
+        Ok((outcome, events))
+    }
+
     /// Read the applied value **and** its origin index under a *single* read
     /// lock (the same D-Arc read as `StateMachine::get`).
     ///
@@ -2003,5 +2099,158 @@ mod tests {
             Err(KvError::MalformedCommand)
         ));
         bad.clear();
+    }
+
+    // ---- M4/P2: write-set watch events (apply_with_events) -------------------
+
+    /// A put produces a write-set `Put` event with the applied index.
+    #[test]
+    fn apply_events_put_emits_one_put_event() {
+        let sm = KvStateMachine::new();
+        let (outcome, events) =
+            sm.apply_with_events(1, &KvStateMachine::encode_put(1, 1, b"k", b"v"))
+                .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Value(b"v".to_vec()));
+        assert_eq!(
+            events,
+            vec![WatchEvent {
+                index: 1,
+                key: b"k".to_vec(),
+                value: Some(b"v".to_vec()),
+            }]
+        );
+    }
+
+    /// A `delete` emits a `Delete` event **even when the key was absent** (a
+    /// write set, not a diff — design D6 / D7 test 5).
+    #[test]
+    fn apply_events_delete_of_absent_key_still_emits() {
+        let sm = KvStateMachine::new();
+        let (outcome, events) =
+            sm.apply_with_events(1, &KvStateMachine::encode_delete(1, 1, b"nope"))
+                .unwrap();
+        assert_eq!(outcome, ApplyOutcome::None);
+        assert_eq!(
+            events,
+            vec![WatchEvent {
+                index: 1,
+                key: b"nope".to_vec(),
+                value: None,
+            }]
+        );
+    }
+
+    /// A deduped replay (same `(client_id, seq_no)`) produces **no** events —
+    /// the first application is the only one that writes (D6/D7 test 2).
+    #[test]
+    fn apply_events_replay_emits_none() {
+        let sm = KvStateMachine::new();
+        let cmd = KvStateMachine::encode_put(1, 1, b"k", b"v");
+        let (o1, e1) = sm.apply_with_events(1, &cmd).unwrap();
+        assert_eq!(e1.len(), 1);
+        // Replay at index 2: cached outcome, no mutation, no event.
+        let (o2, e2) = sm.apply_with_events(2, &cmd).unwrap();
+        assert_eq!(o1, o2);
+        assert!(e2.is_empty(), "a deduped replay must not re-emit the event");
+    }
+
+    /// `multi_put` emits one event per key, all with the batch's apply index
+    /// (D6/D7 test 4).
+    #[test]
+    fn apply_events_multi_put_one_per_key() {
+        let sm = KvStateMachine::new();
+        // Advance the machine to index 2 (no-op term records) so the batch
+        // lands at a non-trivial index 3.
+        sm.apply(1, &[]).unwrap();
+        sm.apply(2, &[]).unwrap();
+        let (outcome, events) = sm
+            .apply_with_events(
+                3,
+                &KvStateMachine::encode_multi_put(1, 1, &[(b"a", b"1"), (b"b", b"2")]),
+            )
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::None);
+        assert_eq!(
+            events,
+            vec![
+                WatchEvent { index: 3, key: b"a".to_vec(), value: Some(b"1".to_vec()) },
+                WatchEvent { index: 3, key: b"b".to_vec(), value: Some(b"2".to_vec()) },
+            ],
+            "multi_put emits one event per key, sharing the batch index"
+        );
+    }
+
+    /// `multi_put` with a **duplicate key inside the batch** collapses to one
+    /// event with the **final** value (design D6 — the write set reflects the
+    /// applied state, not the command's raw repetition).
+    #[test]
+    fn apply_events_multi_put_duplicate_key_collapses_to_final_value() {
+        let sm = KvStateMachine::new();
+        let (outcome, events) = sm
+            .apply_with_events(
+                1,
+                &KvStateMachine::encode_multi_put(1, 1, &[(b"k", b"first"), (b"k", b"second")]),
+            )
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::None);
+        assert_eq!(
+            events,
+            vec![WatchEvent {
+                index: 1,
+                key: b"k".to_vec(),
+                value: Some(b"second".to_vec()),
+            }],
+            "a duplicate key in one batch must collapse to a single event with the final value"
+        );
+        // The stored value is the final one (consistency with the event).
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"second".to_vec()), Some(1))
+        );
+    }
+
+    /// A successful CAS emits its success op's event; a failed CAS emits none
+    /// (D6/D7 test 3).
+    #[test]
+    fn apply_events_cas_success_emits_failure_does_not() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v"))
+            .unwrap();
+        // Success: CAS put.
+        let (outcome, events) = sm
+            .apply_with_events(
+                2,
+                &KvStateMachine::encode_cas(1, 2, b"k", &CasPred::ValueEquals(b"v".to_vec()), &CasOp::Put(b"w".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Value(b"w".to_vec()));
+        assert_eq!(
+            events,
+            vec![WatchEvent { index: 2, key: b"k".to_vec(), value: Some(b"w".to_vec()) }]
+        );
+        // Failure: stale compare, no mutation → no event.
+        let (outcome, events) = sm
+            .apply_with_events(
+                3,
+                &KvStateMachine::encode_cas(1, 3, b"k", &CasPred::IndexEquals(1), &CasOp::Put(b"x".to_vec())),
+            )
+            .unwrap();
+        assert!(matches!(outcome, ApplyOutcome::CasFailed { .. }));
+        assert!(events.is_empty(), "a failed CAS must not emit an event");
+    }
+
+    /// Events are a pure by-product: they never appear in the snapshot (design
+    /// D1 — not persisted, no format change).
+    #[test]
+    fn apply_events_do_not_affect_snapshot() {
+        let sm = KvStateMachine::new();
+        sm.apply_with_events(1, &KvStateMachine::encode_put(1, 1, b"k", b"v"))
+            .unwrap();
+        // The snapshot bytes only carry the version, applied, kv, sessions —
+        // no event data (and re-snapshotting is stable).
+        let snap = sm.snapshot().unwrap();
+        let sm2 = KvStateMachine::new();
+        sm2.restore(&snap).unwrap();
+        assert_eq!(sm2.snapshot().unwrap(), snap);
     }
 }

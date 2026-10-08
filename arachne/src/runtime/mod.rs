@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -61,7 +62,7 @@ use crate::consensus::{
 };
 use crate::metrics::Metrics;
 use crate::profile::ProfileConfig;
-use crate::state_machine::KvStateMachine;
+use crate::state_machine::{KvStateMachine, WatchEvent};
 use crate::storage::WalStorage;
 use crate::types::Timestamp;
 use crate::{
@@ -286,6 +287,40 @@ pub enum Command {
         /// `truncated` means more keys existed past `limit`.
         ack: oneshot::Sender<Result<(Vec<(Vec<u8>, Vec<u8>)>, LogIndex, bool), ArachneError>>,
     },
+    /// Register a watch over a prefix (M4/P2, designs D2/D3/D5).
+    ///
+    /// **Synchronous** registration: the actor reads the prefix snapshot and
+    /// inserts the watcher in the **same** segment under one read lock, so the
+    /// returned snapshot and the subscription share one applied watermark and
+    /// no event can fall between them (there is no post-snapshot gap). The
+    /// reply carries the snapshot plus a bounded per-watcher receiver: events
+    /// with `index > snapshot_index` are delivered; the channel closes when the
+    /// watcher falls behind (a slow consumer is disconnected — design D2 —
+    /// never silently dropped).
+    Watch {
+        /// The prefix range's inclusive lower bound (`start`).
+        start: Vec<u8>,
+        /// The prefix range's exclusive upper bound (`start`'s successor; empty
+        /// = unbounded, for an all-`0xFF` prefix).
+        end: Vec<u8>,
+        /// Max snapshot entries. A prefix snapshot that would exceed this is
+        /// **rejected** (the watch is refused) rather than returned truncated —
+        /// a truncated prefix snapshot would silently miss the older keys
+        /// (design D3).
+        limit: usize,
+        /// Reply: `(snapshot entries, applied_index, truncated, receiver)`.
+        ack: oneshot::Sender<
+            Result<
+                (
+                    Vec<(Vec<u8>, Vec<u8>)>,
+                    LogIndex,
+                    bool,
+                    mpsc::Receiver<WatchEvent>,
+                ),
+                ArachneError,
+            >,
+        >,
+    },
     /// Linearizable read via ReadIndex (propsol §5.4). The leader registers a
     /// quorum-confirmed read and replies once the read index is applied; a
     /// non-leader replies `NotLeader{hint}` for the client to redirect.
@@ -346,6 +381,44 @@ struct Pending {
     index: Option<LogIndex>,
 }
 
+/// One active watch subscription (M4/P2, design D2/D3/D6).
+///
+/// Registered in the **same** actor segment that reads its prefix snapshot, so
+/// the snapshot and the subscription are atomic at one applied watermark; the
+/// filter is that watermark and events are delivered **only** when
+/// `event.index > filter` (strict `>` — the snapshot already includes index
+/// `== filter`). The actor filters by prefix before enqueueing, so a
+/// subscriber only ever sees keys in its own range.
+struct Watcher {
+    /// Inclusive lower bound of the watched prefix range (from `successor`).
+    start: Vec<u8>,
+    /// Exclusive upper bound — `end` is `start`'s byte successor; unbounded
+    /// when the prefix is all-`0xFF` (`None` on the wire = empty end).
+    end: Vec<u8>,
+    /// The filter watermark: only `event.index > filter` events are delivered.
+    /// Set from the application index observed with the registration snapshot.
+    filter: LogIndex,
+    /// Bounded per-watcher queue (design D2: overflow disconnects the watcher,
+    /// it never blocks apply, and the consumer is told to re-subscribe by the
+    /// channel closing — never a silent gap).
+    tx: mpsc::Sender<WatchEvent>,
+}
+
+impl Watcher {
+    /// Whether `key` falls in this watcher's `[start, end)` half-open range
+    /// (`end.is_empty()` = unbounded upper).
+    fn matches(&self, key: &[u8]) -> bool {
+        if &self.start[..] > key {
+            return false;
+        }
+        if self.end.is_empty() {
+            true
+        } else {
+            key < &self.end[..]
+        }
+    }
+}
+
 /// A linearizable (ReadIndex) read awaiting quorum confirmation and apply
 /// (propsol §5.4).
 struct PendingRead {
@@ -375,6 +448,13 @@ const MAX_PENDING_READS: usize = 4096;
 /// (`proposal_queue_bytes`, Q7) stops proposals long before 256 batches could
 /// pile up, so the actor rarely has to defer a batch at all.
 const APPLY_QUEUE_DEPTH: usize = 256;
+
+/// Per-watcher event queue depth (M4/P2, design D2). A watcher that fills its
+/// queue is **disconnected** — the receiver's channel closes and the consumer
+/// re-watches (re-snapshots), so it never sees a silent gap. Bounded so a slow
+/// consumer cannot grow memory; apply never blocks on it (the apply→actor
+/// event channel drops + counts instead).
+const WATCH_BUFFER: usize = 1024;
 
 /// How many sessions one GC entry may name (propsol v0.2.15 R2). The list has to
 /// fit in a log entry, so the leader sweeps in bounded batches.
@@ -498,6 +578,25 @@ struct ApplyTask {
     /// backpressures apply (raft's applied index lags the apply task, exactly
     /// as it already does against the applies channel).
     outcomes: mpsc::Sender<(LogIndex, ApplyOutcome)>,
+    /// Per-batch write-set watch events, applied → actor (M4/P2, design D1).
+    /// **Independent** of `outcomes` so watch delivery never couples to a
+    /// write's response latency or the `received_outcomes` buffer.
+    ///
+    /// Backpressure contract (design D2 — *never* a silent gap): the apply side
+    /// never blocks on watch, but a batch dropped because the bounded event
+    /// channel was full is **not** silently lost to the subscribers. The apply
+    /// side records the earliest dropped index on a shared watermark; the actor
+    /// reads it before dispatching and **disconnects** every watcher whose
+    /// filter is below that index (they may have missed an event they needed),
+    /// forcing them to re-watch and re-snapshot — the same "disconnect, never
+    /// drop-with-count" signal a per-watcher overflow produces.
+    watch_events: mpsc::Sender<(LogIndex, Vec<WatchEvent>)>,
+    /// Shared watermark of the earliest index whose event batch was dropped at
+    /// the apply→actor boundary. `u64::MAX` = none dropped (the normal state).
+    /// The actor drains this (swap back to `u64::MAX`) before each dispatch.
+    watch_backlog_dropped: Arc<AtomicU64>,
+    /// Shared registry for apply-side event-drop accounting.
+    metrics: Arc<Metrics>,
 }
 
 impl ApplyTask {
@@ -551,9 +650,13 @@ impl ApplyTask {
                 // a per-entry channel, so a reply uses the outcome the apply
                 // task computed — never a post-apply re-read (which would
                 // mis-read a concurrent same-batch write, design §9.1).
+                // M4: the same apply call also *computes* the entry's write-set
+                // watch events (design D1: computation in the state machine,
+                // delivery here). They travel on an independent channel so
+                // watch never couples to a reply's latency.
                 for (index, data) in batch.entries {
-                    let outcome = match self.sm.apply(index, &data) {
-                        Ok(o) => o,
+                    let (outcome, events) = match self.sm.apply_with_events(index, &data) {
+                        Ok(pair) => pair,
                         Err(e) => {
                             return self.fail(format!("state machine apply failed: {e}"));
                         }
@@ -562,6 +665,18 @@ impl ApplyTask {
                         // Actor dropped (runtime going away): nothing more to
                         // deliver, and the state is already durable in `sm`.
                         return false;
+                    }
+                    if !events.is_empty() {
+                        // Non-blocking: a full event channel never stalls the
+                        // apply path. The batch is *not* silently lost: record
+                        // the earliest dropped index on the shared watermark so
+                        // the actor disconnects the watchers it may have missed
+                        // (design D2 — "disconnect, never a silent gap").
+                        if let Err(_) = self.watch_events.try_send((index, events)) {
+                            self.watch_backlog_dropped
+                                .fetch_min(index, Ordering::SeqCst);
+                            self.metrics.inc_watch_events_dropped();
+                        }
                     }
                     self.applied_bytes_total += data.len() as u64 + ENTRY_FRAMING_BYTES;
                 }
@@ -628,6 +743,11 @@ enum Outcome {
     /// A per-entry outcome arrived from the apply task (M1). The index names
     /// the entry; the `ApplyOutcome` is what the matching [`Pending`] replies with.
     AppliedOutcome((LogIndex, ApplyOutcome)),
+    /// A per-batch write-set event batch arrived from the apply task (M4/P2).
+    /// The actor folds the burst, filters each watcher by prefix + strict
+    /// `filter`, and enqueues — disconnecting a watcher that cannot keep up
+    /// (design D2/D3/D6).
+    WatchEvents(Option<(LogIndex, Vec<WatchEvent>)>),
 }
 
 /// The node runtime actor.
@@ -753,6 +873,26 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     /// when the matching [`Pending`] is resolved or the index goes stale; kept
     /// bounded by the outstanding-proposal count (one index, one proposal).
     received_outcomes: BTreeMap<LogIndex, ApplyOutcome>,
+    /// Write-set watch events, applied → actor (M4/P2, design D1). The apply
+    /// task delivers batches non-blockingly; the actor drains them and polls
+    /// every registered watcher against its prefix + filter.
+    watch_events: mpsc::Receiver<(LogIndex, Vec<WatchEvent>)>,
+    /// Active watchers. A watcher is registered in the **same** actor segment
+    /// that takes its prefix snapshot (design D3), filter = that applied
+    /// index, and each carries a bounded per-watcher queue; an overflow or a
+    /// dropped receiver disconnects it (design D2: disconnect, not silent
+    /// drop-with-count).
+    watchers: Vec<Watcher>,
+    /// Number of watchers dropped for falling behind (metrics/observability).
+    watch_dropped_total: u64,
+    /// Shared watermark of the earliest index whose event batch was dropped at
+    /// the apply→actor boundary (`u64::MAX` = none — the normal state; the
+    /// actor swaps it back to `u64::MAX` after handling). When a batch was
+    /// dropped, every watcher whose filter is below the dropped index may have
+    /// missed an event it needed, so the actor disconnects them before the next
+    /// dispatch — the apply side never blocks on watch, and the backlog loss is
+    /// surfaced as **disconnection** (never a silent gap; design D2).
+    watch_backlog_dropped: Arc<AtomicU64>,
 }
 
 impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
@@ -803,6 +943,14 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         // M1: the per-entry outcome channel. Bounded (matches the applies depth)
         // so a slow actor only backpressures apply — it never grows without bound.
         let (outcomes_tx, outcomes) = mpsc::channel(APPLY_QUEUE_DEPTH);
+        // M4/P2 watch: an independent apply→actor event channel (design D1).
+        // Delivery is non-blocking on the apply side. A batch that cannot fit
+        // is *not* silently lost to subscribers: the apply side records the
+        // earliest dropped index on a shared watermark, and the actor reads it
+        // before each dispatch and disconnects the watchers it may have missed
+        // (design D2 — "disconnect, never a silent drop-with-count").
+        let (watch_events_tx, watch_events) = mpsc::channel(APPLY_QUEUE_DEPTH);
+        let watch_backlog_dropped = Arc::new(AtomicU64::new(u64::MAX));
         let apply_task = ApplyTask {
             sm: sm.clone(),
             applies: applies_rx,
@@ -810,6 +958,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             applied_bytes_total: 0,
             failed: None,
             outcomes: outcomes_tx,
+            watch_events: watch_events_tx,
+            watch_backlog_dropped: Arc::clone(&watch_backlog_dropped),
+            metrics: Arc::clone(&config.metrics),
         };
 
         // The transport's own answer decides how snapshots travel (rev T): a
@@ -892,6 +1043,10 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             logger: logger.clone(),
             outcomes,
             received_outcomes: BTreeMap::new(),
+            watch_events,
+            watchers: Vec::new(),
+            watch_dropped_total: 0,
+            watch_backlog_dropped,
             raft_id: config.self_raft_id,
             self_node: config.self_node_id,
             node_to_raft,
@@ -988,6 +1143,10 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                         break;
                     }
                 },
+                // M4: watch events — kept after `tick` so a watch consumer can
+                // never delay heartbeats (ora-1 co-existence note); independent
+                // drain, folded below exactly like outcomes.
+                ev = self.watch_events.recv() => Outcome::WatchEvents(ev),
                 progress = self.progress.changed() => Outcome::Progress(progress),
                 _ = self.durability.notified() => Outcome::Durability,
                 cmd = self.commands.recv() => Outcome::Command(cmd),
@@ -1024,6 +1183,33 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                     while let Ok(out) = self.outcomes.try_recv() {
                         self.received_outcomes.insert(out.0, out.1);
                     }
+                }
+                // M4/P2 watch: fold the whole event burst, then distribute each
+                // event to every watcher whose prefix matches and whose filter
+                // the event's index passes (strict `>`). A watcher that cannot
+                // keep up — its queue is full, or its receiver is gone — is
+                // removed (disconnected): its consumer re-watches and
+                // re-snapshots, never seeing a silent gap (design D2/D3/D6).
+                Outcome::WatchEvents(Some((_index, events))) => {
+                    self.dispatch_watch_events(events);
+                    while let Ok((_index, events)) = self.watch_events.try_recv() {
+                        self.dispatch_watch_events(events);
+                    }
+                }
+                Outcome::WatchEvents(None) => {
+                    // The apply task went away (its event sender dropped).
+                    // Identical fail-stop to the outcomes/`Progress(Err(_))`
+                    // branches (the task publishes its failure reason on the
+                    // watch before stopping).
+                    let reason = self
+                        .progress
+                        .borrow()
+                        .failed
+                        .clone()
+                        .unwrap_or_else(|| "the apply task stopped".to_string());
+                    self.fail_all_pending(&reason);
+                    self.metrics.set_is_leader(false);
+                    break;
                 }
                 // Durability completions are consumed by `drive_cycle` (which
                 // runs after every event); waking is the whole point.
@@ -1768,6 +1954,49 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // 4.1), no quorum, no read-index gate.
                 self.spawn_read_reply_range(start, end, limit, ack);
             }
+            Command::Watch {
+                start,
+                end,
+                limit,
+                ack,
+            } => {
+                // Synchronous registration (design D3): read the prefix
+                // snapshot and insert the watcher in the *same* actor segment,
+                // so the returned snapshot and the subscription share one
+                // applied watermark with no gap in between (a watcher can never
+                // miss the events for an index its snapshot already covers, nor
+                // the events between snapshot and insertion).
+                let snap = self.sm.get_range_with_index(&start, &end, limit);
+                match snap {
+                    Ok((entries, applied, truncated)) => {
+                        // A truncated prefix snapshot would silently miss the
+                        // older keys (their events are never delivered, being
+                        // <= filter). Refuse the watch instead (design D3).
+                        if truncated {
+                            let _ = ack.send(Err(ArachneError::Busy));
+                            return;
+                        }
+                        // Per-watcher bounded queue; overflow disconnects the
+                        // watcher (this sender closes → the consumer re-watches
+                        // and re-snapshots, restoring a complete stream).
+                        let (tx, rx) = mpsc::channel(WATCH_BUFFER);
+                        self.watchers.push(Watcher {
+                            start: start.clone(),
+                            end: end.clone(),
+                            // Strict `>`: the snapshot already includes the
+                            // entry at `applied`.
+                            filter: applied,
+                            tx,
+                        });
+                        let _ = ack.send(Ok((entries, applied, truncated, rx)));
+                    }
+                    Err(e) => {
+                        let _ = ack.send(Err(ArachneError::Unrecoverable(format!(
+                            "state machine watch snapshot failed: {e}"
+                        ))));
+                    }
+                }
+            }
             Command::Read { key, ack } => {
                 // Only the leader can serve a linearizable read (propsol §5.4
                 // step 5); a non-leader redirects.
@@ -2112,6 +2341,69 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
             let _ = ack.send(reply);
         });
+    }
+
+    /// Distribute one applied event batch to the watchers (M4/P2, design D2/D6).
+    ///
+    /// First, drain the shared apply→actor backlog watermark: if a batch was
+    /// dropped at the boundary because the bounded event channel was full,
+    /// every watcher whose filter is below the dropped index may have missed an
+    /// event it needed — disconnect them (design D2: "disconnect, never a
+    /// silent drop-with-count") so they re-watch and re-snapshot. Then each
+    /// event goes to every remaining watcher whose prefix matches the key
+    /// **and** whose filter the event's index passes (strict `>` — the snapshot
+    /// the watcher registered with already contains its own index's state). A
+    /// watcher that falls behind — its bounded queue is full, or its receiver
+    /// is gone (the client dropped the subscription) — is removed: the consumer
+    /// re-watches and re-snapshots, restoring a complete stream. A silent
+    /// "drop the event"[and count] path is **not** used: with a sparse write
+    /// set, a dropped index is indistinguishable from "nothing changed", so
+    /// disconnection is the only honest signal (ora-1 D2).
+    fn dispatch_watch_events(&mut self, events: Vec<WatchEvent>) {
+        // Contract: an apply→actor batch drop surfaces as disconnection of the
+        // watchers the drop may have affected, never as a silent gap. Drain the
+        // watermark first (swap back to `u64::MAX` = no drop) so a later drop
+        // is not misattributed, even when there are no watchers yet.
+        let dropped = self.watch_backlog_dropped.swap(u64::MAX, Ordering::SeqCst);
+        if dropped != u64::MAX {
+            let before = self.watchers.len();
+            self.watchers.retain(|w| w.filter >= dropped);
+            let disconnects = before - self.watchers.len();
+            for _ in 0..disconnects {
+                self.watch_dropped_total += 1;
+                self.metrics.inc_watch_dropped();
+            }
+        }
+        if self.watchers.is_empty() {
+            return;
+        }
+        // Each event goes to every matching watcher. (The set is small; a
+        // linear pass is fine at v1.)
+        for event in events {
+            let mut i = 0usize;
+            while i < self.watchers.len() {
+                let watcher = &mut self.watchers[i];
+                let keep = if event.index > watcher.filter && watcher.matches(&event.key) {
+                    match watcher.tx.try_send(event.clone()) {
+                        Ok(()) => true,
+                        // Full queue → the consumer is behind: disconnect it.
+                        // Receiver dropped → the consumer is gone: remove it.
+                        Err(_) => {
+                            self.watch_dropped_total += 1;
+                            self.metrics.inc_watch_dropped();
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if keep {
+                    i += 1;
+                } else {
+                    self.watchers.swap_remove(i);
+                }
+            }
+        }
     }
 
     fn fail_all_pending(&mut self, message: &str) {

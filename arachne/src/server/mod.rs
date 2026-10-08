@@ -248,6 +248,18 @@ impl Arachne {
         handle.cas(key, pred, success).await
     }
 
+    /// Open a **watch** over a byte prefix (M4/P2): a consistent prefix
+    /// snapshot at the current applied watermark + a bounded stream of
+    /// write-set events after it. Mirrors [`Handle::watch`] for the embedding
+    /// facade (design D5).
+    pub async fn watch(
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<crate::client::WatchSubscription, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.watch(prefix, limit).await
+    }
+
     /// Consistent **prefix** stale read (M2-P1A): every `(key, value)` whose
     /// key has byte-prefix `prefix`, plus the applied index the whole segment
     /// was observed at. Mirrors [`Handle::get_stale_prefix`].

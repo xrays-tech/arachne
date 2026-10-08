@@ -47,7 +47,7 @@
 
 mod handle;
 
-pub use handle::Handle;
+pub use handle::{Handle, WatchSubscription};
 
 use std::net::SocketAddr;
 

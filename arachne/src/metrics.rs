@@ -56,6 +56,17 @@ pub struct Metrics {
     snapshot_slow_total: AtomicU64,
     /// Sessions in the state machine's table (propsol §8 `session_count`).
     session_count: AtomicU64,
+    /// Watchers disconnected because they fell behind (M4/P2 watch, design D2:
+    /// a slow consumer is disconnected, never silently dropped). This counts
+    /// both per-watcher queue overflows and apply→actor event-channel overflows
+    /// that forced a disconnect.
+    watch_dropped_total: AtomicU64,
+    /// Write-set event batches dropped at the apply→actor boundary because the
+    /// bounded event channel was full (M4/P2, design D1/D2). Any drop at this
+    /// boundary also forces the affected watchers to disconnect (see the actor
+    /// `dispatch_watch_events`), so this is an internal-backpressure signal,
+    /// not a silent consumer gap.
+    watch_events_dropped_total: AtomicU64,
 }
 
 impl Metrics {
@@ -187,6 +198,28 @@ impl Metrics {
     /// Record the number of sessions in the state machine's table.
     pub fn set_session_count(&self, value: u64) {
         self.session_count.store(value, Ordering::Relaxed);
+    }
+
+    /// Count a watch watcher that fell behind and was disconnected (M4/P2).
+    pub fn inc_watch_dropped(&self) {
+        self.watch_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Watchers disconnected for falling behind (slow consumer / event backlog).
+    pub fn watch_dropped(&self) -> u64 {
+        self.watch_dropped_total.load(Ordering::Relaxed)
+    }
+
+    /// Count a write-set event batch dropped at the apply→actor boundary (the
+    /// bounded event channel was full; the actor disconnects affected watchers
+    /// as a result, so this is a backpressure signal, not a silent consumer gap).
+    pub fn inc_watch_events_dropped(&self) {
+        self.watch_events_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Event batches dropped at the apply→actor boundary.
+    pub fn watch_events_dropped(&self) -> u64 {
+        self.watch_events_dropped_total.load(Ordering::Relaxed)
     }
 
     /// Sessions in the state machine's table.
