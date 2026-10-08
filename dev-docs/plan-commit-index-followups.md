@@ -80,6 +80,7 @@ Phase 3  #8/#11/#12 观察与文档项；#9/#10 下游触发
 
 ## 3. 外部挂账（不计入本仓待办，不得以内绿关闭）
 - **hydra 三方抽验**：**✓ 2026-10-08 下游回执验收通过**（v0.3.1：lib 303/303、three-node 5/5、store 6/6（含「更低 index 被拒」的反证）、5 idle runs、三 cluster drills PASS、config-loss 形态 **0/10** vs 改动前 3 CI 次）。outcome 级 E2E 由 `dev-docs/recipe-stale-read-partition.md` 支持；「拒绝分支」E2E（仅可由落后的副本应答 head 读触发）由下游自持 head-read seam 覆盖，不在本仓范围。
+- **`arachne-kv-testsupport` 转公开发布（2026-10-08，commit e8f69f4）**：为让下游实现 partition 配方，testsupport 从 `publish=false` 改为公开发布（0.3.1，第 5 个发布 crate）。**仍是 dev-dependency-only**（check-deps Gate A：生产 crate 只能经 `[dev-dependencies]` 引入；不进任何运行时依赖树）。crates.io 消费者冒烟已验证：`InMemoryTransportFactory::new()` / `create()` / `firewall(from,to)` / `firewall_drop_count()>0` 守卫。
 
 ## 4. 风险与注意
 1. **勿把 model-check scaffold 当新格式覆盖**（最隐蔽）：会形成虚假信心。

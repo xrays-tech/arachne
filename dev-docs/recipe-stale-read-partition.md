@@ -14,7 +14,7 @@
 
 ## 2. 机制（in-memory / 真机两版）
 
-- **in-memory（`arachne-kv-testsupport`）**：`InMemoryTransportFactory::firewall(from, to)`（`arachne-testsupport/src/transport.rs:141-149`）。它在交换处**静默丢包、不关通道**——发送端/接收端通道都活着，被隔离节点的 actor 继续运行（只是收不到消息），正是「存活但分区」。完全隔离一对 = 双向 `firewall(a,b)` + `firewall(b,a)`。
+- **in-memory（`arachne-kv-testsupport`，**crates.io 已发布 0.3.1，仅作 dev-dependency 使用**）**：`InMemoryTransportFactory::firewall(from, to)`（`arachne-testsupport/src/transport.rs:141-149`）。它在交换处**静默丢包、不关通道**——发送端/接收端通道都活着，被隔离节点的 actor 继续运行（只是收不到消息），正是「存活但分区」。完全隔离一对 = 双向 `firewall(a,b)` + `firewall(b,a)`。非空守卫：`firewall_drop_count() > 0`（有流量被防火墙丢弃才算真正隔离，防测试假绿）。
 - **真机（tonic/TCP）**：等价物是挂起该节点的出入流量（iptables DROP / 连接挂起），**切勿关闭进程或监听**——关闭会暴露 closed-channel，远端会把该节点视作死亡，就不再是「存活分区」而变成「崩溃」语义。
 - **可直接参考的既有测试拓扑**：`arachne/tests/inv14_deposed_leader.rs`（失权 leader 存活、继续服务旧值）、`arachne/tests/quorum_loss.rs`（多数派丢失后 `get_stale` 仍可用）、test-plan `S02`（双分区）/ `S16`（非对称分区）。
 
