@@ -35,7 +35,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::client::ArachneError;
 use crate::runtime::Command;
-use crate::state_machine::{KvStateMachine, MAX_MULTI_PUT_ENTRIES, MAX_MULTI_PUT_TOTAL_BYTES};
+use crate::state_machine::{
+    CasOp, CasPred, CasResult, KvStateMachine, MAX_MULTI_PUT_ENTRIES, MAX_MULTI_PUT_TOTAL_BYTES,
+};
 use crate::{
     ApplyOutcome, ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
 };
@@ -163,6 +165,70 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no)
             .await
             .map(|_| ())
+    }
+
+    /// Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`
+    /// under one log entry and one session.
+    ///
+    /// A matching predicate applies `success` (put/delete); a miss applies
+    /// nothing and returns [`CasResult::NotApplied`] carrying the current
+    /// state, so the caller can re-read and retry. A failed compare is a legal
+    /// **result**, not an error — the caller can always distinguish "definitely
+    /// did not apply" from "result unknown" (Timeout).
+    ///
+    /// Recommended predicate: [`CasPred::IndexEquals`] paired with
+    /// `get_stale_with_index`'s origin (`stale read → CAS(i) → re-put`, the
+    /// optimistic-concurrency loop); an absent key is expressed with
+    /// [`CasPred::NotExists`]. This is a general RMW primitive — it does not
+    /// paper over multi-writer interleavings across keys (those belong to a
+    /// full txn, out of scope).
+    pub async fn cas(
+        &self,
+        key: &[u8],
+        pred: CasPred,
+        success: CasOp,
+    ) -> Result<CasResult, ArachneError> {
+        self.validate_key(key)?;
+        if let CasOp::Put(value) = &success
+            && (value.len() as u64) > self.inner.max_value_bytes
+        {
+            return Err(ArachneError::InvalidArgument(format!(
+                "cas value of {} bytes exceeds max_value_bytes ({})",
+                value.len(),
+                self.inner.max_value_bytes
+            )));
+        }
+        // The `ValueEquals` predicate's payload rides the command too: it must
+        // respect the same size discipline (propsol §3.2 / plan §2.3), or an
+        // over-limit compare could reach the log and fail to replicate past the
+        // transport's max_message_size (the same trap M2's multi-put total cap
+        // closed).
+        if let CasPred::ValueEquals(want) = &pred
+            && (want.len() as u64) > self.inner.max_value_bytes
+        {
+            return Err(ArachneError::InvalidArgument(format!(
+                "cas ValueEquals predicate of {} bytes exceeds max_value_bytes ({})",
+                want.len(),
+                self.inner.max_value_bytes
+            )));
+        }
+        let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
+        let client_id = self.inner.client_id;
+        let cmd = KvStateMachine::encode_cas(client_id, seq_no, key, &pred, &success);
+        let outcome = self.propose_with_redirect(cmd, client_id, seq_no).await?;
+        // Map the apply outcome to the public verdict. The M1 write-back
+        // pipeline carries `CasFailed` here; a fresh retry loop reads the
+        // current state off `NotApplied`.
+        match outcome {
+            ApplyOutcome::Value(_) | ApplyOutcome::None => Ok(CasResult::Applied),
+            ApplyOutcome::CasFailed {
+                current_index,
+                current_value,
+            } => Ok(CasResult::NotApplied {
+                current_index,
+                current_value,
+            }),
+        }
     }
 
     /// **Test-only** (feature `fault-injection`): propose a raw state-machine

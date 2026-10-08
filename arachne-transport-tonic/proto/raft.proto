@@ -143,16 +143,38 @@ message ForwardReply {
   ForwardResult result = 6;
 }
 
-// The per-command apply outcome of a forwarded `Propose` (M1). Carries only the
-// outcome's value: a successful write that produced a value sets `value`
-// (even an empty value is encoded); a write whose outcome is `None` (delete /
-// no-op), like the old-node default, is encoded as an *absent* field. This
-// presence envelope is what distinguishes `Value(vec![...])` from "no outcome"
-// over the wire; note the documented collapse (seam `ForwardOutcome` doc) where
-// `ApplyOutcome::None` and the old-node default are indistinguishable and both
-// decode to an absent field.
+// The per-command apply outcome of a forwarded `Propose` (M1/M3). The
+// envelope's *presence* distinguishes "an outcome happened" from "no outcome"
+// (a read / an old node that predates the field — the rolling-compatibility
+// default). Within a present envelope:
+//   * `value` set  — the outcome was `Value(v)` (possibly `v == []`);
+//   * `cas_failed` set — the outcome was a failed compare-and-swap (M3), which
+//     carries the state the compare saw for the caller's retry.
+// A present envelope with neither field set is malformed and decodes as an
+// absent outcome (`None`), matching the documented seam collapse.
 message ForwardResult {
-  // The outcome's value; set when the outcome is `Value(v)`, including
-  // `v == []`.
-  bytes value = 1;
+  oneof kind {
+    // The outcome's value; set when the outcome is `Value(v)`, including
+    // `v == []`.
+    bytes value = 1;
+    // The outcome of a failed compare-and-swap (M3).
+    CasFailed cas_failed = 2;
+  }
+}
+
+// A failed compare-and-swap outcome (M3): the predicate did not match, so the
+// success operation was not applied. Carries the state the compare observed.
+message CasFailed {
+  // The current origin index of the key; `0` when the key is absent.
+  uint64 current_index = 1;
+  // The current value; use `BytesValue` (a message) so a *present empty* value
+  // is distinguishable from an *absent* key (the envelope's presence is this
+  // field's `None`).
+  BytesValue current_value = 2;
+}
+
+// A byte blob with message-level presence (proto3 message fields have
+// presence; naked `bytes` do not).
+message BytesValue {
+  bytes data = 1;
 }

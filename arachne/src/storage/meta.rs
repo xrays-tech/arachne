@@ -45,7 +45,14 @@ use arachne_kv_seam::types::{LogIndex, Term};
 use crate::storage::crc32c::crc32c;
 
 /// The current WAL format major version.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// v3 (M3): the state-machine snapshot payload rose to
+/// [`KV_SNAPSHOT_VERSION`](crate::state_machine::kv::KV_SNAPSHOT_VERSION) 2
+/// (session-table outcomes gained a `CasFailed` tag) and new command opcodes
+/// (`OP_MULTI_PUT`, `OP_CAS`) are not understood by older nodes. Both
+/// versions bump exactly once together per plan `dev-docs/plan-vs-etcd.md`
+/// §2.2; see `dev-docs/runbook-format-v3-upgrade.md`.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Magic number identifying a valid META file.
 const META_MAGIC: u32 = 0x41_52_41_4D; // "ARAM" in ASCII
@@ -455,8 +462,8 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_two() {
-        assert_eq!(FORMAT_VERSION, 2);
+    fn format_version_is_three() {
+        assert_eq!(FORMAT_VERSION, 3);
     }
 
     #[test]

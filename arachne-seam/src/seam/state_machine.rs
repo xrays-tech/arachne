@@ -14,6 +14,22 @@ pub enum ApplyOutcome {
     Value(Vec<u8>),
     /// The command applied with no value.
     None,
+    /// The command **did not apply** because its compare (CAS, M3) failed: the
+    /// predicate was not met. The command's session is still recorded (see
+    /// [`StateMachine`]'s exactly-once contract), so a replay returns this
+    /// cached failure without recomputing the compare — the client re-reads and
+    /// retries instead.
+    ///
+    /// Carries the state the compare saw, so the client can build the next
+    /// attempt: the current origin index (and current value) when the key is
+    /// present, or an absent key expressed as `current_index == 0` /
+    /// `current_value == None`.
+    CasFailed {
+        /// The current value's origin index; `0` when the key is absent.
+        current_index: LogIndex,
+        /// The current value; `None` when the key is absent.
+        current_value: Option<Vec<u8>>,
+    },
 }
 
 /// The deterministic data store driven by the replicated log.

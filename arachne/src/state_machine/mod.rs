@@ -4,4 +4,7 @@
 
 pub mod kv;
 
-pub use kv::{KvError, KvStateMachine, MAX_MULTI_PUT_ENTRIES, MAX_MULTI_PUT_TOTAL_BYTES};
+pub use kv::{
+    CasOp, CasPred, CasResult, KvError, KvStateMachine, MAX_MULTI_PUT_ENTRIES,
+    MAX_MULTI_PUT_TOTAL_BYTES, MAX_STALE_RANGE_ENTRIES,
+};

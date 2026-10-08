@@ -54,6 +54,12 @@ const OP_SESSION_GC: u8 = 2;
 /// nothing, single apply). Outcome is `None` (the write-back pipeline carries
 /// the success; there is no value result).
 const OP_MULTI_PUT: u8 = 3;
+/// Compare-and-swap (M3): `compare(key, pred) → op(success|failure)` on a
+/// **single key**. Success applies `op` (put/delete) and returns the put value /
+/// `None`; predicate miss returns [`ApplyOutcome::CasFailed`] with the current
+/// state — and the failed session is still recorded, so a replay returns the
+/// cached failure without recomputing the compare.
+const OP_CAS: u8 = 4;
 
 /// The upper bound on a single `multi_put`'s total key+value payload, in bytes
 /// (M2-P1B, §5.2). Enforced at the `Handle` boundary (`validate_multi_put`)
@@ -88,13 +94,69 @@ pub const MAX_STALE_RANGE_ENTRIES: usize = 10_000;
 /// rejected with [`KvError::MalformedSnapshot`] (fail-stop, no migration — a
 /// v0 payload lacks this byte entirely, and fabricating `index 0` would be
 /// an illegal public value that could be persisted and propagated).
-const KV_SNAPSHOT_VERSION: u8 = 1;
+///
+/// v2 (M3): the session-table tag space grew from `0/1` (`None`/`Value`) to
+/// `0/1/2` (`+ CasFailed`) so a failed CAS outcome survives
+/// snapshot→restore; the same single M3 format package bumps the storage
+/// `FORMAT_VERSION` (§2.2).
+const KV_SNAPSHOT_VERSION: u8 = 2;
 
 /// The kind of command, parsed from its opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
     Put,
     Delete,
+}
+
+/// The compare predicate of a compare-and-swap (M3 §6.1).
+///
+/// Three predicates (oracle-locked: an index alone cannot express an absent
+/// key):
+/// 1. [`IndexEquals`](CasPred::IndexEquals) — the key's origin index equals
+///    `index` (monotonic, no ABA, aligns with `get_stale_with_index`;
+///    **recommended**). An absent key never matches; pair with
+///    [`NotExists`](CasPred::NotExists) for create-if-absent.
+/// 2. [`ValueEquals`](CasPred::ValueEquals) — the key's value equals `bytes`
+///    (compatible-intuitive, internal second choice).
+/// 3. [`NotExists`](CasPred::NotExists) — the key is absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasPred {
+    /// The key's origin index equals `>= 1`; an absent key never matches.
+    IndexEquals(u64),
+    /// The key's value equals `bytes`; an absent key never matches.
+    ValueEquals(Vec<u8>),
+    /// The key is absent (create-if-absent).
+    NotExists,
+}
+
+/// The success operation of a compare-and-swap (M3 §6.1): what the command
+/// applies when the predicate matches. The failure branch is always a no-op
+/// (first version: single-key only, no nested/multi-branch txn).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasOp {
+    /// Write `value` to the key on success.
+    Put(Vec<u8>),
+    /// Delete the key on success.
+    Delete,
+}
+
+/// The client-visible verdict of a compare-and-swap (M3 §6). `ArachneError`
+/// is NOT used for a failed compare: a failed CAS is a legal *result*, not an
+/// error (a caller must be able to tell "definitely did not apply" from
+/// "result unknown"/Timeout). Carries the current state so the caller can
+/// build the next attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasResult {
+    /// The predicate matched and the success operation applied.
+    Applied,
+    /// The predicate did not match; nothing was applied. Carries the state
+    /// the compare observed for the retry loop.
+    NotApplied {
+        /// The current origin index (`0` when the key is absent).
+        current_index: u64,
+        /// The current value (`None` when the key is absent).
+        current_value: Option<Vec<u8>>,
+    },
 }
 
 /// A session key for idempotency: `(client_id, seq_no)`.
@@ -265,6 +327,51 @@ impl KvStateMachine {
         buf
     }
 
+    /// Encode a compare-and-swap command (M3).
+    ///
+    /// Layout:
+    /// `[op:1][client_id:8][seq_no:8][key_len:u32][key][pred_tag:1]`
+    /// followed by the predicate payload and the success op:
+    /// * `IndexEquals`: `[0][index:u64 LE]`
+    /// * `ValueEquals`: `[1][len:u32][value]`
+    /// * `NotExists`: `[2]`
+    /// then `[op_tag:1]`: `[0][len:u32][value]` for `Put`, `[1]` for `Delete`.
+    pub fn encode_cas(
+        client_id: u64,
+        seq_no: u64,
+        key: &[u8],
+        pred: &CasPred,
+        success: &CasOp,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(OP_CAS);
+        buf.extend_from_slice(&client_id.to_le_bytes());
+        buf.extend_from_slice(&seq_no.to_le_bytes());
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        match pred {
+            CasPred::IndexEquals(index) => {
+                buf.push(0);
+                buf.extend_from_slice(&index.to_le_bytes());
+            }
+            CasPred::ValueEquals(value) => {
+                buf.push(1);
+                buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                buf.extend_from_slice(value);
+            }
+            CasPred::NotExists => buf.push(2),
+        }
+        match success {
+            CasOp::Put(value) => {
+                buf.push(0);
+                buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                buf.extend_from_slice(value);
+            }
+            CasOp::Delete => buf.push(1),
+        }
+        buf
+    }
+
     /// The idempotency session `(client_id, seq_no)` a command belongs to.
     ///
     /// `None` for an empty (leader no-op) entry or a truncated command. The
@@ -275,7 +382,7 @@ impl KvStateMachine {
         // validates, minus the payload.
         if !matches!(
             cmd.first(),
-            Some(&OP_PUT) | Some(&OP_DELETE) | Some(&OP_MULTI_PUT)
+            Some(&OP_PUT) | Some(&OP_DELETE) | Some(&OP_MULTI_PUT) | Some(&OP_CAS)
         ) {
             return None;
         }
@@ -397,6 +504,103 @@ impl KvStateMachine {
         Ok((session, entries))
     }
 
+    /// Decode a compare-and-swap command, rejecting a malformed one rather
+    /// than partially applying it.
+    ///
+    /// Layout (mirror of [`encode_cas`](KvStateMachine::encode_cas)):
+    /// `[op:1][cid:8][seq:8][klen:u32][key]` + predicate + success op.
+    fn parse_cas(cmd: &[u8]) -> Result<(SessionKey, Vec<u8>, CasPred, CasOp), KvError> {
+        const HEADER: usize = 1 + 8 + 8; // op + cid + seq
+        if cmd.first() != Some(&OP_CAS) || cmd.len() < HEADER {
+            return Err(KvError::MalformedCommand);
+        }
+        let client_id = u64::from_le_bytes(
+            cmd.get(1..9)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        );
+        let seq_no = u64::from_le_bytes(
+            cmd.get(9..17)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        );
+        let session = SessionKey { client_id, seq_no };
+
+        let mut rest = cmd.get(HEADER..).ok_or(KvError::MalformedCommand)?;
+        let klen = u32::from_le_bytes(
+            rest.get(0..4)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        ) as usize;
+        rest = rest.get(4..).ok_or(KvError::MalformedCommand)?;
+        let key = rest
+            .get(..klen)
+            .ok_or(KvError::MalformedCommand)?
+            .to_vec();
+        rest = rest.get(klen..).ok_or(KvError::MalformedCommand)?;
+
+        let pred = match rest.first() {
+            Some(0) => {
+                let index = u64::from_le_bytes(
+                    rest.get(1..9)
+                        .ok_or(KvError::MalformedCommand)?
+                        .try_into()
+                        .map_err(|_| KvError::MalformedCommand)?,
+                );
+                rest = rest.get(9..).ok_or(KvError::MalformedCommand)?;
+                CasPred::IndexEquals(index)
+            }
+            Some(1) => {
+                let vlen = u32::from_le_bytes(
+                    rest.get(1..5)
+                        .ok_or(KvError::MalformedCommand)?
+                        .try_into()
+                        .map_err(|_| KvError::MalformedCommand)?,
+                ) as usize;
+                let value = rest
+                    .get(5..5 + vlen)
+                    .ok_or(KvError::MalformedCommand)?
+                    .to_vec();
+                rest = rest.get(5 + vlen..).ok_or(KvError::MalformedCommand)?;
+                CasPred::ValueEquals(value)
+            }
+            Some(2) => {
+                rest = rest.get(1..).ok_or(KvError::MalformedCommand)?;
+                CasPred::NotExists
+            }
+            _ => return Err(KvError::MalformedCommand),
+        };
+
+        let success = match rest.first() {
+            Some(0) => {
+                let vlen = u32::from_le_bytes(
+                    rest.get(1..5)
+                        .ok_or(KvError::MalformedCommand)?
+                        .try_into()
+                        .map_err(|_| KvError::MalformedCommand)?,
+                ) as usize;
+                let value = rest
+                    .get(5..5 + vlen)
+                    .ok_or(KvError::MalformedCommand)?
+                    .to_vec();
+                rest = rest.get(5 + vlen..).ok_or(KvError::MalformedCommand)?;
+                CasOp::Put(value)
+            }
+            Some(1) => {
+                rest = rest.get(1..).ok_or(KvError::MalformedCommand)?;
+                CasOp::Delete
+            }
+            _ => return Err(KvError::MalformedCommand),
+        };
+        if !rest.is_empty() {
+            return Err(KvError::MalformedCommand);
+        }
+        Ok((session, key, pred, success))
+    }
+
     /// How many sessions the table holds (propsol §8 `session_count`).
     pub fn session_count(&self) -> usize {
         let guard = self
@@ -497,6 +701,66 @@ impl StateMachine for KvStateMachine {
             return Ok(ApplyOutcome::None);
         }
 
+        // Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`.
+        // A matching predicate applies `op` (put/delete, same apply index);
+        // a miss produces `ApplyOutcome::CasFailed` carrying the state the
+        // compare saw — and the FAILED session is still recorded, so a replay
+        // returns the cached failure without recomputing the compare
+        // (exactly-once: a re-evaluation could flip an originally-failed CAS
+        // to success and break the "at most one outcome" invariant, §6.2.2).
+        if command.first() == Some(&OP_CAS) {
+            let (session, key, pred, success) = Self::parse_cas(command)?;
+            let cached = guard.sessions.get(&session).cloned();
+            let outcome = match cached {
+                Some(cached) => cached,
+                None => {
+                    // Evaluate the predicate against the CURRENT stored state
+                    // (still under the write lock; no torn read).
+                    let current = guard.kv.get(&key);
+                    let matched = match &pred {
+                        CasPred::IndexEquals(want) => {
+                            current.map(|e| e.index == *want).unwrap_or(false)
+                        }
+                        CasPred::ValueEquals(want) => {
+                            current.map(|e| e.val == *want).unwrap_or(false)
+                        }
+                        CasPred::NotExists => current.is_none(),
+                    };
+                    let outcome = if matched {
+                        match success {
+                            CasOp::Put(value) => {
+                                guard.kv.insert(key, Entry { val: value.clone(), index });
+                                ApplyOutcome::Value(value)
+                            }
+                            CasOp::Delete => {
+                                guard.kv.remove(&key);
+                                ApplyOutcome::None
+                            }
+                        }
+                    } else {
+                        let (current_index, current_value) = match current {
+                            Some(e) => (
+                                e.index,
+                                // Cloned current value for the client's retry.
+                                Some(e.val.clone()),
+                            ),
+                            None => (0, None),
+                        };
+                        ApplyOutcome::CasFailed {
+                            current_index,
+                            current_value,
+                        }
+                    };
+                    // Record BOTH outcomes — success and failure — in the
+                    // session table (failure too: §6.2.2).
+                    guard.sessions.insert(session, outcome.clone());
+                    outcome
+                }
+            };
+            guard.applied = index;
+            return Ok(outcome);
+        }
+
         let (session, op, key, val) = Self::parse_command(command)?;
 
         // Idempotency: a replayed session returns its cached result without
@@ -579,6 +843,24 @@ impl StateMachine for KvStateMachine {
                     buf.push(1);
                     buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
                     buf.extend_from_slice(val);
+                }
+                // M3: a failed CAS is a cached outcome and must survive the
+                // snapshot→restore round-trip (KV_SNAPSHOT_VERSION 2). Layout:
+                // `[tag=2][current_index:u64 LE][has_value:1][val]*`.
+                ApplyOutcome::CasFailed {
+                    current_index,
+                    current_value,
+                } => {
+                    buf.push(2);
+                    buf.extend_from_slice(&current_index.to_le_bytes());
+                    match current_value {
+                        Some(val) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(val);
+                        }
+                        None => buf.push(0),
+                    }
                 }
             }
         }
@@ -810,6 +1092,27 @@ fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
                 let vlen = read_u32(&mut cursor)? as usize;
                 let val = read_bytes(&mut cursor, vlen)?;
                 ApplyOutcome::Value(val)
+            }
+            // M3: a cached failed CAS. Layout mirrors the encoder:
+            // `[tag=2][current_index:u64][has_value:1][val]*` (KV_SNAPSHOT_VERSION 2).
+            2 => {
+                let current_index = read_u64(&mut cursor)?;
+                let has_value = read_u8(&mut cursor)?;
+                match has_value {
+                    1 => {
+                        let vlen = read_u32(&mut cursor)? as usize;
+                        let val = read_bytes(&mut cursor, vlen)?;
+                        ApplyOutcome::CasFailed {
+                            current_index,
+                            current_value: Some(val),
+                        }
+                    }
+                    0 => ApplyOutcome::CasFailed {
+                        current_index,
+                        current_value: None,
+                    },
+                    _ => return Err(KvError::MalformedSnapshot),
+                }
             }
             _ => return Err(KvError::MalformedSnapshot),
         };
@@ -1174,7 +1477,7 @@ mod tests {
         ));
 
         // Any version byte other than the current one is rejected too.
-        let mut wrong = vec![2u8]; // KV_SNAPSHOT_VERSION is 1
+        let mut wrong = vec![3u8]; // KV_SNAPSHOT_VERSION is 2 (bumped at M3)
         wrong.extend_from_slice(&0u64.to_le_bytes());
         wrong.extend_from_slice(&0u32.to_le_bytes());
         wrong.extend_from_slice(&0u32.to_le_bytes());
@@ -1462,5 +1765,243 @@ mod tests {
             entries.len()
         );
         assert!(truncated, "more keys existed past the cap");
+    }
+
+    // ---- M3: compare-and-swap ----------------------------------------------
+
+    /// `IndexEquals` matches the current origin index and applies the success
+    /// op (recommended predicate, J3).
+    #[test]
+    fn cas_index_equals_hits_and_applies() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"old"))
+            .unwrap();
+        // CAS on the current index: success, writes the new value.
+        let outcome = sm
+            .apply(
+                2,
+                &KvStateMachine::encode_cas(1, 2, b"k", &CasPred::IndexEquals(1), &CasOp::Put(b"new".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Value(b"new".to_vec()));
+        assert_eq!(sm.get_with_index(b"k").unwrap(), (Some(b"new".to_vec()), Some(2)));
+    }
+
+    /// `IndexEquals` on a *stale* index (the key moved) fails with `CasFailed`
+    /// carrying the current state — and the compare is never re-applied.
+    #[test]
+    fn cas_index_equals_stale_fails_with_current_state() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v1"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_put(1, 2, b"k", b"v2"))
+            .unwrap();
+        // Compare against index 1; the key now sits at index 2.
+        let outcome = sm
+            .apply(
+                3,
+                &KvStateMachine::encode_cas(1, 3, b"k", &CasPred::IndexEquals(1), &CasOp::Put(b"v3".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::CasFailed {
+                current_index: 2,
+                current_value: Some(b"v2".to_vec()),
+            }
+        );
+        // Nothing was written; the key is untouched.
+        assert_eq!(sm.get_with_index(b"k").unwrap(), (Some(b"v2".to_vec()), Some(2)));
+    }
+
+    /// `NotExists` is create-if-absent: succeeds on an absent key, fails (with
+    /// the now-present current state) on an existing one.
+    #[test]
+    fn cas_not_exists_creates_absent_but_rejects_present() {
+        let sm = KvStateMachine::new();
+        // Absent key: create succeeds.
+        let outcome = sm
+            .apply(
+                1,
+                &KvStateMachine::encode_cas(1, 1, b"k", &CasPred::NotExists, &CasOp::Put(b"v".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Value(b"v".to_vec()));
+        // Present key: create-if-absent fails, carrying the current value.
+        let outcome = sm
+            .apply(
+                2,
+                &KvStateMachine::encode_cas(1, 2, b"k", &CasPred::NotExists, &CasOp::Put(b"x".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::CasFailed {
+                current_index: 1,
+                current_value: Some(b"v".to_vec()),
+            }
+        );
+        assert_eq!(sm.get_with_index(b"k").unwrap(), (Some(b"v".to_vec()), Some(1)));
+    }
+
+    /// `ValueEquals` is the compatible-intuitive predicate: exact value match.
+    #[test]
+    fn cas_value_equals_hits_and_misses() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"abc"))
+            .unwrap();
+        // Hit.
+        let outcome = sm
+            .apply(
+                2,
+                &KvStateMachine::encode_cas(1, 2, b"k", &CasPred::ValueEquals(b"abc".to_vec()), &CasOp::Put(b"def".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Value(b"def".to_vec()));
+        // Miss.
+        let outcome = sm
+            .apply(
+                3,
+                &KvStateMachine::encode_cas(1, 3, b"k", &CasPred::ValueEquals(b"nope".to_vec()), &CasOp::Put(b"?".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::CasFailed {
+                current_index: 2,
+                current_value: Some(b"def".to_vec()),
+            }
+        );
+    }
+
+    /// A failed CAS records its session, so a replay returns the **cached**
+    /// `CasFailed` without recomputing the compare (J3: exactly-once — a
+    /// re-evaluation could flip an originally-failed CAS to success).
+    #[test]
+    fn cas_failure_is_cached_and_replay_returns_it() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v"))
+            .unwrap();
+        // A CAS that fails (stale index).
+        let cmd = KvStateMachine::encode_cas(42, 7, b"k", &CasPred::IndexEquals(99), &CasOp::Put(b"x".to_vec()));
+        let first = sm.apply(2, &cmd).unwrap();
+        assert!(matches!(first, ApplyOutcome::CasFailed { .. }));
+        // Replay the same (client_id, seq_no) at a new index: cached failure.
+        let replay = sm.apply(3, &cmd).unwrap();
+        assert_eq!(replay, first, "a replayed CAS returns its cached failure");
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v".to_vec()), Some(1)),
+            "the key is untouched by the failed CAS (and its replay)"
+        );
+    }
+
+    /// A failed CAS outcome survives a snapshot → restore round-trip
+    /// (KV_SNAPSHOT_VERSION 2 encodes tag=2).
+    #[test]
+    fn cas_failure_survives_snapshot_restore() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v"))
+            .unwrap();
+        let cmd = KvStateMachine::encode_cas(42, 7, b"k", &CasPred::IndexEquals(99), &CasOp::Delete);
+        sm.apply(2, &cmd).unwrap();
+
+        let snap = sm.snapshot().unwrap();
+        let sm2 = KvStateMachine::new();
+        sm2.restore(&snap).unwrap();
+
+        // The rebuilt machine snapshots to identical bytes *before* any new
+        // apply (the restore alone must be lossless; a re-apply would move the
+        // index and legitimately change the watermark in the bytes).
+        assert_eq!(sm2.snapshot().unwrap(), snap);
+
+        // The replayed session on the rebuilt machine returns the cached
+        // CasFailed (the compare is not recomputed against current state) —
+        // without re-mutating anything.
+        let replay = sm2.apply(3, &cmd).unwrap();
+        assert_eq!(
+            replay,
+            ApplyOutcome::CasFailed {
+                current_index: 1,
+                current_value: Some(b"v".to_vec()),
+            }
+        );
+        // The key still holds the same value (no delete re-applied).
+        assert_eq!(sm2.get_with_index(b"k").unwrap(), (Some(b"v".to_vec()), Some(1)));
+    }
+
+    /// `IndexEquals` after a delete → re-put: the new value has a fresh
+    /// (higher) origin index, so a compare against the old index fails (I6
+    /// style — the origin really tracks the writing entry).
+    #[test]
+    fn cas_index_equals_sees_reput_origin() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v1"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_delete(1, 2, b"k"))
+            .unwrap();
+        sm.apply(3, &KvStateMachine::encode_put(1, 3, b"k", b"v2"))
+            .unwrap();
+        // Compare against the *old* index (1): the key now lives at 3.
+        let outcome = sm
+            .apply(
+                4,
+                &KvStateMachine::encode_cas(1, 4, b"k", &CasPred::IndexEquals(1), &CasOp::Delete),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::CasFailed {
+                current_index: 3,
+                current_value: Some(b"v2".to_vec()),
+            }
+        );
+    }
+
+    /// A CAS on an absent key with a value predicate fails, carrying an absent
+    /// current state (`current_index: 0`, `current_value: None`).
+    #[test]
+    fn cas_value_equals_on_absent_key_reports_absent() {
+        let sm = KvStateMachine::new();
+        let outcome = sm
+            .apply(
+                1,
+                &KvStateMachine::encode_cas(1, 1, b"nope", &CasPred::ValueEquals(b"x".to_vec()), &CasOp::Put(b"y".to_vec())),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::CasFailed {
+                current_index: 0,
+                current_value: None,
+            }
+        );
+    }
+
+    /// `command_session` recognizes a CAS (same envelope layout).
+    #[test]
+    fn cas_command_session_is_attributed() {
+        let cmd = KvStateMachine::encode_cas(55, 3, b"k", &CasPred::NotExists, &CasOp::Put(b"v".to_vec()));
+        assert_eq!(KvStateMachine::command_session(&cmd), Some((55, 3)));
+    }
+
+    /// Malformed CAS payloads are rejected without partial application.
+    #[test]
+    fn malformed_cas_is_rejected() {
+        let sm = KvStateMachine::new();
+        assert!(matches!(
+            sm.apply(1, &[OP_CAS]),
+            Err(KvError::MalformedCommand)
+        ));
+        // A valid header but a missing predicate byte. (A rejected command
+        // does not advance `applied`, so the next attempt is again at index 1.)
+        let mut bad =
+            Vec::from(&KvStateMachine::encode_cas(1, 1, b"k", &CasPred::NotExists, &CasOp::Put(b"v".to_vec()))[..]);
+        let header_key = 1 + 8 + 8 + 4 + 1; // op + cid + seq + klen + k
+        assert!(matches!(
+            sm.apply(1, &bad[..header_key]),
+            Err(KvError::MalformedCommand)
+        ));
+        bad.clear();
     }
 }

@@ -28,7 +28,7 @@ use crate::factory::TransportConfig;
 use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_client::RaftTransportClient;
 use crate::proto::{
-    ForwardReply, ForwardRequest, ForwardResult, Hello, RaftEnvelope, SnapshotRequest,
+    forward_result, ForwardReply, ForwardRequest, ForwardResult, Hello, RaftEnvelope, SnapshotRequest,
 };
 use crate::unlock;
 use crate::unlock_read;
@@ -398,16 +398,22 @@ async fn get_or_connect<Io: TransportIo>(
 
 /// Decode the wire `result` envelope back into the apply outcome it carried.
 ///
-/// Presence semantics (M1): an *absent* envelope — a read, an old node that
+/// Presence semantics (M1/M3): an *absent* envelope — a read, an old node that
 /// predates the field, or a `None` outcome — decodes to `None`; a *present*
-/// envelope is the `Value` of its interior, including an empty interior, so a
-/// `put` of an empty value round-trips as `Value(vec![])`, not as `None`.
+/// envelope is `Value` of its interior (including empty) unless it carries the
+/// M3 `CasFailed` branch, which decodes to the failed-CAS outcome.
 fn decode_forward_result(result: Option<ForwardResult>) -> Option<ApplyOutcome> {
-    // Explicit rather than `.map(ApplyOutcome::Value)`: when M3 extends the
-    // envelope (e.g. a `CasFailed` branch), this match must be revisited here
-    // instead of silently mapping every present envelope to `Value`.
     match result {
-        Some(r) => Some(ApplyOutcome::Value(r.value)),
+        Some(r) => match r.kind {
+            Some(forward_result::Kind::Value(v)) => Some(ApplyOutcome::Value(v)),
+            Some(forward_result::Kind::CasFailed(cas)) => Some(ApplyOutcome::CasFailed {
+                current_index: cas.current_index,
+                current_value: cas.current_value.map(|b| b.data),
+            }),
+            // A present envelope with no branch set never leaves a current
+            // encoder; decode it as "no outcome" rather than inventing one.
+            None => None,
+        },
         None => None,
     }
 }
@@ -415,36 +421,52 @@ fn decode_forward_result(result: Option<ForwardResult>) -> Option<ApplyOutcome> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::ForwardResult;
+    use crate::proto::{forward_result, BytesValue, CasFailed, ForwardResult};
 
-    /// The three wire shapes are distinguishable: `Value(v)`, empty-`Value`,
-    /// and absent (`None` / old node).
+    /// The wire shapes are distinguishable: `Value(v)`, empty-`Value`,
+    /// `CasFailed`, and absent (`None` / old node).
     #[test]
     fn decode_distinguishes_presence_shapes() {
         // A present envelope carrying a value.
         assert_eq!(
             decode_forward_result(Some(ForwardResult {
-                value: b"v".to_vec()
+                kind: Some(forward_result::Kind::Value(b"v".to_vec()))
             })),
             Some(ApplyOutcome::Value(b"v".to_vec()))
         );
         // A present envelope carrying an *empty* value is `Value(vec![])`,
         // not a collapse with the absent case.
         assert_eq!(
-            decode_forward_result(Some(ForwardResult { value: Vec::new() })),
+            decode_forward_result(Some(ForwardResult {
+                kind: Some(forward_result::Kind::Value(Vec::new()))
+            })),
             Some(ApplyOutcome::Value(Vec::new()))
+        );
+        // A `CasFailed` envelope decodes to the failed outcome, carrying the
+        // state the compare observed (absent value = absent key).
+        assert_eq!(
+            decode_forward_result(Some(ForwardResult {
+                kind: Some(forward_result::Kind::CasFailed(CasFailed {
+                    current_index: 7,
+                    current_value: Some(BytesValue { data: b"cur".to_vec() }),
+                }))
+            })),
+            Some(ApplyOutcome::CasFailed {
+                current_index: 7,
+                current_value: Some(b"cur".to_vec()),
+            })
         );
         // An absent envelope (old node / read / `None` outcome) is `None`.
         assert_eq!(decode_forward_result(None), None);
     }
 
     /// The round-trip through the wire encoding is lossless for the shapes
-    /// M1's forward path actually produces.
+    /// the forward path actually produces.
     #[test]
     fn decode_maps_internal_outcome_shapes() {
         assert_eq!(
             decode_forward_result(Some(ForwardResult {
-                value: b"x".to_vec()
+                kind: Some(forward_result::Kind::Value(b"x".to_vec()))
             })),
             Some(ApplyOutcome::Value(b"x".to_vec()))
         );

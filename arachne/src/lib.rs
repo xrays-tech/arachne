@@ -70,6 +70,7 @@ pub use client::ArachneError;
 pub use metrics::Metrics;
 pub use runtime::{Command, Runtime, RuntimeConfig, RuntimeThread};
 pub use server::Arachne;
+pub use state_machine::{CasOp, CasPred, CasResult};
 
 pub use arachne_kv_seam::seam;
 pub use arachne_kv_seam::types;

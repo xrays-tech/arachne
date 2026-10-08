@@ -20,7 +20,10 @@ use tonic::{Request, Response, Status};
 use crate::error::ERR_HELLO_MISSING;
 use crate::handshake::validate_hello;
 use crate::proto::raft_transport_server::RaftTransport;
-use crate::proto::{ForwardReply, ForwardRequest, ForwardResult, RaftEnvelope, SendReply, SnapshotChunk, SnapshotRequest};
+use crate::proto::{
+    forward_result, BytesValue, CasFailed, ForwardReply, ForwardRequest, ForwardResult, RaftEnvelope,
+    SendReply, SnapshotChunk, SnapshotRequest,
+};
 use crate::snapshot::{RateLimiter, SnapshotProvider};
 
 /// The largest useful snapshot chunk.
@@ -370,14 +373,25 @@ impl RaftTransport for RaftTransportService {
 /// Presence semantics: `Value(v)` — including an empty `v` — is encoded with
 /// the envelope present; `ApplyOutcome::None` (delete / no-op) and "no
 /// outcome" (a read) are both encoded as the *absent* envelope, which is the
-/// documented collapse (see the seam `ForwardOutcome` doc). The match is
-/// written **exhaustively** over the current `ApplyOutcome` variants: M3 adding
-/// a third variant (e.g. `CasFailed`) fails this match at compile time, forcing
-/// its wire encoding to be decided here rather than silently collapsing into
-/// "no outcome".
+/// documented collapse (see the seam `ForwardOutcome` doc). A `CasFailed`
+/// outcome (M3) is a present envelope carrying the state the compare saw. The
+/// match is written **exhaustively** over `ApplyOutcome`: a new variant fails
+/// this match at compile time, forcing its wire encoding to be decided here
+/// rather than silently collapsing into "no outcome".
 fn encode_forward_result(result: Option<ApplyOutcome>) -> Option<ForwardResult> {
     match result {
-        Some(ApplyOutcome::Value(v)) => Some(ForwardResult { value: v }),
+        Some(ApplyOutcome::Value(v)) => Some(ForwardResult {
+            kind: Some(forward_result::Kind::Value(v)),
+        }),
+        Some(ApplyOutcome::CasFailed {
+            current_index,
+            current_value,
+        }) => Some(ForwardResult {
+            kind: Some(forward_result::Kind::CasFailed(CasFailed {
+                current_index,
+                current_value: current_value.map(|data| BytesValue { data }),
+            })),
+        }),
         Some(ApplyOutcome::None) | None => None,
     }
 }
@@ -385,22 +399,42 @@ fn encode_forward_result(result: Option<ApplyOutcome>) -> Option<ForwardResult> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::ForwardResult;
+    use crate::proto::{forward_result, BytesValue, CasFailed, ForwardResult};
 
     /// Encoding preserves the presence distinction the decode side relies on:
-    /// `Value(v)` and empty-`Value` are present; `None` and "no outcome" are
-    /// absent (and therefore indistinguishable over the wire, by design).
+    /// `Value(v)` and empty-`Value` are present; `CasFailed` is a present
+    /// envelope whose branch carries the current state; `None` and "no
+    /// outcome" are absent (and therefore indistinguishable over the wire, by
+    /// design).
     #[test]
     fn encode_distinguishes_presence_shapes() {
         // A value outcome is a present envelope carrying the value.
         assert_eq!(
             encode_forward_result(Some(ApplyOutcome::Value(b"v".to_vec()))),
-            Some(ForwardResult { value: b"v".to_vec() })
+            Some(ForwardResult {
+                kind: Some(forward_result::Kind::Value(b"v".to_vec()))
+            })
         );
         // An empty value is still a present envelope (empty interior).
         assert_eq!(
             encode_forward_result(Some(ApplyOutcome::Value(Vec::new()))),
-            Some(ForwardResult { value: Vec::new() })
+            Some(ForwardResult {
+                kind: Some(forward_result::Kind::Value(Vec::new()))
+            })
+        );
+        // A `CasFailed` outcome is a present envelope carrying the current
+        // state (absent `current_value` = absent key).
+        assert_eq!(
+            encode_forward_result(Some(ApplyOutcome::CasFailed {
+                current_index: 7,
+                current_value: Some(b"cur".to_vec()),
+            })),
+            Some(ForwardResult {
+                kind: Some(forward_result::Kind::CasFailed(CasFailed {
+                    current_index: 7,
+                    current_value: Some(BytesValue { data: b"cur".to_vec() }),
+                }))
+            })
         );
         // `None` outcome and absent outcome are both the absent envelope.
         assert_eq!(encode_forward_result(Some(ApplyOutcome::None)), None);

@@ -236,6 +236,18 @@ impl Arachne {
         handle.multi_put(entries).await
     }
 
+    /// Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`,
+    /// returning the public verdict. Mirrors [`Handle::cas`] for the embedding
+    /// facade.
+    pub async fn cas(
+        key: &[u8],
+        pred: crate::CasPred,
+        success: crate::CasOp,
+    ) -> Result<crate::CasResult, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.cas(key, pred, success).await
+    }
+
     /// Consistent **prefix** stale read (M2-P1A): every `(key, value)` whose
     /// key has byte-prefix `prefix`, plus the applied index the whole segment
     /// was observed at. Mirrors [`Handle::get_stale_prefix`].
