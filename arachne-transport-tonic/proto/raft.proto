@@ -137,4 +137,22 @@ message ForwardReply {
   // (the hint the forwarded node itself would have answered with locally).
   string leader_node_id = 4;
   string leader_addr = 5;
+  // The target's per-command apply outcome for a forwarded `Propose` (write)
+  // (M1). Absent on reads, on any failure, and on old nodes that predate the
+  // field (the rolling-compatibility default, see `ForwardResult`).
+  ForwardResult result = 6;
+}
+
+// The per-command apply outcome of a forwarded `Propose` (M1). Carries only the
+// outcome's value: a successful write that produced a value sets `value`
+// (even an empty value is encoded); a write whose outcome is `None` (delete /
+// no-op), like the old-node default, is encoded as an *absent* field. This
+// presence envelope is what distinguishes `Value(vec![...])` from "no outcome"
+// over the wire; note the documented collapse (seam `ForwardOutcome` doc) where
+// `ApplyOutcome::None` and the old-node default are indistinguishable and both
+// decode to an absent field.
+message ForwardResult {
+  // The outcome's value; set when the outcome is `Value(v)`, including
+  // `v == []`.
+  bytes value = 1;
 }

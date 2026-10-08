@@ -30,6 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::seam::transport::Transport;
+use crate::seam::ApplyOutcome;
 use crate::types::NodeId;
 
 /// A client command that a non-leader node forwards to the leader.
@@ -72,6 +73,25 @@ pub enum ForwardCommand {
 /// surface as the `Err(String)` half of the sink's result rather than as a hint
 /// here, so "failure without a new leader" and "failure that yields a new
 /// leader" are distinguishable.
+///
+/// `result` is the per-command apply outcome of a forwarded `Propose` (write)
+/// that committed and applied on the target: `Value(v)` when the write produced
+/// a value, `None` for a `Delete`/no-op. It is present **only** on a successful
+/// `Propose`; on a read/stale-read the answer rides in `value`, and on any
+/// failure `result` is absent. This is what lets a future compare-and-swap
+/// surface its outcome to the client over the same path (M3). It is *separate*
+/// from `value` (the read's answer) so the two cannot be confused.
+///
+/// # Rolling compatibility
+///
+/// A node predating the outcome field sends a `ForwardReply` whose
+/// `result` is absent (the proto default). The decode side therefore maps it
+/// to `result: None`, indistinguishable from a write whose outcome was
+/// genuinely `None`. This is a deliberate, documented collapse: M1 writes
+/// (`Put`/`Delete`) have outcomes the public API discards anyway, so nothing
+/// observable changes; the field only starts to *matter* when M3 adds an
+/// outcome a caller must distinguish from `None` (and only a new-node pair can
+/// exchange it, since an old node can neither encode nor decode it).
 #[derive(Clone, Debug)]
 pub struct ForwardOutcome {
     /// The read's value, or `None` for a successful write / missing key.
@@ -79,6 +99,9 @@ pub struct ForwardOutcome {
     /// Present only on a `not_leader` outcome: the leader hint to re-redirect
     /// to.
     pub leader_hint: Option<(NodeId, SocketAddr)>,
+    /// Present only on a successful `Propose`: the apply outcome the target
+    /// computed. See the doc on the struct for the rolling-compatibility note.
+    pub result: Option<ApplyOutcome>,
 }
 
 /// Sink the *leader* offers to the transport: it accepts forwarded commands

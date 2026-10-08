@@ -14,7 +14,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
-use arachne_kv_seam::seam::{ForwardCommand, ForwardOutcome, ForwardTransport, RemoteForwarder, Transport, TransportMessage};
+use arachne_kv_seam::seam::{
+    ApplyOutcome, ForwardCommand, ForwardOutcome, ForwardTransport, RemoteForwarder, Transport,
+    TransportMessage,
+};
 use arachne_kv_seam::types::NodeId;
 use tokio::io::AsyncWriteExt;
 use tonic::transport::{Channel, Endpoint};
@@ -25,7 +28,7 @@ use crate::factory::TransportConfig;
 use crate::io::{TokioIoProvider, TransportIo};
 use crate::proto::raft_transport_client::RaftTransportClient;
 use crate::proto::{
-    ForwardReply, ForwardRequest, Hello, RaftEnvelope, SnapshotRequest,
+    ForwardReply, ForwardRequest, ForwardResult, Hello, RaftEnvelope, SnapshotRequest,
 };
 use crate::unlock;
 use crate::unlock_read;
@@ -289,10 +292,17 @@ impl<Io: TransportIo> Forwarder<Io> {
         let reply = response.into_inner();
         if reply.ok {
             // A successful forward: `value` is the read's answer (empty for a
-            // write) and there is no new hint.
+            // write) and there is no new hint. The `result` envelope is the
+            // write's apply outcome: its *presence* distinguishes an outcome
+            // from its absence, and an empty interior `Value(vec![])` is a
+            // genuine value outcome (a put of an empty value), not a collapse
+            // with `None` — the server encodes `Value(v)` with the envelope
+            // present and `None`/no-outcome as absent.
+            let result = decode_forward_result(reply.result);
             Ok(ForwardOutcome {
                 value: Some(reply.value),
                 leader_hint: None,
+                result,
             })
         } else if reply.error_code == "not_leader" {
             // The leader redirected: hand back a fresh hint so the caller can
@@ -304,6 +314,7 @@ impl<Io: TransportIo> Forwarder<Io> {
             Ok(ForwardOutcome {
                 value: None,
                 leader_hint: Some((NodeId::new(reply.leader_node_id), leader_addr)),
+                result: None,
             })
         } else {
             // A stable code that carries no hint (quorum_unavailable, timeout,
@@ -383,4 +394,59 @@ async fn get_or_connect<Io: TransportIo>(
     // (tonic channels share their underlying connection and are cheap to drop).
     unlock(channels).entry(to.clone()).or_insert_with(|| channel.clone());
     Ok(channel)
+}
+
+/// Decode the wire `result` envelope back into the apply outcome it carried.
+///
+/// Presence semantics (M1): an *absent* envelope — a read, an old node that
+/// predates the field, or a `None` outcome — decodes to `None`; a *present*
+/// envelope is the `Value` of its interior, including an empty interior, so a
+/// `put` of an empty value round-trips as `Value(vec![])`, not as `None`.
+fn decode_forward_result(result: Option<ForwardResult>) -> Option<ApplyOutcome> {
+    // Explicit rather than `.map(ApplyOutcome::Value)`: when M3 extends the
+    // envelope (e.g. a `CasFailed` branch), this match must be revisited here
+    // instead of silently mapping every present envelope to `Value`.
+    match result {
+        Some(r) => Some(ApplyOutcome::Value(r.value)),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::ForwardResult;
+
+    /// The three wire shapes are distinguishable: `Value(v)`, empty-`Value`,
+    /// and absent (`None` / old node).
+    #[test]
+    fn decode_distinguishes_presence_shapes() {
+        // A present envelope carrying a value.
+        assert_eq!(
+            decode_forward_result(Some(ForwardResult {
+                value: b"v".to_vec()
+            })),
+            Some(ApplyOutcome::Value(b"v".to_vec()))
+        );
+        // A present envelope carrying an *empty* value is `Value(vec![])`,
+        // not a collapse with the absent case.
+        assert_eq!(
+            decode_forward_result(Some(ForwardResult { value: Vec::new() })),
+            Some(ApplyOutcome::Value(Vec::new()))
+        );
+        // An absent envelope (old node / read / `None` outcome) is `None`.
+        assert_eq!(decode_forward_result(None), None);
+    }
+
+    /// The round-trip through the wire encoding is lossless for the shapes
+    /// M1's forward path actually produces.
+    #[test]
+    fn decode_maps_internal_outcome_shapes() {
+        assert_eq!(
+            decode_forward_result(Some(ForwardResult {
+                value: b"x".to_vec()
+            })),
+            Some(ApplyOutcome::Value(b"x".to_vec()))
+        );
+    }
 }

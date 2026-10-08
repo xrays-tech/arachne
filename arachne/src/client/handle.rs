@@ -37,7 +37,7 @@ use crate::client::ArachneError;
 use crate::runtime::Command;
 use crate::state_machine::KvStateMachine;
 use crate::{
-    ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
+    ApplyOutcome, ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
 };
 use raft_seedable::eraftpb::ConfChangeType;
 
@@ -140,7 +140,9 @@ impl Handle {
         let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
         let client_id = self.inner.client_id;
         let cmd = KvStateMachine::encode_put(client_id, seq_no, key, value);
-        self.propose_with_redirect(cmd, client_id, seq_no).await
+        self.propose_with_redirect(cmd, client_id, seq_no)
+            .await
+            .map(|_| ())
     }
 
     /// **Test-only** (feature `fault-injection`): propose a raw state-machine
@@ -157,6 +159,26 @@ impl Handle {
         client_id: u64,
         seq_no: u64,
     ) -> Result<(), ArachneError> {
+        self.propose_with_redirect(cmd, client_id, seq_no)
+            .await
+            .map(|_| ())
+    }
+
+    /// **M1 observability seam** (`#[doc(hidden)]`, temporary): propose `cmd`
+    /// under an explicit session and return the applied [`ApplyOutcome`] the
+    /// write-back pipeline carried back from the apply task, instead of
+    /// discarding it like [`Handle::put`] does.
+    ///
+    /// M1's acceptance requires a test that can actually see the outcome (a
+    /// `put` regression cannot: its outcome equals its input and the public API
+    /// drops it). M3's CAS/multi-put replace this with permanent APIs.
+    #[doc(hidden)]
+    pub async fn propose_with_outcome(
+        &self,
+        cmd: Vec<u8>,
+        client_id: u64,
+        seq_no: u64,
+    ) -> Result<ApplyOutcome, ArachneError> {
         self.propose_with_redirect(cmd, client_id, seq_no).await
     }
 
@@ -227,12 +249,14 @@ impl Handle {
             target: Some(node_id),
         })
         .await
+        .map(|_| ())
     }
 
     /// Hand leadership to any other voter (propsol §5.3 hard constraint 3).
     async fn hand_over_leadership(&self) -> Result<(), ArachneError> {
         self.request_with_redirect(Request::TransferLeader { target: None })
             .await
+            .map(|_| ())
     }
 
     /// Propose one membership change, following leader hints.
@@ -246,6 +270,7 @@ impl Handle {
             node_id,
         })
         .await
+        .map(|_| ())
     }
 
     /// **Test-only** (feature `fault-injection`): propose a single-step
@@ -269,7 +294,9 @@ impl Handle {
         let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
         let client_id = self.inner.client_id;
         let cmd = KvStateMachine::encode_delete(client_id, seq_no, key);
-        self.propose_with_redirect(cmd, client_id, seq_no).await
+        self.propose_with_redirect(cmd, client_id, seq_no)
+            .await
+            .map(|_| ())
     }
 
     /// Linearizable read (propsol §2.1 / §5.4).
@@ -393,7 +420,7 @@ impl Handle {
         leader_addr: SocketAddr,
         req: &Request,
         deadline: Instant,
-    ) -> Result<Result<(), ArachneError>, ArachneError> {
+    ) -> Result<Result<ApplyOutcome, ArachneError>, ArachneError> {
         // Only writes are forwardable in M1. `ConfChange`/`TransferLeader` are
         // only ever proposed by the node itself to a known in-process peer,
         // so they never reach this path; refuse rather than hang if they do.
@@ -417,12 +444,15 @@ impl Handle {
         {
             Ok(Ok(outcome)) => {
                 // A `not_leader` outcome carries a *fresh* hint (re-redirect);
-                // otherwise the write succeeded.
+                // otherwise the write succeeded, and the outcome is what the
+                // target's apply task computed and wrote back (M1). A node
+                // predating the outcome field returns `result: None`, which the
+                // caller treats as `ApplyOutcome::None` (the M1 default).
                 match outcome.leader_hint {
                     Some((id, a)) => Ok(Err(ArachneError::NotLeader {
                         leader_hint: Some((id, a)),
                     })),
-                    None => Ok(Ok(()))
+                    None => Ok(Ok(outcome.result.unwrap_or(ApplyOutcome::None))),
                 }
             }
             // A stable code from the leader's command sink (a non-`not_leader`
@@ -434,16 +464,16 @@ impl Handle {
     }
 
     /// Reach `target_id` for `req`, choosing the in-process or wire path, and
-    /// return the *inner* result the redirect loop routes (`Ok(())` on success,
-    /// `Err(e)` for the node's verdict) or a reachability error (`Err(e)` on the
-    /// outer side, e.g. an unreachable leader or a gone peer).
+    /// return the *inner* result the redirect loop routes (`Ok(outcome)` on
+    /// success, `Err(e)` for the node's verdict) or a reachability error
+    /// (`Err(e)` on the outer side, e.g. an unreachable leader or a gone peer).
     async fn reach_target(
         &self,
         target_id: &NodeId,
         wire_addr: Option<SocketAddr>,
         req: &Request,
         deadline: Instant,
-    ) -> Result<Result<(), ArachneError>, ArachneError> {
+    ) -> Result<Result<ApplyOutcome, ArachneError>, ArachneError> {
         // In-process: a known in-process peer (self or a registered peer).
         if self.handle_for(target_id).is_some() {
             return self.send_request(target_id, req, deadline).await;
@@ -459,12 +489,16 @@ impl Handle {
         Err(ArachneError::QuorumUnavailable)
     }
 
+    /// Propose `cmd` under `(client_id, seq_no)` and return the applied
+    /// [`ApplyOutcome`] the write-back pipeline carried from the apply task
+    /// (M1). Public write methods discard the outcome and return `()`; the
+    /// outcome is what M3's CAS surfaces.
     async fn propose_with_redirect(
         &self,
         cmd: Vec<u8>,
         client_id: u64,
         seq_no: u64,
-    ) -> Result<(), ArachneError> {
+    ) -> Result<ApplyOutcome, ArachneError> {
         self.request_with_redirect(Request::Propose {
             cmd,
             client_id,
@@ -483,7 +517,14 @@ impl Handle {
     /// The hint drives the target to reach: in-process when it's a known peer,
     /// over the wire otherwise (the multi-process case). A fresh hint re-feeds
     /// the loop toward the current leader.
-    async fn request_with_redirect(&self, req: Request) -> Result<(), ArachneError> {
+    ///
+    /// Returns the applied [`ApplyOutcome`] for a write (M1 write-back). Reads
+    /// and membership changes do not go through this path; the caller maps the
+    /// outcome to its public shape.
+    async fn request_with_redirect(
+        &self,
+        req: Request,
+    ) -> Result<ApplyOutcome, ArachneError> {
         let deadline = Instant::now() + self.inner.timeout;
         let order = self.target_order();
         let mut pos = 0usize;
@@ -526,7 +567,7 @@ impl Handle {
                 Err(e) => return Err(e),
             };
             match result {
-                Ok(()) => return Ok(()),
+                Ok(outcome) => return Ok(outcome),
                 // Re-redirect to the (possibly fresh) leader the node named.
                 Err(ArachneError::NotLeader { leader_hint }) => {
                     if self.max_redirects == 0 {
@@ -633,23 +674,25 @@ impl Handle {
     ///
     /// The outer error is a transport/deadline failure of *this* client; the
     /// inner one is the target's verdict (which may be `NotLeader{hint}`, the
-    /// signal the redirect loop follows).
+    /// signal the redirect loop follows). The `Ok` half of the inner result
+    /// carries the applied outcome for a `Propose` (M1 write-back); membership
+    /// changes have no outcome and map to [`ApplyOutcome::None`].
     async fn send_request(
         &self,
         target: &NodeId,
         req: &Request,
         deadline: Instant,
-    ) -> Result<Result<(), ArachneError>, ArachneError> {
+    ) -> Result<Result<ApplyOutcome, ArachneError>, ArachneError> {
         let Some(handle) = self.handle_for(target) else {
             return Err(ArachneError::QuorumUnavailable);
         };
-        let (ack_tx, ack_rx) = oneshot::channel();
         match req {
             Request::Propose {
                 cmd,
                 client_id,
                 seq_no,
             } => {
+                let (ack_tx, ack_rx) = oneshot::channel::<Result<ApplyOutcome, ArachneError>>();
                 handle
                     .inner
                     .tx
@@ -661,11 +704,13 @@ impl Handle {
                     })
                     .await
                     .map_err(|_| ArachneError::ShuttingDown)?;
+                self.await_oneshot(ack_rx, deadline).await
             }
             Request::ConfChange {
                 change_type,
                 node_id,
             } => {
+                let (ack_tx, ack_rx) = oneshot::channel::<Result<(), ArachneError>>();
                 handle
                     .inner
                     .tx
@@ -676,8 +721,12 @@ impl Handle {
                     })
                     .await
                     .map_err(|_| ArachneError::ShuttingDown)?;
+                self.await_oneshot(ack_rx, deadline)
+                    .await
+                    .map(|r| r.map(|()| ApplyOutcome::None))
             }
             Request::TransferLeader { target: to } => {
+                let (ack_tx, ack_rx) = oneshot::channel::<Result<(), ArachneError>>();
                 handle
                     .inner
                     .tx
@@ -687,9 +736,11 @@ impl Handle {
                     })
                     .await
                     .map_err(|_| ArachneError::ShuttingDown)?;
+                self.await_oneshot(ack_rx, deadline)
+                    .await
+                    .map(|r| r.map(|()| ApplyOutcome::None))
             }
         }
-        self.await_oneshot(ack_rx, deadline).await
     }
 
     async fn send_get(

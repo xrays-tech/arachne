@@ -42,7 +42,7 @@
 //! than on a shared async worker thread; `run` stays available for embedders
 //! and tests that want to place it themselves.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::pin::Pin;
@@ -67,7 +67,9 @@ use crate::types::Timestamp;
 use crate::{
     Clock, LogIndex, NodeId, RaftId, StateMachine, Transport, TransportMessage, TransportRx,
 };
-use arachne_kv_seam::seam::{CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport};
+use arachne_kv_seam::seam::{
+    ApplyOutcome, CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport,
+};
 
 /// A [`CommandSink`] backed by this node's runtime actor: forwarded client
 /// commands are run against the local runtime and the answer is sent back to
@@ -90,7 +92,7 @@ impl CommandSink for ForwardCommandSink {
         Box::pin(async move {
             match cmd {
                 ForwardCommand::Propose { cmd, client_id, seq_no } => {
-                    let (ack_tx, ack_rx) = oneshot::channel::<Result<(), ArachneError>>();
+                    let (ack_tx, ack_rx) = oneshot::channel::<Result<ApplyOutcome, ArachneError>>();
                     self.tx.send(Command::Propose {
                         cmd,
                         client_id,
@@ -104,10 +106,20 @@ impl CommandSink for ForwardCommandSink {
                         Err(_) => return Err("ack channel closed".to_string()),
                     };
                     match result {
-                        Ok(()) => Ok(ForwardOutcome { value: None, leader_hint: None }),
+                        // Success: carry the per-entry apply outcome written back
+                        // by the apply-task → actor pipeline (M1). `value` stays
+                        // `None` — a write has no read answer; the outcome is the
+                        // thing that matters here.
+                        Ok(outcome) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint: None,
+                            result: Some(outcome),
+                        }),
+                        // Not leader: no outcome, just the hint to re-redirect.
                         Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
                             value: None,
                             leader_hint,
+                            result: None,
                         }),
                         Err(e) => Err(format!("forward propose failed: {}", e)),
                     }
@@ -125,13 +137,17 @@ impl CommandSink for ForwardCommandSink {
                         Err(_) => return Err("ack channel closed".to_string()),
                     };
                     match result {
+                        // A read's answer rides in `value`; there is no apply
+                        // outcome to carry for a read.
                         Ok(value) => Ok(ForwardOutcome {
                             value,
                             leader_hint: None,
+                            result: None,
                         }),
                         Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
                             value: None,
                             leader_hint,
+                            result: None,
                         }),
                         Err(e) => Err(format!("forward read failed: {}", e)),
                     }
@@ -152,10 +168,12 @@ impl CommandSink for ForwardCommandSink {
                         Ok(value) => Ok(ForwardOutcome {
                             value,
                             leader_hint: None,
+                            result: None,
                         }),
                         Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
                             value: None,
                             leader_hint,
+                            result: None,
                         }),
                         Err(e) => Err(format!("forward get_stale failed: {}", e)),
                     }
@@ -229,8 +247,11 @@ pub enum Command {
         client_id: u64,
         /// The session sequence number.
         seq_no: u64,
-        /// Reply channel: `Ok(())` once applied, or an error.
-        ack: oneshot::Sender<Result<(), ArachneError>>,
+        /// Reply channel: `Ok(outcome)` once applied — the per-entry
+        /// [`ApplyOutcome`] written back through the apply-task → actor pipeline
+        /// (M1) — or an error. M1 carries the outcome rather than looking it
+        /// up after apply (which would mis-read a concurrent same-batch write).
+        ack: oneshot::Sender<Result<ApplyOutcome, ArachneError>>,
     },
     /// Read this node's applied state (stale read, propsol N1).
     GetStale {
@@ -298,11 +319,14 @@ enum SessionBand {
 struct Pending {
     client_id: u64,
     seq_no: u64,
-    ack: Option<oneshot::Sender<Result<(), ArachneError>>>,
+    /// Reply channel. M1: the `Ok` half now carries the per-entry
+    /// [`ApplyOutcome`] (written back by the apply task), so the client never
+    /// has to look the result up after apply.
+    ack: Option<oneshot::Sender<Result<ApplyOutcome, ArachneError>>>,
     deadline: Instant,
     /// The log index carrying this proposal's entry, once the actor has handed
     /// it to the apply task. `None` until then; the reply follows the applied
-    /// index (propsol v0.2.11 N).
+    /// index *and* the per-entry outcome (propsol v0.2.11 N / M1).
     index: Option<LogIndex>,
 }
 
@@ -451,6 +475,13 @@ struct ApplyTask {
     progress: watch::Sender<ApplyProgress>,
     applied_bytes_total: u64,
     failed: Option<String>,
+    /// Per-entry outcomes, applied → actor. One `(LogIndex, ApplyOutcome)` per
+    /// applied entry; the actor buffers them in `received_outcomes` and uses
+    /// them to answer the matching [`Pending`] (M1 write-back). Bounded so a
+    /// slow actor cannot grow memory without bound; a full channel simply
+    /// backpressures apply (raft's applied index lags the apply task, exactly
+    /// as it already does against the applies channel).
+    outcomes: mpsc::Sender<(LogIndex, ApplyOutcome)>,
 }
 
 impl ApplyTask {
@@ -464,7 +495,7 @@ impl ApplyTask {
         loop {
             match self.applies.try_recv() {
                 Ok(req) => {
-                    if !self.handle(req) {
+                    if !self.handle(req).await {
                         break;
                     }
                     continue;
@@ -477,7 +508,7 @@ impl ApplyTask {
                 maybe = self.applies.recv() => {
                     match maybe {
                         Some(req) => {
-                            if !self.handle(req) {
+                            if !self.handle(req).await {
                                 break;
                             }
                         }
@@ -489,7 +520,7 @@ impl ApplyTask {
     }
 
     /// Returns `false` when the task must stop.
-    fn handle(&mut self, req: ApplyRequest) -> bool {
+    async fn handle(&mut self, req: ApplyRequest) -> bool {
         match req {
             ApplyRequest::Batch(batch) => {
                 if let Some(snapshot) = batch.snapshot
@@ -500,9 +531,21 @@ impl ApplyTask {
                         snapshot.meta.index
                     ));
                 }
+                // M1: each entry's outcome is written back to the actor through
+                // a per-entry channel, so a reply uses the outcome the apply
+                // task computed — never a post-apply re-read (which would
+                // mis-read a concurrent same-batch write, design §9.1).
                 for (index, data) in batch.entries {
-                    if let Err(e) = self.sm.apply(index, &data) {
-                        return self.fail(format!("state machine apply failed: {e}"));
+                    let outcome = match self.sm.apply(index, &data) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            return self.fail(format!("state machine apply failed: {e}"));
+                        }
+                    };
+                    if let Err(_) = self.outcomes.send((index, outcome)).await {
+                        // Actor dropped (runtime going away): nothing more to
+                        // deliver, and the state is already durable in `sm`.
+                        return false;
                     }
                     self.applied_bytes_total += data.len() as u64 + ENTRY_FRAMING_BYTES;
                 }
@@ -566,6 +609,9 @@ enum Outcome {
     Command(Option<Command>),
     /// A background snapshot fetch finished (rev T).
     SnapshotFetched(Option<SnapshotFetchDone>),
+    /// A per-entry outcome arrived from the apply task (M1). The index names
+    /// the entry; the `ApplyOutcome` is what the matching [`Pending`] replies with.
+    AppliedOutcome((LogIndex, ApplyOutcome)),
 }
 
 /// The node runtime actor.
@@ -684,6 +730,13 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     /// Where forwarded client commands are run (propsol v0.2.19). Set by the
     /// facade after `new` so the transport can register it for its gRPC server.
     command_sink: Arc<ForwardCommandSink>,
+    /// Per-entry outcomes, applied → actor (M1). The sender was handed to the
+    /// apply task; this receiver is drained by the actor loop below.
+    outcomes: mpsc::Receiver<(LogIndex, ApplyOutcome)>,
+    /// Outcomes buffered by log index (applied but not yet answered). Drained
+    /// when the matching [`Pending`] is resolved or the index goes stale; kept
+    /// bounded by the outstanding-proposal count (one index, one proposal).
+    received_outcomes: BTreeMap<LogIndex, ApplyOutcome>,
 }
 
 impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
@@ -731,12 +784,16 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             failed: None,
             sessions: 0,
         });
+        // M1: the per-entry outcome channel. Bounded (matches the applies depth)
+        // so a slow actor only backpressures apply — it never grows without bound.
+        let (outcomes_tx, outcomes) = mpsc::channel(APPLY_QUEUE_DEPTH);
         let apply_task = ApplyTask {
             sm: sm.clone(),
             applies: applies_rx,
             progress: progress_tx,
             applied_bytes_total: 0,
             failed: None,
+            outcomes: outcomes_tx,
         };
 
         // The transport's own answer decides how snapshots travel (rev T): a
@@ -817,6 +874,8 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             promote_lag_entries: config.profile.promote_lag_entries,
             metrics: config.metrics,
             logger: logger.clone(),
+            outcomes,
+            received_outcomes: BTreeMap::new(),
             raft_id: config.self_raft_id,
             self_node: config.self_node_id,
             node_to_raft,
@@ -883,8 +942,36 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         loop {
             let outcome = tokio::select! {
                 biased;
+                // `tick` keeps its pre-M1 priority (ahead of every event that a
+                // write storm could sustain): heartbeats must never be queued
+                // behind an outcome burst, or a busy writer could push them past
+                // the election timeout and trigger a spurious election. The
+                // `AppliedOutcome` branch drains the whole burst in one cycle
+                // (`try_recv` folds it), so draining is one wakeup regardless of
+                // where outcomes sit; the actor never blocks on a full outcome
+                // channel (apply backpressures instead), so apply is not
+                // starved by this ordering either.
                 _ = self.stop.notified() => Outcome::Stop,
                 _ = tick.tick() => Outcome::Tick,
+                out = self.outcomes.recv() => match out {
+                    // A per-entry outcome: buffer it for `reply_pendings`.
+                    Some((index, outcome)) => Outcome::AppliedOutcome((index, outcome)),
+                    // The apply task is gone (its sender dropped), so there can
+                    // be no more outcomes. Identical fail-stop to the
+                    // `Progress(Err(_))` branch (the task publishes its failure
+                    // reason on the watch before stopping, so prefer that).
+                    None => {
+                        let reason = self
+                            .progress
+                            .borrow()
+                            .failed
+                            .clone()
+                            .unwrap_or_else(|| "the apply task stopped".to_string());
+                        self.fail_all_pending(&reason);
+                        self.metrics.set_is_leader(false);
+                        break;
+                    }
+                },
                 progress = self.progress.changed() => Outcome::Progress(progress),
                 _ = self.durability.notified() => Outcome::Durability,
                 cmd = self.commands.recv() => Outcome::Command(cmd),
@@ -911,6 +998,17 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // The fetch channel is only closed when the runtime is going
                 // away; there is nothing to finish.
                 Outcome::SnapshotFetched(None) => {}
+                // Outcomes from the apply task are buffered for the matching
+                // proposal; `reply_pendings` pairs them with pendsings on the
+                // cycle that follows (the reply is driven by outcome arrival,
+                // M1). Fold the burst into one buffer + one cycle so a replay
+                // does not force one `drive_cycle` per entry.
+                Outcome::AppliedOutcome(out) => {
+                    self.received_outcomes.insert(out.0, out.1);
+                    while let Ok(out) = self.outcomes.try_recv() {
+                        self.received_outcomes.insert(out.0, out.1);
+                    }
+                }
                 // Durability completions are consumed by `drive_cycle` (which
                 // runs after every event); waking is the whole point.
                 Outcome::Durability => {}
@@ -1706,12 +1804,50 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         let mut still = Vec::with_capacity(self.pending.len());
         for mut p in self.pending.drain(..) {
             // The entry the proposal was attributed to is applied once the
-            // applied index reaches it (propsol v0.2.11 N). A proposal whose
-            // entry never reached the apply task keeps `None` and times out.
-            let applied = matches!(p.index, Some(index) if self.applied_index >= index);
+            // applied index reaches it (propsol v0.2.11 N). M1: the reply also
+            // requires the per-entry outcome to have been written back by the
+            // apply task, so the client gets the outcome the apply task computed
+            // — never a post-apply re-read (which would mis-read a concurrent
+            // same-batch write, §9.1). A proposal whose entry never reached the
+            // apply task keeps `index: None` and times out.
+            let applied = match p.index {
+                Some(index) => self.applied_index >= index,
+                None => false,
+            };
             if applied {
-                if let Some(ack) = p.ack.take() {
-                    let _ = ack.send(Ok(()));
+                let index = match p.index {
+                    Some(i) => i,
+                    None => {
+                        // Unreachable: `applied` is true only when index is set.
+                        if now >= p.deadline
+                            && let Some(ack) = p.ack.take()
+                        {
+                            let _ = ack.send(Err(ArachneError::Timeout));
+                        }
+                        continue;
+                    },
+                };
+                if let Some(outcome) = self.received_outcomes.get(&index) {
+                    if let Some(ack) = p.ack.take() {
+                        let _ = ack.send(Ok(outcome.clone()));
+                    }
+                    // The index is now answered; drop the buffered outcome so
+                    // `received_outcomes` stays bounded (one index, one
+                    // proposal).
+                    self.received_outcomes.remove(&index);
+                } else {
+                    // Applied, but the outcome is still in transit (the apply
+                    // task sends it before advancing `applied_index` past the
+                    // entry, so it must arrive — the reply just waits one more
+                    // cycle). If the deadline has meanwhile lapsed, time out
+                    // rather than hang.
+                    if now >= p.deadline {
+                        if let Some(ack) = p.ack.take() {
+                            let _ = ack.send(Err(ArachneError::Timeout));
+                        }
+                    } else {
+                        still.push(p);
+                    }
                 }
             } else if now >= p.deadline {
                 if let Some(ack) = p.ack.take() {
@@ -1722,6 +1858,17 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             }
         }
         self.pending = still;
+        // Each buffered outcome is tied to exactly one proposal. Once that
+        // proposal is gone (answered above, or timed out), its outcome is
+        // orphaned (applied-after-timeout); prune so `received_outcomes` is
+        // bounded by the count of outstanding proposals.
+        let live: std::collections::HashSet<_> = self
+            .pending
+            .iter()
+            .filter_map(|p| p.index)
+            .collect();
+        self.received_outcomes
+            .retain(|index, _| live.contains(index));
     }
 
     /// Pick a voter to hand leadership to, excluding this node (rev S).

@@ -11,7 +11,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use arachne_kv_seam::seam::{CommandSink, ForwardCommand, ForwardOutcome, TransportMessage};
+use arachne_kv_seam::seam::{ApplyOutcome, CommandSink, ForwardCommand, ForwardOutcome, TransportMessage};
 use arachne_kv_seam::types::NodeId;
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio_stream::wrappers::ReceiverStream;
@@ -20,7 +20,7 @@ use tonic::{Request, Response, Status};
 use crate::error::ERR_HELLO_MISSING;
 use crate::handshake::validate_hello;
 use crate::proto::raft_transport_server::RaftTransport;
-use crate::proto::{ForwardRequest, ForwardReply, RaftEnvelope, SendReply, SnapshotChunk, SnapshotRequest};
+use crate::proto::{ForwardReply, ForwardRequest, ForwardResult, RaftEnvelope, SendReply, SnapshotChunk, SnapshotRequest};
 use crate::snapshot::{RateLimiter, SnapshotProvider};
 
 /// The largest useful snapshot chunk.
@@ -264,6 +264,7 @@ impl RaftTransport for RaftTransportService {
             value: Vec::new(),
             leader_node_id: String::new(),
             leader_addr: String::new(),
+            result: None,
         };
 
         // A missing handshake is rejected *unconditionally*, exactly as for `Send`.
@@ -318,7 +319,11 @@ impl RaftTransport for RaftTransportService {
         };
 
         match sink.sink(forward_command).await {
-            Ok(ForwardOutcome { value, leader_hint }) => {
+            Ok(ForwardOutcome {
+                value,
+                leader_hint,
+                result,
+            }) => {
                 // A hint means this node is not the (current) leader:
                 // report `not_leader` with a fresh hint so the caller can
                 // re-redirect, rather than a bare failure.
@@ -334,6 +339,17 @@ impl RaftTransport for RaftTransportService {
                     // so unwrap to an empty vector when the read has no
                     // value.
                     reply.value = value.unwrap_or_default();
+                    // M1: the apply outcome of a successful write rides the
+                    // `result` envelope (an explicit-presence message, so "no
+                    // result" for a read / old node is distinguishable from a
+                    // genuinely empty value). `ApplyOutcome::Value(v)` is
+                    // encoded with the envelope present — including an empty
+                    // `v` — while `ApplyOutcome::None` (delete / no-op) is
+                    // encoded with the envelope *absent*, which is also what a
+                    // read and an old node produce. This is the documented
+                    // collapse (seam `ForwardOutcome` doc): `None` and "no
+                    // outcome" are indistinguishable over the wire.
+                    reply.result = encode_forward_result(result);
                 }
             }
             // `Err(code)` carries the stable code produced by the sink
@@ -346,5 +362,48 @@ impl RaftTransport for RaftTransportService {
             }
         }
         Ok(Response::new(reply))
+    }
+}
+
+/// Encode a seam apply outcome into the wire `ForwardResult` envelope (M1).
+///
+/// Presence semantics: `Value(v)` — including an empty `v` — is encoded with
+/// the envelope present; `ApplyOutcome::None` (delete / no-op) and "no
+/// outcome" (a read) are both encoded as the *absent* envelope, which is the
+/// documented collapse (see the seam `ForwardOutcome` doc). The match is
+/// written **exhaustively** over the current `ApplyOutcome` variants: M3 adding
+/// a third variant (e.g. `CasFailed`) fails this match at compile time, forcing
+/// its wire encoding to be decided here rather than silently collapsing into
+/// "no outcome".
+fn encode_forward_result(result: Option<ApplyOutcome>) -> Option<ForwardResult> {
+    match result {
+        Some(ApplyOutcome::Value(v)) => Some(ForwardResult { value: v }),
+        Some(ApplyOutcome::None) | None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::ForwardResult;
+
+    /// Encoding preserves the presence distinction the decode side relies on:
+    /// `Value(v)` and empty-`Value` are present; `None` and "no outcome" are
+    /// absent (and therefore indistinguishable over the wire, by design).
+    #[test]
+    fn encode_distinguishes_presence_shapes() {
+        // A value outcome is a present envelope carrying the value.
+        assert_eq!(
+            encode_forward_result(Some(ApplyOutcome::Value(b"v".to_vec()))),
+            Some(ForwardResult { value: b"v".to_vec() })
+        );
+        // An empty value is still a present envelope (empty interior).
+        assert_eq!(
+            encode_forward_result(Some(ApplyOutcome::Value(Vec::new()))),
+            Some(ForwardResult { value: Vec::new() })
+        );
+        // `None` outcome and absent outcome are both the absent envelope.
+        assert_eq!(encode_forward_result(Some(ApplyOutcome::None)), None);
+        assert_eq!(encode_forward_result(None), None);
     }
 }
