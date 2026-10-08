@@ -19,8 +19,8 @@
 | 6 | fuzz：kv snapshot `restore`/`decode_store` target | P2 | 新格式（payload 版本字节 + 8B index）确为 panic 面，现 `fuzz_targets/` 仅 `wal_recovery` | **1**；改 `ci.yml` nightly fuzz job 目标名 | M |
 | 7 | l2 确定性 lane（`l2/tests/in_sim.rs`，turmoil）+ CI `--locked` | P2 | 实质确定性套件在此（≥core lean 已测的 l2_scenarios）；补 `--locked` 堵 drift | **1** | S–M |
 | 8 | model-check 跑通 | P3 | `model-check/src/main.rs` 系 M0 scaffold，跑通**不覆盖新编码**，勿当格式验证。**✓ 2026-10-08 跑通（PASS，观测完成）** | — | S |
-| 9 | `put_with_index`（Option A） | P3 | 可被「put + get_stale_with_index」覆盖；动写 ack 管线 + proto + 滚动门控，收益/成本不划算 | 下游触发 | L |
-| 10 | delete 带序号 / tombstone | P3 | 语义未定（缺键 None 冲突），需先开 API 语义设计 | 下游触发 | L+ |
+| 9 | `put_with_index`（Option A） | P3 | 可被「put + get_stale_with_index」覆盖；动写 ack 管线 + proto + 滚动门控，收益/成本不划算。**✓ 2026-10-08 下游确认不需要 → 关闭**（Option B 已足够；A 不发布） | 下游触发（已关闭） | L |
+| 10 | delete 带序号 / tombstone | P3 | 语义未定（缺键 None 冲突），需先开 API 语义设计。下游为 put-only 替换模型、无需求信号 → **维持挂账** | 下游触发 | L+ |
 | 11 | 快照尺寸/压缩点观察 | P3 | 每 key +8B index +1B 头 → `snapshot_threshold` 触发点前移；**✓ 2026-10-08 观察已登记**（runbook §6；待真实部署量化） | — | S |
 | 12 | 公开 API 站点/embedding 文档同步 | P3 | `docs/api-reference.html` 与 facade/embedding 一致性。**✓ 2026-10-08 已补**（api-reference + tutorial） | — | S |
 
@@ -79,7 +79,7 @@ Phase 3  #8/#11/#12 观察与文档项；#9/#10 下游触发
 - **#12 API 站点/embedding 文档同步**——**✓ 2026-10-08 已补**：`docs/api-reference.html`（facade 方法块 + Handle 表行）+ `tutorial.html` get_stale 段。
 
 ## 3. 外部挂账（不计入本仓待办，不得以内绿关闭）
-- **hydra 三方抽验**：以「head index ≥ 已应用 index 才物化」接入并按下游验收流程回执（design §8）。这是 v0.3.0 的 acceptance，由下游侧驱动，本仓侧保持开放挂账。
+- **hydra 三方抽验**：**✓ 2026-10-08 下游回执验收通过**（v0.3.1：lib 303/303、three-node 5/5、store 6/6（含「更低 index 被拒」的反证）、5 idle runs、三 cluster drills PASS、config-loss 形态 **0/10** vs 改动前 3 CI 次）。outcome 级 E2E 由 `dev-docs/recipe-stale-read-partition.md` 支持；「拒绝分支」E2E（仅可由落后的副本应答 head 读触发）由下游自持 head-read seam 覆盖，不在本仓范围。
 
 ## 4. 风险与注意
 1. **勿把 model-check scaffold 当新格式覆盖**（最隐蔽）：会形成虚假信心。
