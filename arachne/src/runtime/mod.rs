@@ -270,6 +270,22 @@ pub enum Command {
         /// Reply channel with `(value, origin_index)`; `Ok(None)` when absent.
         ack: oneshot::Sender<Result<Option<(Vec<u8>, u64)>, ArachneError>>,
     },
+    /// Consistent **range** stale read (M2-P1A): every `(key, value)` in the
+    /// half-open `[start, end)` range plus the **applied index** under one read
+    /// lock (D-Arc). Like [`Command::GetStale`]: local, weak, no quorum. The
+    /// reply's single index is the atomic version of the whole segment — the
+    /// caller sees either all-old or all-new, never a torn mix.
+    GetStaleRange {
+        /// The half-open range's inclusive lower bound. Empty = unbounded.
+        start: Vec<u8>,
+        /// The half-open range's exclusive upper bound. Empty = unbounded.
+        end: Vec<u8>,
+        /// Max entries to return (bounded first version, §2.3/§4.2).
+        limit: usize,
+        /// Reply channel: `(entries, applied_index, truncated)` where
+        /// `truncated` means more keys existed past `limit`.
+        ack: oneshot::Sender<Result<(Vec<(Vec<u8>, Vec<u8>)>, LogIndex, bool), ArachneError>>,
+    },
     /// Linearizable read via ReadIndex (propsol §5.4). The leader registers a
     /// quorum-confirmed read and replies once the read index is applied; a
     /// non-leader replies `NotLeader{hint}` for the client to redirect.
@@ -1745,6 +1761,13 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // read-index gate, whole path safe to leave the actor thread.
                 self.spawn_read_reply_with_index(key, ack);
             }
+            Command::GetStaleRange { start, end, limit, ack } => {
+                // Consistent range stale read (M2-P1A): everything in `[start,
+                // end)` plus the applied index, under one read lock. Same weak
+                // local path as the other stale reads — off-actor reply (P4
+                // 4.1), no quorum, no read-index gate.
+                self.spawn_read_reply_range(start, end, limit, ack);
+            }
             Command::Read { key, ack } => {
                 // Only the leader can serve a linearizable read (propsol §5.4
                 // step 5); a non-leader redirects.
@@ -2065,6 +2088,28 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 )),
                 Err(e) => Err(e),
             };
+            let _ = ack.send(reply);
+        });
+    }
+
+    /// Off-actor variant of [`spawn_read_reply`] for
+    /// [`Command::GetStaleRange`]: the weak local range read, off the actor's
+    /// current-thread loop (P4 4.1) — everything in `[start, end)` plus the
+    /// **applied index** observed under the same read lock. The single index
+    /// makes the whole segment atomic to the caller (no torn range); `limit`
+    /// bounds the returned entries and `truncated` reports an over-cut.
+    fn spawn_read_reply_range(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: usize,
+        ack: oneshot::Sender<Result<(Vec<(Vec<u8>, Vec<u8>)>, LogIndex, bool), ArachneError>>,
+    ) {
+        let sm = Arc::clone(&self.sm);
+        tokio::spawn(async move {
+            let reply = sm
+                .get_range_with_index(&start, &end, limit)
+                .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
             let _ = ack.send(reply);
         });
     }

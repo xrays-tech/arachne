@@ -49,6 +49,35 @@ const OP_DELETE: u8 = 1;
 /// remove exactly the same sessions, and a timestamp would have to come from the
 /// leader's clock and could not be replayed.
 const OP_SESSION_GC: u8 = 2;
+/// Atomic multi-key put (M2-P1B): one command writes a whole key set under
+/// **one** log entry and one `(client_id, seq_no)` session, atomically (all or
+/// nothing, single apply). Outcome is `None` (the write-back pipeline carries
+/// the success; there is no value result).
+const OP_MULTI_PUT: u8 = 3;
+
+/// The upper bound on a single `multi_put`'s total key+value payload, in bytes
+/// (M2-P1B, §5.2). Enforced at the `Handle` boundary (`validate_multi_put`)
+/// *before* propose, so an over-limit command never enters the log.
+///
+/// The bound is **deliberately below the transport's default max message size**
+/// (8 MiB, `arachne-transport-tonic` `DEFAULT_MAX_MESSAGE_SIZE`): a raft entry
+/// (and a forwarded command) travels as one whole gRPC message with the raft
+/// framing on top, so a batch this size is guaranteed to replicate/forward
+/// without exceeding the wire cap. Raising it requires raising the transport's
+/// `max_message_size` to match.
+pub const MAX_MULTI_PUT_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The largest `multi_put` entry count. Bounded so the encoded command (and the
+/// lock hold during its single apply) stays proportional even before byte
+/// checks run; `Handle::validate_multi_put` rejects beyond this.
+pub const MAX_MULTI_PUT_ENTRIES: usize = 4096;
+
+/// The largest number of entries a single range/prefix stale read will return,
+/// regardless of the caller-supplied `limit` (M2-P1A, §4.2). The state machine
+/// clamps to this so a caller can never ask it to clone the whole map under the
+/// read lock (a `limit = usize::MAX` would otherwise drain memory and block
+/// apply while holding the lock).
+pub const MAX_STALE_RANGE_ENTRIES: usize = 10_000;
 
 /// The state-machine snapshot payload format version.
 ///
@@ -213,6 +242,29 @@ impl KvStateMachine {
         buf
     }
 
+    /// Encode an atomic multi-put command (M2-P1B).
+    ///
+    /// Layout: `[op:1][client_id:8][seq_no:8][count:u32][(klen:u32 key vlen:u32 val) × count]`
+    /// — a single session envelope for the whole batch, one log entry, one
+    /// apply. Callers validate the batch (per-key size, total bytes,
+    /// entry count) *before* proposing (`Handle::validate_multi_put`);
+    /// [`parse_multi_put`](KvStateMachine::parse_multi_put) re-checks the
+    /// structural bounds defensively at apply time.
+    pub fn encode_multi_put(client_id: u64, seq_no: u64, entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(17 + entries.len() * 8);
+        buf.push(OP_MULTI_PUT);
+        buf.extend_from_slice(&client_id.to_le_bytes());
+        buf.extend_from_slice(&seq_no.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (key, val) in entries {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            buf.extend_from_slice(val);
+        }
+        buf
+    }
+
     /// The idempotency session `(client_id, seq_no)` a command belongs to.
     ///
     /// `None` for an empty (leader no-op) entry or a truncated command. The
@@ -221,7 +273,10 @@ impl KvStateMachine {
     pub fn command_session(cmd: &[u8]) -> Option<(u64, u64)> {
         // `[op:1][client_id:8][seq_no:8]` — the same layout `parse_command`
         // validates, minus the payload.
-        if !matches!(cmd.first(), Some(&OP_PUT) | Some(&OP_DELETE)) {
+        if !matches!(
+            cmd.first(),
+            Some(&OP_PUT) | Some(&OP_DELETE) | Some(&OP_MULTI_PUT)
+        ) {
             return None;
         }
         let client_id = u64::from_le_bytes(cmd.get(1..9)?.try_into().ok()?);
@@ -273,6 +328,73 @@ impl KvStateMachine {
             sessions.push(SessionKey { client_id, seq_no });
         }
         Ok(sessions)
+    }
+
+    /// Decode a multi-put command, rejecting a malformed one rather than
+    /// partially applying a prefix of it.
+    ///
+    /// Layout (mirror of [`encode_multi_put`](KvStateMachine::encode_multi_put)):
+    /// `[op:1][client_id:8][seq_no:8][count:u32][(klen:u32 key vlen:u32 val) × count]`.
+    fn parse_multi_put(cmd: &[u8]) -> Result<(SessionKey, Vec<(Vec<u8>, Vec<u8>)>), KvError> {
+        const HEADER: usize = 1 + 8 + 8 + 4; // op + cid + seq + count
+        if cmd.first() != Some(&OP_MULTI_PUT) || cmd.len() < HEADER {
+            return Err(KvError::MalformedCommand);
+        }
+        let client_id = u64::from_le_bytes(
+            cmd.get(1..9)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        );
+        let seq_no = u64::from_le_bytes(
+            cmd.get(9..17)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        );
+        let session = SessionKey { client_id, seq_no };
+        let count = u32::from_le_bytes(
+            cmd.get(17..21)
+                .ok_or(KvError::MalformedCommand)?
+                .try_into()
+                .map_err(|_| KvError::MalformedCommand)?,
+        ) as usize;
+        if count > MAX_MULTI_PUT_ENTRIES {
+            return Err(KvError::MalformedCommand);
+        }
+        let mut rest = cmd.get(21..).ok_or(KvError::MalformedCommand)?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let klen = u32::from_le_bytes(
+                rest.get(0..4)
+                    .ok_or(KvError::MalformedCommand)?
+                    .try_into()
+                    .map_err(|_| KvError::MalformedCommand)?,
+            ) as usize;
+            rest = rest.get(4..).ok_or(KvError::MalformedCommand)?;
+            let key = rest
+                .get(..klen)
+                .ok_or(KvError::MalformedCommand)?
+                .to_vec();
+            rest = rest.get(klen..).ok_or(KvError::MalformedCommand)?;
+            let vlen = u32::from_le_bytes(
+                rest.get(0..4)
+                    .ok_or(KvError::MalformedCommand)?
+                    .try_into()
+                    .map_err(|_| KvError::MalformedCommand)?,
+            ) as usize;
+            rest = rest.get(4..).ok_or(KvError::MalformedCommand)?;
+            let val = rest
+                .get(..vlen)
+                .ok_or(KvError::MalformedCommand)?
+                .to_vec();
+            rest = rest.get(vlen..).ok_or(KvError::MalformedCommand)?;
+            entries.push((key, val));
+        }
+        if !rest.is_empty() {
+            return Err(KvError::MalformedCommand);
+        }
+        Ok((session, entries))
     }
 
     /// How many sessions the table holds (propsol §8 `session_count`).
@@ -349,6 +471,27 @@ impl StateMachine for KvStateMachine {
             let sessions = Self::parse_session_gc(command)?;
             for session in sessions {
                 guard.sessions.remove(&session);
+            }
+            guard.applied = index;
+            return Ok(ApplyOutcome::None);
+        }
+
+        // Atomic multi-put (M2-P1B): one command applies a whole key set under
+        // a single lock hold and a single `(client_id, seq_no)` session. All
+        // entries share this command's log index (same atomic apply), so a
+        // reader observes either all of them or none of them at one watermark.
+        // A replayed session returns its cached `None` without re-mutating —
+        // exactly-once, like the single-key ops.
+        if command.first() == Some(&OP_MULTI_PUT) {
+            let (session, entries) = Self::parse_multi_put(command)?;
+            let cached = guard.sessions.get(&session).cloned();
+            if cached.is_none() {
+                for (key, val) in entries {
+                    guard
+                        .kv
+                        .insert(key, Entry { val, index });
+                }
+                guard.sessions.insert(session, ApplyOutcome::None);
             }
             guard.applied = index;
             return Ok(ApplyOutcome::None);
@@ -501,6 +644,88 @@ impl KvStateMachine {
                 Ok((Some(e.val.clone()), Some(e.index)))
             }
         }
+    }
+
+    /// Consistent **range** read (M2-P1A): every `(key, val)` in `[start, end)`
+    /// plus the **applied index** observed under the same read lock.
+    ///
+    /// This is the D-Arc invariant applied to a range: a single lock hold
+    /// yields a whole segment of the map that belongs to one applied
+    /// watermark, so the caller can use the returned index as the atomic
+    /// version of the entire result (no torn read across the range — the
+    /// `[a,b)` half-open read is never a mix of two applied states).
+    ///
+    /// Semantics: `[start, end)` half-open; a **full** empty range is
+    /// expressed as `start == end == 0x00`-free — see [`RangeBounds`]
+    /// handling — but the convention here is: an empty `start` and empty
+    /// `end` returns **all** keys. The caller computes a byte-prefix range by
+    /// `start = prefix` and `end = prefix + 0x00` padded to the next byte
+    /// (see `Handle::get_stale_prefix`).
+    ///
+    /// `limit` bounds the returned entry count; `truncated` reports whether
+    /// more keys existed past the cut (M2-P1B §4.2: bounded first version —
+    /// never return an unbounded wall of keys in one reply).
+    pub fn get_range_with_index(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, LogIndex, bool), KvError> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| KvError::PoisonedLock)?;
+        // Read the version (D-Arc: version-first) then the range, atomically.
+        let applied = guard.applied;
+        // Server-side hard cap: never clone more than MAX_STALE_RANGE_ENTRIES
+        // under the read lock, no matter what the caller asks for (§4.2).
+        let limit = limit.min(MAX_STALE_RANGE_ENTRIES);
+        let mut out = Vec::new();
+        let mut truncated = false;
+        // A reversed / degenerate `[start, end)` (start >= end, both non-empty)
+        // is an empty range by definition. `BTreeMap::range` would panic on
+        // `start > end`, so return the empty result instead (the Handle
+        // rejects a clearly-reversed request with `InvalidArgument`; this is
+        // the defensive state-machine floor).
+        let reversed = !start.is_empty() && !end.is_empty() && start >= end;
+        if !reversed {
+            let range = if start.is_empty() && end.is_empty() {
+                None
+            } else {
+                let lo = if start.is_empty() {
+                    std::ops::Bound::Unbounded
+                } else {
+                    std::ops::Bound::Included(start.to_vec())
+                };
+                let hi = if end.is_empty() {
+                    std::ops::Bound::Unbounded
+                } else {
+                    std::ops::Bound::Excluded(end.to_vec())
+                };
+                Some((lo, hi))
+            };
+            match range {
+                Some((lo, hi)) => {
+                    for (k, e) in guard.kv.range((lo, hi)) {
+                        if out.len() >= limit {
+                            truncated = true;
+                            break;
+                        }
+                        out.push((k.clone(), e.val.clone()));
+                    }
+                }
+                None => {
+                    for (k, e) in &guard.kv {
+                        if out.len() >= limit {
+                            truncated = true;
+                            break;
+                        }
+                        out.push((k.clone(), e.val.clone()));
+                    }
+                }
+            }
+        }
+        Ok((out, applied, truncated))
     }
 }
 
@@ -979,5 +1204,263 @@ mod tests {
             (Some(b"v2".to_vec()), Some(3)),
             "re-put after delete must carry an index above the whole history"
         );
+    }
+
+    // ---- M2-P1B: atomic multi-put -------------------------------------------
+
+    /// A multi-put writes the whole batch atomically: every key lands under
+    /// the **same** origin index (the command's log index).
+    #[test]
+    fn multi_put_writes_batch_atomically_with_shared_index() {
+        let sm = KvStateMachine::new();
+        // Advance the machine to index 6 (no-op term records) so the batch's
+        // origin index is a non-trivial `7`.
+        for i in 1..=6u64 {
+            sm.apply(i, &[]).unwrap();
+        }
+        let entries: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
+        let outcome = sm
+            .apply(7, &KvStateMachine::encode_multi_put(1, 1, entries))
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::None);
+        // Every key exists, all with origin index 7 (the batch's apply index).
+        assert_eq!(sm.get_with_index(b"a").unwrap(), (Some(b"1".to_vec()), Some(7)));
+        assert_eq!(sm.get_with_index(b"b").unwrap(), (Some(b"2".to_vec()), Some(7)));
+        assert_eq!(sm.get_with_index(b"c").unwrap(), (Some(b"3".to_vec()), Some(7)));
+    }
+
+    /// Duplicate keys inside one batch: the later entry wins (documented
+    /// semantic), and still a single origin index.
+    #[test]
+    fn multi_put_duplicate_keys_last_wins() {
+        let sm = KvStateMachine::new();
+        let entries: &[(&[u8], &[u8])] = &[(b"k", b"first"), (b"k", b"second")];
+        sm.apply(1, &KvStateMachine::encode_multi_put(1, 1, entries))
+            .unwrap();
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"second".to_vec()), Some(1)),
+            "a later duplicate key must overwrite the earlier one"
+        );
+    }
+
+    /// Replaying the same `(client_id, seq_no)` returns the cached `None`
+    /// outcome and does **not** re-apply the batch (exactly-once, like
+    /// single-key writes).
+    #[test]
+    fn multi_put_replay_is_idempotent() {
+        let sm = KvStateMachine::new();
+        let cmd = KvStateMachine::encode_multi_put(42, 9, &[(b"a", b"1"), (b"b", b"2")]);
+        sm.apply(1, &cmd).unwrap();
+        // A replay at a new index with the *same* session returns the cache and
+        // leaves the store at its original apply.
+        let replay = sm.apply(2, &cmd).unwrap();
+        assert_eq!(replay, ApplyOutcome::None);
+        assert_eq!(sm.get_with_index(b"a").unwrap(), (Some(b"1".to_vec()), Some(1)));
+        assert_eq!(sm.get_with_index(b"b").unwrap(), (Some(b"2".to_vec()), Some(1)));
+    }
+
+    /// Over-limit / malformed batches are rejected rather than partially
+    /// applied: the count cap and the structural bounds are enforced at apply.
+    #[test]
+    fn multi_put_rejects_malformed_and_over_bounds() {
+        // Count exceeding MAX_MULTI_PUT_ENTRIES must be rejected.
+        let sm = KvStateMachine::new();
+        let mut over = Vec::new();
+        over.push(OP_MULTI_PUT);
+        over.extend_from_slice(&1u64.to_le_bytes()); // client_id
+        over.extend_from_slice(&1u64.to_le_bytes()); // seq_no
+        over.extend_from_slice(&((MAX_MULTI_PUT_ENTRIES + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            sm.apply(1, &over),
+            Err(KvError::MalformedCommand)
+        ));
+        // A declared count that outruns the payload is malformed too. A
+        // rejected batch does not advance `applied`, so this must also land at
+        // the next expected index (1) on a fresh machine.
+        let sm = KvStateMachine::new();
+        let cmd = KvStateMachine::encode_multi_put(1, 2, &[(b"a", b"1")]);
+        let cut = &cmd[..cmd.len() - 2];
+        assert!(matches!(
+            sm.apply(1, cut),
+            Err(KvError::MalformedCommand)
+        ));
+        // A truncated command carrying the op byte only. A rejected batch does
+        // not advance `applied`, so this lands at the next expected index (1)
+        // on the same machine.
+        assert!(matches!(
+            sm.apply(1, &[OP_MULTI_PUT]),
+            Err(KvError::MalformedCommand)
+        ));
+        // Nothing was applied by any rejected batch.
+        assert_eq!(sm.applied_index(), 0);
+        assert_eq!(sm.get_with_index(b"a").unwrap(), (None, None));
+    }
+
+    /// `command_session` recognizes a multi-put (same `(client_id, seq_no)`
+    /// envelope layout) so the runtime can attribute it to a waiting proposal.
+    #[test]
+    fn multi_put_command_session_is_attributed() {
+        let cmd = KvStateMachine::encode_multi_put(55, 3, &[(b"a", b"1")]);
+        assert_eq!(KvStateMachine::command_session(&cmd), Some((55, 3)));
+    }
+
+    // ---- M2-P1A: consistent range read --------------------------------------
+
+    /// An empty `start`+`end` is the full map; entries come back in byte order
+    /// with the applied index.
+    #[test]
+    fn range_read_full_map_is_ordered_with_index() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"b", b"2"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_put(1, 2, b"a", b"1"))
+            .unwrap();
+        let (entries, index, truncated) = sm.get_range_with_index(b"", b"", 100).unwrap();
+        assert_eq!(
+            entries,
+            vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())],
+            "full range must be byte-ordered"
+        );
+        assert_eq!(index, 2);
+        assert!(!truncated);
+    }
+
+    /// Half-open `[a, b)` semantics: `a` included, `b` excluded; missing
+    /// endpoints are unbounded (empty = unbounded).
+    #[test]
+    fn range_read_respects_half_open_bounds() {
+        let sm = KvStateMachine::new();
+        let keys: [&[u8]; 5] = [b"aa", b"ab", b"ac", b"b", b"ba"];
+        for (i, k) in keys.into_iter().enumerate() {
+            sm.apply((i + 1) as u64, &KvStateMachine::encode_put(1, (i + 1) as u64, k, b"v"))
+                .unwrap();
+        }
+        // [ab, b) → ab, ac (aa < ab excluded; b excluded).
+        let (entries, _, _) = sm.get_range_with_index(b"ab", b"b", 100).unwrap();
+        assert_eq!(
+            entries,
+            vec![(b"ab".to_vec(), b"v".to_vec()), (b"ac".to_vec(), b"v".to_vec())]
+        );
+        // Unbounded lower: `[.., b)` = everything before `b`.
+        let (entries, _, _) = sm.get_range_with_index(b"", b"b", 100).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"aa".to_vec(), b"v".to_vec()),
+                (b"ab".to_vec(), b"v".to_vec()),
+                (b"ac".to_vec(), b"v".to_vec())
+            ]
+        );
+        // Unbounded upper: `[b, ..)` = b and after.
+        let (entries, _, _) = sm.get_range_with_index(b"b", b"", 100).unwrap();
+        assert_eq!(
+            entries,
+            vec![(b"b".to_vec(), b"v".to_vec()), (b"ba".to_vec(), b"v".to_vec())]
+        );
+    }
+
+    /// `limit` bounds the returned entries and sets `truncated`.
+    #[test]
+    fn range_read_honors_limit_and_truncation() {
+        let sm = KvStateMachine::new();
+        let keys: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
+        for (i, k) in keys.into_iter().enumerate() {
+            sm.apply((i + 1) as u64, &KvStateMachine::encode_put(1, (i + 1) as u64, k, b"v"))
+                .unwrap();
+        }
+        let (entries, _, truncated) = sm.get_range_with_index(b"", b"", 2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(truncated, "more keys existed past the limit");
+        let (entries, _, truncated) = sm.get_range_with_index(b"", b"", 4).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(!truncated);
+    }
+
+    /// A prefix range behaves like `[prefix, successor(prefix))` — keys that
+    /// merely start with the prefix but extend it are included, longer-mismatch
+    /// keys are not.
+    #[test]
+    fn range_read_prefix_semantics() {
+        let sm = KvStateMachine::new();
+        let keys: [&[u8]; 4] = [b"head", b"head\x00e1", b"head\x00e2", b"other"];
+        for (i, k) in keys.into_iter().enumerate() {
+            sm.apply((i + 1) as u64, &KvStateMachine::encode_put(1, (i + 1) as u64, k, b"v"))
+                .unwrap();
+        }
+        // `[prefix, successor(prefix))` for the prefix `head\x00e1`: the
+        // successor bumps the last non-0xFF byte (`e1` → `e2`) and truncates,
+        // yielding exactly `head\x00e2`.
+        let prefix = b"head\x00e1";
+        let end = b"head\x00e2";
+        let (entries, _, _) = sm.get_range_with_index(prefix, end, 100).unwrap();
+        assert_eq!(entries, vec![(b"head\x00e1".to_vec(), b"v".to_vec())]);
+
+        // The prefix `head` (no embedded null) reaches all `head*` keys: its
+        // successor bumps the trailing `d` → `e`.
+        let (entries, _, _) = sm.get_range_with_index(b"head", b"heae", 100).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"head".to_vec(), b"v".to_vec()),
+                (b"head\x00e1".to_vec(), b"v".to_vec()),
+                (b"head\x00e2".to_vec(), b"v".to_vec())
+            ]
+        );
+    }
+
+    /// A range read observes a whole segment at one applied watermark — writing
+    /// after the read does not tear the earlier result.
+    #[test]
+    fn range_read_index_advances_with_apply() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"a", b"1"))
+            .unwrap();
+        let (_, index1, _) = sm.get_range_with_index(b"", b"", 100).unwrap();
+        assert_eq!(index1, 1);
+        sm.apply(2, &KvStateMachine::encode_put(1, 2, b"b", b"2"))
+            .unwrap();
+        let (_, index2, _) = sm.get_range_with_index(b"", b"", 100).unwrap();
+        assert_eq!(index2, 2);
+    }
+
+    /// A reversed / degenerate `[start, end)` (start >= end, both non-empty)
+    /// returns an empty result rather than panicking inside `BTreeMap::range`.
+    #[test]
+    fn range_read_reversed_returns_empty() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"a", b"1"))
+            .unwrap();
+        // start == end is a legal empty range (no panic, nothing to return).
+        let (entries, index, truncated) = sm.get_range_with_index(b"b", b"b", 10).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(index, 1);
+        assert!(!truncated);
+        // start > end must not panic; returns empty.
+        let (entries, _, _) = sm.get_range_with_index(b"z", b"a", 10).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    /// The server-side cap `MAX_STALE_RANGE_ENTRIES` bounds the reply even when
+    /// the caller passes an unbounded `limit`.
+    #[test]
+    fn range_read_is_capped_by_server_side_limit() {
+        let sm = KvStateMachine::new();
+        for i in 0..(MAX_STALE_RANGE_ENTRIES + 5) as u64 {
+            sm.apply(
+                i + 1,
+                &KvStateMachine::encode_put(1, i + 1, format!("k{i:06}").as_bytes(), b"v"),
+            )
+            .unwrap();
+        }
+        let (entries, _, truncated) = sm
+            .get_range_with_index(b"", b"", usize::MAX)
+            .unwrap();
+        assert!(
+            entries.len() <= MAX_STALE_RANGE_ENTRIES,
+            "server-side cap must clamp the reply, got {}",
+            entries.len()
+        );
+        assert!(truncated, "more keys existed past the cap");
     }
 }

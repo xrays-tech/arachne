@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::client::ArachneError;
 use crate::runtime::Command;
-use crate::state_machine::KvStateMachine;
+use crate::state_machine::{KvStateMachine, MAX_MULTI_PUT_ENTRIES, MAX_MULTI_PUT_TOTAL_BYTES};
 use crate::{
     ApplyOutcome, ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
 };
@@ -140,6 +140,26 @@ impl Handle {
         let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
         let client_id = self.inner.client_id;
         let cmd = KvStateMachine::encode_put(client_id, seq_no, key, value);
+        self.propose_with_redirect(cmd, client_id, seq_no)
+            .await
+            .map(|_| ())
+    }
+
+    /// Atomic multi-key write (M2-P1B): one command, one log entry, one session
+    /// that sets **all** `entries` atomically (all or nothing, single apply).
+    ///
+    /// This is the "whole-tree replace" primitive: hydra re-sets every key of a
+    /// tree in one propose instead of N single-key writes (N proposes → 1).
+    /// Duplicate keys within one batch are legal; the later entry wins.
+    ///
+    /// Violations of the per-key size limits or the batch's total-byte bound
+    /// are rejected with [`ArachneError::InvalidArgument`] *before* proposing
+    /// (fail-stop discipline, propsol §3.2) — the batch never enters the log.
+    pub async fn multi_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), ArachneError> {
+        self.validate_multi_put(entries)?;
+        let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
+        let client_id = self.inner.client_id;
+        let cmd = KvStateMachine::encode_multi_put(client_id, seq_no, entries);
         self.propose_with_redirect(cmd, client_id, seq_no)
             .await
             .map(|_| ())
@@ -324,6 +344,78 @@ impl Handle {
             .tx
             .send(Command::GetStale {
                 key: key.to_vec(),
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| ArachneError::ShuttingDown)?;
+        self.await_oneshot(ack_rx, deadline).await?
+    }
+
+    /// Stale read of an **atomic prefix**: every `(key, value)` whose key has
+    /// byte-prefix `prefix`, plus the **applied index** the whole segment was
+    /// observed at (M2-P1A). The index is the atomic version of the result: the
+    /// caller can treat `(keys, values, index)` as one consistent snapshot and
+    /// order on `index` — e.g. batch-decision without a quorum round.
+    ///
+    /// Same contract as [`Handle::get_stale`]: local, weak, may be stale, no
+    /// quorum. The prefix is a raw byte prefix (keyspace in byte-lexicographic
+    /// order, as `BTreeMap` orders them); `[prefix, prefix + successor)` is the
+    /// half-open range returned. `limit` bounds the returned entries; the
+    /// `bool` is `true` when more keys existed past `limit` (truncated).
+    pub async fn get_stale_prefix(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, u64, bool), ArachneError> {
+        self.validate_key(prefix)?;
+        // The byte-successor range end: `prefix` with the last byte carrying a
+        // `0xFF` bumped, `0x00`-padded beyond, so [prefix, end) is exactly the
+        // prefix's slice of the keyspace. A prefix that is all `0xFF` has no
+        // successor — an empty `end` means unbounded in the state machine.
+        let end = successor(prefix);
+        self.get_stale_range(prefix, end.as_deref().unwrap_or(&[]), limit)
+            .await
+    }
+
+    /// Stale read of a **half-open key range** `[start, end)` plus the applied
+    /// index the segment was observed at (M2-P1A). Consistent: one read lock,
+    /// no torn mix of two applied states. `start.is_empty()` = unbounded lower,
+    /// `end.is_empty()` = unbounded upper (both empty = the whole map).
+    ///
+    /// Same contract as [`Handle::get_stale`]: local, weak, may be stale, no
+    /// quorum. `limit` bounds the returned entries; the `bool` is `true` when
+    /// more keys existed past `limit` (truncated). See
+    /// [`Handle::get_stale_prefix`] for the prefix short-hand.
+    #[allow(clippy::type_complexity)]
+    pub async fn get_stale_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, u64, bool), ArachneError> {
+        self.validate_key(start)?;
+        self.validate_key(end)?;
+        // A clearly-reversed `[start, end)` (start > end, both non-empty) has
+        // no keys; reject it as an invalid argument instead of letting the
+        // state machine hit `BTreeMap::range`'s start-greater-than-end panic
+        // inside the read-reply task (which would surface as a misleading
+        // `ShuttingDown` and, on abort builds, let a remote client crash the
+        // node). `start == end` (both non-empty) is a legal empty range.
+        if !start.is_empty() && !end.is_empty() && start > end {
+            return Err(ArachneError::InvalidArgument(format!(
+                "range start {:?} is greater than end {:?}",
+                String::from_utf8_lossy(start),
+                String::from_utf8_lossy(end)
+            )));
+        }
+        let deadline = Instant::now() + self.inner.timeout;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(Command::GetStaleRange {
+                start: start.to_vec(),
+                end: end.to_vec(),
+                limit,
                 ack: ack_tx,
             })
             .await
@@ -870,6 +962,49 @@ impl Handle {
         }
         Ok(())
     }
+
+    /// Validate a `multi_put` batch against every bound **before** propose
+    /// (fail-stop discipline, propsol §3.2): each key within `max_key_bytes`,
+    /// each value within `max_value_bytes`, entry count within
+    /// [`MAX_MULTI_PUT_ENTRIES`], and the batch's total key+value bytes within
+    /// [`MAX_MULTI_PUT_TOTAL_BYTES`]. An over-limit batch is rejected with
+    /// `InvalidArgument` and never enters the log (§5.2 backpressure + size
+    /// caps).
+    fn validate_multi_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), ArachneError> {
+        if entries.is_empty() {
+            return Err(ArachneError::InvalidArgument(
+                "multi_put requires at least one entry".into(),
+            ));
+        }
+        if entries.len() > MAX_MULTI_PUT_ENTRIES {
+            return Err(ArachneError::InvalidArgument(format!(
+                "multi_put of {} entries exceeds MAX_MULTI_PUT_ENTRIES ({})",
+                entries.len(),
+                MAX_MULTI_PUT_ENTRIES
+            )));
+        }
+        let mut total: u64 = 0;
+        for (key, value) in entries {
+            self.validate_key(key)?;
+            if (value.len() as u64) > self.inner.max_value_bytes {
+                return Err(ArachneError::InvalidArgument(format!(
+                    "multi_put value of {} bytes exceeds max_value_bytes ({})",
+                    value.len(),
+                    self.inner.max_value_bytes
+                )));
+            }
+            total = total
+                .saturating_add(key.len() as u64)
+                .saturating_add(value.len() as u64);
+        }
+        if total > MAX_MULTI_PUT_TOTAL_BYTES {
+            return Err(ArachneError::InvalidArgument(format!(
+                "multi_put total {} bytes exceeds MAX_MULTI_PUT_TOTAL_BYTES ({})",
+                total, MAX_MULTI_PUT_TOTAL_BYTES
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// A request the redirect loop can carry to whichever node is the leader.
@@ -945,4 +1080,23 @@ fn lock_write<'a, T>(lock: &'a RwLock<T>) -> RwLockWriteGuard<'a, T> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     }
+}
+
+/// The byte-successor of a prefix: the smallest key greater than every key
+/// that has `prefix` as its byte prefix (M2-P1A §4.1).
+///
+/// `[prefix, successor(prefix))` is exactly the keyspace slice sharing
+/// `prefix`. Computed by taking `prefix`, bumping the last byte that is not
+/// `0xFF` by one and truncating after it; a prefix whose tail is all `0xFF`
+/// has no successor in the byte-ordering and returns `None` (the range end is
+/// then unbounded).
+fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    for i in (0..prefix.len()).rev() {
+        if prefix[i] != 0xFF {
+            let mut out = prefix[..=i].to_vec();
+            out[i] += 1;
+            return Some(out);
+        }
+    }
+    None
 }

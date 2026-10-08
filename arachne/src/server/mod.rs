@@ -228,6 +228,39 @@ impl Arachne {
         handle.delete(key).await
     }
 
+    /// Atomic multi-key write (M2-P1B): one command sets all `entries`
+    /// atomically (all or nothing). Mirrors [`Handle::multi_put`] for the
+    /// embedding facade — the "whole-tree replace" primitive for hydra.
+    pub async fn multi_put(entries: &[(&[u8], &[u8])]) -> Result<(), ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.multi_put(entries).await
+    }
+
+    /// Consistent **prefix** stale read (M2-P1A): every `(key, value)` whose
+    /// key has byte-prefix `prefix`, plus the applied index the whole segment
+    /// was observed at. Mirrors [`Handle::get_stale_prefix`].
+    #[allow(clippy::type_complexity)]
+    pub async fn get_stale_prefix(
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, u64, bool), ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.get_stale_prefix(prefix, limit).await
+    }
+
+    /// Consistent **range** stale read (M2-P1A): everything in `[start, end)`
+    /// plus the applied index the segment was observed at. Mirrors
+    /// [`Handle::get_stale_range`].
+    #[allow(clippy::type_complexity)]
+    pub async fn get_stale_range(
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, u64, bool), ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.get_stale_range(start, end, limit).await
+    }
+
     /// Escape hatch: return a clone of the local [`Handle`] so embedding code can
     /// do anything the full client API permits (reads, proposes, membership
     /// changes...). The clone is cheap (shared actor channel) and the node must
