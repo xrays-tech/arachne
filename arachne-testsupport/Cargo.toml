@@ -5,8 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-# Test-only: never published.
-publish = false
+# Published for downstream **test harnesses** (in-memory transport + firewall).
+# It remains dev-dependency-only: production crates may only pull it via
+# [dev-dependencies] (enforced by scripts/check-deps.sh Gate A); it never
+# enters any published crate's runtime dependency tree.
 
 [dependencies]
 # This test-only crate depends on the SEAM crate (`arachne-kv-seam`), NOT on
