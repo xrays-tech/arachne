@@ -56,6 +56,14 @@ async fn node_serves_writes_after_election() {
         kv.get_stale(b"k").await.expect("get_stale"),
         Some(b"v".to_vec())
     );
+    // v0.3.0: the weak read also reports the value's origin index (>= 1).
+    let (value, index) = kv
+        .get_stale_with_index(b"k")
+        .await
+        .expect("get_stale_with_index")
+        .expect("key must be present");
+    assert_eq!(value, b"v".to_vec());
+    assert!(index >= 1, "origin index must be >= 1, got {index}");
 
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

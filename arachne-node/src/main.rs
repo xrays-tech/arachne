@@ -126,15 +126,30 @@ impl NodeHttp {
         match method {
             "GET" => {
                 let key = rest.as_bytes();
-                let result = if query.contains("stale=1") {
-                    self.kv.get_stale(key).await
+                if query.contains("stale_index=1") {
+                    // Weak read + the value's origin index (v0.3.0): body is
+                    // `<value>\n<index>` with index >= 1 when present.
+                    match self.kv.get_stale_with_index(key).await {
+                        Ok(Some((value, index))) => {
+                            let mut body = value;
+                            body.push(b'\n');
+                            body.extend_from_slice(index.to_string().as_bytes());
+                            HttpResponse::text(body)
+                        }
+                        Ok(None) => HttpResponse::not_found(),
+                        Err(e) => Self::map_error(e),
+                    }
                 } else {
-                    self.kv.get(key).await
-                };
-                match result {
-                    Ok(Some(value)) => HttpResponse::text(value),
-                    Ok(None) => HttpResponse::not_found(),
-                    Err(e) => Self::map_error(e),
+                    let result = if query.contains("stale=1") {
+                        self.kv.get_stale(key).await
+                    } else {
+                        self.kv.get(key).await
+                    };
+                    match result {
+                        Ok(Some(value)) => HttpResponse::text(value),
+                        Ok(None) => HttpResponse::not_found(),
+                        Err(e) => Self::map_error(e),
+                    }
                 }
             }
             "PUT" => {

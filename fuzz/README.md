@@ -12,6 +12,18 @@ then calls `WalStorage::open`. The target **must not panic on any input** — ev
 input must land in one of the two INV6 quadrants (a `Result` of `Ok` =
 legal-prefix truncation, or `Err` = fail-start).
 
+## Fuzz target ② — `kv_snapshot_restore`
+
+`fuzz_targets/kv_snapshot_restore.rs` feeds the fuzzer input directly to
+`KvStateMachine::restore` (the v0.3.0 snapshot payload: a leading format-version
+byte + per-key 8-byte origin index). The target **must not panic on any input**
+— every input must land in `Ok(())` or `Err(MalformedSnapshot)`, and a
+successful restore must round-trip: re-snapshotting reproduces the input bytes
+exactly (lossless, deterministic encoding), with reads never exposing an origin
+index of `0`. This hardens the format change in
+`dev-docs/arachne-kv-commit-index-design.md` §5.1/§5.4 (legacy payloads are
+rejected, never migrated).
+
 ## Relationship to the deterministic harness (M0 ② / INV6)
 
 The **primary CI evidence** for M0 ② is the deterministic, in-repo harness
@@ -55,6 +67,7 @@ It runs on a nightly schedule (cron: `0 4 * * *`) and on manual dispatch:
 - Nightly toolchain with `rust-src` component
 - `cargo +nightly install cargo-fuzz --locked`
 - `cargo +nightly fuzz run wal_recovery -- -max_total_time=300`
+- `cargo +nightly fuzz run kv_snapshot_restore -- -max_total_time=300`
 
 ## Local invocation
 
@@ -67,6 +80,9 @@ cargo +nightly fuzz build
 
 # run fuzz target ① on Linux (default ASan):
 cargo +nightly fuzz run wal_recovery -- -max_total_time=300
+
+# run fuzz target ② (v0.3.0 snapshot restore) on Linux (default ASan):
+cargo +nightly fuzz run kv_snapshot_restore -- -max_total_time=300
 
 # run on macOS aarch64 (must use --sanitizer none):
 cargo +nightly fuzz run --sanitizer none wal_recovery -- -max_total_time=300

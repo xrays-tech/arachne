@@ -42,5 +42,13 @@ name = "wal_recovery"
 path = "fuzz_targets/wal_recovery.rs"
 harness = false
 
+# KV snapshot-restore hardening for the v0.3.0 payload format (version byte +
+# per-key origin index; legacy payloads fail-stop). See
+# `dev-docs/arachne-kv-commit-index-design.md` §5.1/§5.4.
+[[bin]]
+name = "kv_snapshot_restore"
+path = "fuzz_targets/kv_snapshot_restore.rs"
+harness = false
+
 # Standalone workspace root (keeps `fuzz/` out of the root Arachne workspace).
 [workspace]
