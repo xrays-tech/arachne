@@ -168,7 +168,7 @@ jobs:
 
       - name: L2 tests (real tonic over turmoil, no ignored tests)
         working-directory: l2
-        run: cargo test
+        run: cargo test --locked
 
   # Fuzz job: runs only on the nightly schedule or manual dispatch (not per-PR).
   # Uses `github.event_name` to gate: `schedule` and `workflow_dispatch` are
