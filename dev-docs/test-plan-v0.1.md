@@ -228,6 +228,9 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 | INV13 | 单调性：每节点 term/vote/commit/applied 随时间与跨重启单调 | 状态转移日志断言 | L1/L2/L4 |
 | INV14 | 失权 leader 不服务线性读：ReadIndex quorum 轮失败即拒（`QuorumUnavailable`/`NotLeader`） | 非对称分区场景 + oracle | L2 |
 | INV15 | 会话表跨节点一致（快照含会话表，§5.5.4） | 并入 INV10 哈希域 | L2 |
+| INV16 | 溯源 index 跨节点一致、值-序同源（设计 I2/I7）：任一已 apply 写后，各节点 `get_stale_with_index` 报同一 origin index，且 value 与其 index 单读原子 | `tests/stale_read_with_index.rs`（3-node 轮询）+ KV SM 单锁读（`get_with_index`） | L1/L2 |
+| INV17 | 溯源 index 单调且重放不变（设计 I1/I3/I6）：同 key 改写严格递增；同会话重放不改变 index；delete→`None`→re-put 高于历史 | `state_machine/kv.rs` 单测（`value_origin_index_tracks_apply_index` 等） | L0/L1 |
+| INV18 | 快照溯源往返保真、旧 payload fail-stop（设计 I4/I5）：新格式快照 restore 保 index；旧/未知 payload 恢复被拒、公开 API 永不出现 index 0 | `state_machine/kv.rs` 单测（`snapshot_roundtrip_preserves_origin_index`、`old_or_unknown_snapshot_payload_is_rejected`）+ S09 快照安装扩展 | L0/L2 |
 
 **fail-stop 纪律断言**：任何不变量违反时进程必须 abort（§3.2），测试同时断言"违规 → abort"路径本身可达（错误处理不为空转）。
 
@@ -238,7 +241,7 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 | ID | 场景 | 注入 | 期望行为 | 断言不变量 | 层 |
 |---|---|---|---|---|---|
 | S01 | 选举中旧 leader 复活 | crash(bounce) leader + PreVote 窗口 | 复活者不抬 term 抢回；至多一 leader | INV7/INV4 | L2 |
-| S02 | 双分区（2+1 / 3+2） | partition | 少数侧写 `QuorumUnavailable`、线性读拒、`get_stale` 可用且弱于 N1 | INV4/INV14 | L2 |
+| S02 | 双分区（2+1 / 3+2） | partition | 少数侧写 `QuorumUnavailable`、线性读拒、`get_stale` 可用且弱于 N1；`get_stale_with_index` 同样可用且 present 时 index≥1 | INV4/INV14/INV16 | L2 |
 | S03 | follower 追赶中 leader 切换 | 慢链路 + crash leader | 快照路径追赶完成，无日志分叉残留 | INV8/INV9 | L2 |
 | S04 | WAL 尾部损坏（commit 之后） | torn_write 尾部 | 自动截断到合法前缀 + 从 leader 追赶 | INV6/INV13 | L2+L4 |
 | S05 | WAL 损坏侵入已提交区间 | flip_bits ≤ commit | **fail-start（Unrecoverable）**，绝不静默丢 | INV6 | L0+L2+L4 |
@@ -252,7 +255,7 @@ INV1–INV6 承接上游 §9.2 并细化，INV7–15 借鉴 openraft 不变量�
 | S13 | force-recovery 后旧多数派复活 | bounce 旧成员 + 旧 cluster_id | 握手互拒，无同 ID 双集群（§6.1） | — | L2 |
 | S14 | 时钟跳变 × TTL | 模拟时钟前跳 | lease 过期为弱保证（N6），一致性不变 | INV5 | L2 |
 | S15 | 跨 term 旧消息滞留 | hold → 换主 → release | 旧 term 消息被拒，无状态污染 | INV8/INV13 | L2 |
-| S16 | 非对称分区 | partition_oneway | CheckQuorum step-down + ReadIndex 拒读正确 | INV7/INV14 | L2 |
+| S16 | 非对称分区 | partition_oneway | CheckQuorum step-down + ReadIndex 拒读正确；`get_stale_with_index` 在分区/失权侧仍本地可用（N1 附 index） | INV7/INV14/INV16 | L2 |
 | S17 | 首启初始化竞态（§5.7） | 3 节点并发首启 / initial_cluster 不一致 | 语义符合 §5.7（fail-start/WARN） | — | L2 |
 | S18 | 快照安装期间本地读 | install 中 `get` | 短暂 `Busy`，无部分状态可见 | INV10 | L2 |
 | S19 | kill -9 任意 ready 阶段边界（真实盘） | L4 注入器逐阶段 kill | INV2 在真实 fsync 语义下成立 | INV2/INV6/INV13 | L4 |

@@ -663,6 +663,21 @@ Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 
 **验证**：TDD（`tests/read_concurrency_off_actor.rs` 16 并发线性读+写风暴；`tests/outbound_queue.rs` fast 复制/慢传输溢出计数/收敛）+ workspace/l2/model-check/release 全绿；INV14 门绿（commit `6fea0d1`）；bench A/B（3 轮）记录于 `dev-docs/bench-baseline-phase4-2026-10-07.md`；`scripts/check-perf-baseline.sh` 语法 + `--fast` 流验证通过。**完整 3 轮门禁 + 合入 main（PR，含 2.0 INV14 测试与基准对照）留 Phase-5.3。**
 
+### AC. v0.3.0：提交序号读原语（`get_stale_with_index`）——Q5 重审兑现（2026-10-08）
+
+**背景**：下游 hydra（`dev-docs/arachne-kv-commit-index-request.md`；缺陷证据 ADR-0001「观察」节）的首个用户反馈即 **Q5** 的重审触发条件：`get_stale` 非单调（N1）导致「旧树覆盖新树」，四个 workaround 全部实测失败，顺序信息只能来自共识层。
+
+**决议**：采用 **value 溯源 index 原语**，**替代** Q5 备选的 per-handle「已见 applied 水位」单调变体。新 API `Handle::get_stale_with_index` / `Arachne::get_stale_with_index`：本地 stale 读的同时返回该 value 的溯源序号（= 写入它的那条 log entry 的 index；同 raft group 内跨 key / 跨节点可比、per-key 单调、present 时 ≥ 1，缺键回 `None`）。`get_stale` 本身仍为非单调（N1），但外部调用方可凭溯源序号自行排序，无需仲裁、无额外 RTT。
+
+**配套（破坏性，用户已确认）**：
+- 快照存储 `FORMAT_VERSION` 1 → 2：数据目录破坏性升级，旧目录 `WalStorage::open` 即 fail-stop（不静默迁移）；升级 runbook 见 `dev-docs/runbook-format-v2-upgrade.md`。
+- kv 快照 payload 内加自身版本字节 + per-key 8B 溯源数据；旧 / 未知 payload 恢复 fail-stop（**不伪造 index 0**，公开 API 永不出现 0）。
+- 线协议与 Hello 握手**不变**（纯 additive API，滚动升级不引入 wire 风险）。
+
+**落点**：§2.1 / §5.4（N1 旁注）；完整设计（含 @oracle 评审并入）见 `dev-docs/arachne-kv-commit-index-design.md`；后续项见 `dev-docs/plan-commit-index-followups.md`。
+
+**状态**：v0.3.0 已发布（`6e8e8f2` feat + `79d7e65` release，tag `v0.3.0`；lean 全套件 + 发布门禁绿）。
+
 ## 1. 目标与非目标
 
 **目标**
@@ -704,7 +719,7 @@ Linux CI 跑 2 个 linux-only 测 + `cargo test --workspace`。
 
 **不保证（结果未知或弱化的显式清单）**：
 
-- N1：`get_stale` 可以读到任意旧的已提交值，且跨调用、跨 handle 不保证单调。
+- N1：`get_stale` 可以读到任意旧的已提交值，且跨调用、跨 handle 不保证单调。（v0.3.0 起，附 index 变体 `get_stale_with_index` 可携带该 value 的溯源序号，N1 语义不变——见 rev AC。）
 - N2：**会话过期后的重试**：返回 `SessionExpired` 时原操作**可能已生效也可能未生效**，客户端重发即可能重复执行；重复风险窗口 ≤ `session_ttl + grace_period`（§2.3）。
 - N3：`Timeout`（propose 后有界等待超时）同样**结果未知**，客户端应带同一 `(client_id, seq_no)` 重试。
 - N4：`Unrecoverable` 与 `force-recovery` 之后的一切行为不在一致性承诺范围内。
@@ -906,7 +921,7 @@ enum ArachneError {
 5. **follower 收到 `get`**：与写一致地返回 `NotLeader{hint}` 走客户端重定向（不做 follower 本地 ReadIndex 转发代理，v1 不引入服务端 proxy 一跳）。
 6. 应用侧约束：`applied` 长时间落后（如 WAL fsync 卡顿）时读等待队列有界，触顶 `Busy`。
 
-`get_stale`：任意节点直接读本地 applied 状态机；多数派丢失时仍可用；**不保证单调**（N1）。**v1 不提供单调读变体**（v0.2.1 决议 Q5）：仅文档声明非单调；若出现强需求，v1.1 再评估 per-handle 已见 applied 水位的低成本追随变体。
+`get_stale`：任意节点直接读本地 applied 状态机；多数派丢失时仍可用；**不保证单调**（N1）。**v1 不提供单调读变体**（v0.2.1 决议 Q5）：仅文档声明非单调；若出现强需求，v1.1 再评估 per-handle 已见 applied 水位的低成本追随变体。**（v0.3.0 已重审 —— rev AC：交付 value 溯源 index 原语 `get_stale_with_index`，无需 per-handle 水位。）**
 
 Lease Read 留 v2，显式记录其前提：配置化的时钟偏移上限 + 安全性论证，v1 不做。
 
@@ -1219,7 +1234,7 @@ v0.2 曾列为开放问题的 7 项，经评审**全部决议**并已传播至�
 | Q2 | ReadIndex 超时/重试参数 | `2×election_timeout`，重试 1 次 | §5.4、§7 | M2 基准数据出来后 |
 | Q3 | `transfer_leader` 是否作为公开 API 暴露 | 暴露（shutdown 与 remove-leader 流程已内部依赖，藏不住不如明示） | §3.1、§5.3 | M3 API review |
 | Q4 | 快照期间阻塞 apply 的预算；超预算何时升级为双缓冲/持久结构 | 阻塞 + `snapshot_last_duration` 告警阈值 1s；数据量逼近内存上限时 v1.1 重审 | §5.5.4、§8.2 | 容量告警首次触发 |
-| Q5 | `get_stale` 是否提供 per-handle 单调读变体（记录已见 applied 水位） | v1 不提供，仅文档声明非单调；若用户强需求，v1.1 加低成本水位追随变体 | §2.1、§5.4 | 首个用户反馈 |
+| Q5 | `get_stale` 是否提供 per-handle 单调读变体（记录已见 applied 水位） | v1 不提供，仅文档声明非单调；**已重审（v0.3.0 rev AC）：交付 value 溯源 index 原语 `get_stale_with_index`，水位追随变体备选作废** | §2.1、§5.4、rev AC | 首个用户反馈（**已触发**） |
 | Q6 | `wal_trailing_keep` 是否与 `snapshot_threshold` 解耦 | 绑定同值简化运维，出现慢 follower 快照风暴证据再解耦 | §5.5.4、§7 | M2 追赶测试 |
 | Q7 | 提案队列按字节还是按条数计 | 按字节（64MB），对大值更稳 | §4.1、§7 | M1 压测 |
 
