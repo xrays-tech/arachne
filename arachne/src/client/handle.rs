@@ -304,6 +304,32 @@ impl Handle {
         self.await_oneshot(ack_rx, deadline).await?
     }
 
+    /// Stale read plus the **origin index** of the returned value: the log
+    /// index of the entry that wrote it, always `>= 1` for a present key.
+    ///
+    /// Same contract as [`Handle::get_stale`] (propsol §2.1 / N1): a direct
+    /// local state-machine read on any node, no quorum, may be stale and is
+    /// not monotone across calls — but the value and its origin are observed
+    /// coherently, so an external client can order on the origin without a
+    /// quorum round. Returns `Ok(None)` for an absent key.
+    pub async fn get_stale_with_index(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<(Vec<u8>, u64)>, ArachneError> {
+        self.validate_key(key)?;
+        let deadline = Instant::now() + self.inner.timeout;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(Command::GetStaleWithIndex {
+                key: key.to_vec(),
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| ArachneError::ShuttingDown)?;
+        self.await_oneshot(ack_rx, deadline).await?
+    }
+
     /// Report this node's current leader hint: a `(NodeId, SocketAddr)` if a
     /// leader is known, else `None` (no leader / quorum lost). Bounded by the
     /// operation deadline (a `None` reply means the node simply has no leader).

@@ -45,7 +45,7 @@ use arachne_kv_seam::types::{LogIndex, Term};
 use crate::storage::crc32c::crc32c;
 
 /// The current WAL format major version.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Magic number identifying a valid META file.
 const META_MAGIC: u32 = 0x41_52_41_4D; // "ARAM" in ASCII
@@ -455,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_one() {
-        assert_eq!(FORMAT_VERSION, 1);
+    fn format_version_is_two() {
+        assert_eq!(FORMAT_VERSION, 2);
     }
 
     #[test]

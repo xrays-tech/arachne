@@ -15,6 +15,7 @@
 //! | `put` / `delete` | linearizable write | Raft log; committed after quorum persistence, replied after apply |
 //! | `get` | linearizable read (default) | **ReadIndex** (propsol §5.4): a quorum-confirmed read on the leader, served after `applied ≥ read_index`; a non-leader returns `NotLeader` and is redirected |
 //! | `get_stale` | arbitrary stale read allowed | direct local state-machine read; **not monotone** (propsol N1) |
+//! | `get_stale_with_index` | arbitrary stale read + the value's **origin index** (log index of the entry that wrote it, `>= 1` when present); the value and its origin are read coherently | same local read as `get_stale`, reply carries `(value, index)`; `Ok(None)` when absent |
 //! | loss of quorum | writes/linearizable reads → `QuorumUnavailable`; `get_stale` still works | CheckQuorum + leader step-down |
 //!
 //! # Redirect policy (propsol §3.3)

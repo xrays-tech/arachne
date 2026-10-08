@@ -211,6 +211,17 @@ impl Arachne {
         handle.get_stale(key).await
     }
 
+    /// Local (weak) read plus the value's **origin index** (the log index of
+    /// the entry that wrote it, always `>= 1` when present). Same cost and
+    /// availability as [`Arachne::get_stale`]; `Ok(None)` when the key is
+    /// absent.
+    pub async fn get_stale_with_index(
+        key: &[u8],
+    ) -> Result<Option<(Vec<u8>, u64)>, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.get_stale_with_index(key).await
+    }
+
     /// Delete a key (propose an empty value).
     pub async fn delete(key: &[u8]) -> Result<(), ArachneError> {
         let handle = Self::borrow().await?;

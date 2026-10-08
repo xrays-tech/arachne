@@ -239,6 +239,16 @@ pub enum Command {
         /// Reply channel with the local applied value.
         ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
     },
+    /// Stale read + the **origin index** of the returned value (the log index
+    /// of the entry that wrote it). Same cost/availability as [`Command::GetStale`]:
+    /// direct local state-machine read, no quorum, no ReadIndex — the value and
+    /// its origin are observed under one read lock (design doc §3/§4).
+    GetStaleWithIndex {
+        /// The key to read.
+        key: Vec<u8>,
+        /// Reply channel with `(value, origin_index)`; `Ok(None)` when absent.
+        ack: oneshot::Sender<Result<Option<(Vec<u8>, u64)>, ArachneError>>,
+    },
     /// Linearizable read via ReadIndex (propsol §5.4). The leader registers a
     /// quorum-confirmed read and replies once the read index is applied; a
     /// non-leader replies `NotLeader{hint}` for the client to redirect.
@@ -1630,6 +1640,13 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // the whole path is safe to leave the actor thread).
                 self.spawn_read_reply(key, ack);
             }
+            Command::GetStaleWithIndex { key, ack } => {
+                // Same local stale-read path as `GetStale` (propsol N1), plus
+                // the value's origin index. Handed to a worker off the actor's
+                // current-thread loop exactly like the weak read (P4 4.1): no
+                // read-index gate, whole path safe to leave the actor thread.
+                self.spawn_read_reply_with_index(key, ack);
+            }
             Command::Read { key, ack } => {
                 // Only the leader can serve a linearizable read (propsol §5.4
                 // step 5); a non-leader redirects.
@@ -1872,6 +1889,36 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 .get(&key)
                 .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
             let _ = ack.send(value);
+        });
+    }
+
+    /// Off-actor variant of [`spawn_read_reply`] for
+    /// [`Command::GetStaleWithIndex`]: the same weak local read, but the reply
+    /// also carries the value's **origin index** (the log index of the entry
+    /// that wrote it, always `>= 1` for a present key; `Ok(None)` when absent).
+    ///
+    /// A present value with no index is an invariant violation in the state
+    /// machine and is reported as `Unrecoverable` rather than surfaced to the
+    /// client (public API never exposes `index 0`).
+    fn spawn_read_reply_with_index(
+        &self,
+        key: Vec<u8>,
+        ack: oneshot::Sender<Result<Option<(Vec<u8>, u64)>, ArachneError>>,
+    ) {
+        let sm = Arc::clone(&self.sm);
+        tokio::spawn(async move {
+            let read = sm
+                .get_with_index(&key)
+                .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+            let reply = match read {
+                Ok((None, _)) => Ok(None),
+                Ok((Some(val), Some(index))) => Ok(Some((val, index))),
+                Ok((Some(_), None)) => Err(ArachneError::Unrecoverable(
+                    "state machine returned a value without an origin index".into(),
+                )),
+                Err(e) => Err(e),
+            };
+            let _ = ack.send(reply);
         });
     }
 

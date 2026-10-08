@@ -50,6 +50,17 @@ const OP_DELETE: u8 = 1;
 /// leader's clock and could not be replayed.
 const OP_SESSION_GC: u8 = 2;
 
+/// The state-machine snapshot payload format version.
+///
+/// State-machine-internal; **independent of** the storage layer's
+/// [`crate::storage::meta::FORMAT_VERSION`]. It is the first byte of the
+/// snapshot payload (see [`snapshot`](StateMachine::snapshot)) and is
+/// validated by [`decode_store`]: a payload with a wrong version byte is
+/// rejected with [`KvError::MalformedSnapshot`] (fail-stop, no migration — a
+/// v0 payload lacks this byte entirely, and fabricating `index 0` would be
+/// an illegal public value that could be persisted and propagated).
+const KV_SNAPSHOT_VERSION: u8 = 1;
+
 /// The kind of command, parsed from its opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
@@ -80,12 +91,25 @@ pub struct KvStateMachine {
     store: Arc<RwLock<Store>>,
 }
 
+/// A single KV entry: the applied value plus its origin — the log index of
+/// the entry that wrote this value. The index is stable across deduped
+/// replays (a replay does not re-mutate the entry, so it keeps its original
+/// origin) and is always `>= 1` for a present key (the first applied index
+/// is 1; index `0` is reserved to mean "absent").
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    /// The applied value.
+    val: Vec<u8>,
+    /// The log index of the entry that wrote this value (value's origin).
+    index: LogIndex,
+}
+
 /// The data guarded by the state machine's single lock.
 struct Store {
     /// Monotonic applied-version. Must be bumped *after* the maps mutate
     /// (D-Ord) so a reader never sees `version >= C` with entry `C` missing.
     applied: LogIndex,
-    kv: BTreeMap<Vec<u8>, Vec<u8>>,
+    kv: BTreeMap<Vec<u8>, Entry>,
     /// Session table: `(client_id, seq_no)` → the cached apply result.
     sessions: BTreeMap<SessionKey, ApplyOutcome>,
 }
@@ -281,7 +305,7 @@ impl KvStateMachine {
     /// version and the map are always observed together (no torn read). The
     /// torn-read TDD test asserts the linear invariant on this atomic snapshot.
     #[cfg(test)]
-    fn read_store_copy(&self) -> (LogIndex, BTreeMap<Vec<u8>, Vec<u8>>) {
+    fn read_store_copy(&self) -> (LogIndex, BTreeMap<Vec<u8>, Entry>) {
         let guard = self
             .store
             .read()
@@ -338,7 +362,15 @@ impl StateMachine for KvStateMachine {
             None => {
                 let outcome = match op {
                     Op::Put => {
-                        guard.kv.insert(key.clone(), val.clone());
+                        // D-Ord: the entry (with its origin index) lands in the
+                        // map first; `applied` is bumped last. The origin index
+                        // is this command's log index — stable across deduped
+                        // replays, which take the `Some(cached)` arm and skip
+                        // this write entirely.
+                        guard.kv.insert(
+                            key.clone(),
+                            Entry { val: val.clone(), index },
+                        );
                         ApplyOutcome::Value(val)
                     }
                     Op::Delete => {
@@ -366,7 +398,7 @@ impl StateMachine for KvStateMachine {
             .map_err(|_| KvError::PoisonedLock)?;
         // Read the version (D-Arc: version-first) then the map, atomically.
         let _version = guard.applied;
-        Ok(guard.kv.get(key).cloned())
+        Ok(guard.kv.get(key).map(|entry| entry.val.clone()))
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
@@ -376,14 +408,21 @@ impl StateMachine for KvStateMachine {
             .read()
             .map_err(|_| KvError::PoisonedLock)?;
         let mut buf = Vec::new();
+        // First byte: state-machine snapshot format version (KV_SNAPSHOT_VERSION).
+        // Rest of the payload: applied (u64 LE), kv entries, sessions — the
+        // kv entry now appends an 8-byte LE `index` (value's origin) after
+        // `[klen][k][vlen][v]`; sessions are unchanged.
+        buf.push(KV_SNAPSHOT_VERSION);
         buf.extend_from_slice(&guard.applied.to_le_bytes());
 
         buf.extend_from_slice(&(guard.kv.len() as u32).to_le_bytes());
         for (k, v) in &guard.kv {
             buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
             buf.extend_from_slice(k);
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            buf.extend_from_slice(v);
+            buf.extend_from_slice(&(v.val.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&v.val);
+            // Value's origin: the log index of the entry that wrote this value.
+            buf.extend_from_slice(&v.index.to_le_bytes());
         }
 
         buf.extend_from_slice(&(guard.sessions.len() as u32).to_le_bytes());
@@ -426,6 +465,41 @@ impl StateMachine for KvStateMachine {
             .read()
             .expect("state machine read lock should never be poisoned");
         guard.applied
+    }
+}
+
+impl KvStateMachine {
+    /// Read the applied value **and** its origin index under a *single* read
+    /// lock (the same D-Arc read as `StateMachine::get`).
+    ///
+    /// Returns `(None, None)` when the key is absent, so the public API never
+    /// exposes `index 0`. When present, returns `(Some(val), Some(i))` with
+    /// `i >= 1` (the first applied index is 1); the value and its index are
+    /// observed coherently so they can never disagree about origin.
+    pub fn get_with_index(
+        &self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, Option<LogIndex>), KvError> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| KvError::PoisonedLock)?;
+        // Read the version (D-Arc: version-first) then the map, atomically.
+        let _version = guard.applied;
+        match guard.kv.get(key) {
+            None => Ok((None, None)),
+            Some(e) => {
+                // A present entry always carries its origin; index 0 can only
+                // reach an Entry via a restore bug, which would mean the state
+                // machine itself is corrupt.
+                debug_assert!(
+                    e.index >= 1,
+                    "present entry {key:?} has index {}, invariant violation",
+                    e.index
+                );
+                Ok((Some(e.val.clone()), Some(e.index)))
+            }
+        }
     }
 }
 
@@ -475,6 +549,15 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<Vec<u8>, KvError
 /// reads (2.4).
 fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
     let mut cursor = Cursor::new(bytes);
+    // First byte is the snapshot format version. It must match
+    // KV_SNAPSHOT_VERSION exactly; anything else (an old v0 payload that
+    // lacks this byte, a corrupted/foreign byte, etc.) is rejected with
+    // MalformedSnapshot. Fail-stop: we never fabricate an index (e.g. 0)
+    // to tolerate an old payload.
+    let version = read_u8(&mut cursor)?;
+    if version != KV_SNAPSHOT_VERSION {
+        return Err(KvError::MalformedSnapshot);
+    }
     let applied = read_u64(&mut cursor)?;
 
     let kv_len = read_u32(&mut cursor)? as usize;
@@ -484,7 +567,9 @@ fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
         let key = read_bytes(&mut cursor, klen)?;
         let vlen = read_u32(&mut cursor)? as usize;
         let val = read_bytes(&mut cursor, vlen)?;
-        kv.insert(key, val);
+        // Value's origin, appended after the value (post-0.2.0 payload).
+        let index = read_u64(&mut cursor)?;
+        kv.insert(key, Entry { val, index });
     }
 
     let sess_len = read_u32(&mut cursor)? as usize;
@@ -736,10 +821,10 @@ mod tests {
                             .get(kstr.as_bytes())
                             .expect("torn read: key missing from the map at this version");
                         assert_eq!(
-                            got.as_slice(),
+                            got.val.as_slice(),
                             format!("v{i}").as_bytes(),
                             "torn read: version={version}, key k{i} = {:?}",
-                            got.as_slice()
+                            got.val.as_slice()
                         );
                     }
                 }
@@ -776,5 +861,122 @@ mod tests {
             sm.restore(&[0u8; 4]),
             Err(KvError::MalformedSnapshot)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // I1/I3/I4/I5/I6 — value origin (commit index) semantics, design doc §6.
+    // -----------------------------------------------------------------------
+
+    /// I1: a key's origin index tracks the entry that wrote the current value,
+    /// strictly increasing across rewrites.
+    #[test]
+    fn value_origin_index_tracks_apply_index() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v1"))
+            .unwrap();
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v1".to_vec()), Some(1))
+        );
+        sm.apply(2, &KvStateMachine::encode_put(1, 2, b"k", b"v2"))
+            .unwrap();
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v2".to_vec()), Some(2))
+        );
+        sm.apply(3, &KvStateMachine::encode_put(1, 3, b"k", b"v3"))
+            .unwrap();
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v3".to_vec()), Some(3))
+        );
+    }
+
+    /// I3: a deduped replay (same `(client_id, seq_no)` at a later index) does
+    /// not re-mutate the entry, so the origin index is preserved.
+    #[test]
+    fn deduped_replay_preserves_origin_index() {
+        let sm = KvStateMachine::new();
+        let cmd = KvStateMachine::encode_put(7, 1, b"k", b"v");
+        sm.apply(1, &cmd).unwrap();
+        sm.apply(2, &cmd).unwrap(); // replay of the same session, deduped
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v".to_vec()), Some(1)),
+            "replay must not move the origin index"
+        );
+        assert_eq!(sm.applied_index(), 2);
+    }
+
+    /// I4: a snapshot → restore round-trip preserves each value's origin index.
+    #[test]
+    fn snapshot_roundtrip_preserves_origin_index() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"a", b"1"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_put(2, 1, b"b", b"2"))
+            .unwrap();
+        let snap = sm.snapshot().unwrap();
+        let sm2 = KvStateMachine::new();
+        sm2.restore(&snap).unwrap();
+        assert_eq!(
+            sm2.get_with_index(b"a").unwrap(),
+            (Some(b"1".to_vec()), Some(1))
+        );
+        assert_eq!(
+            sm2.get_with_index(b"b").unwrap(),
+            (Some(b"2".to_vec()), Some(2))
+        );
+        // Lossless: re-snapshotting the restored machine yields identical bytes.
+        assert_eq!(sm2.snapshot().unwrap(), snap);
+    }
+
+    /// I5: a legacy / unknown snapshot payload is **rejected** (fail-stop) —
+    /// no fabricated origin is ever accepted, and `index 0` never surfaces.
+    #[test]
+    fn old_or_unknown_snapshot_payload_is_rejected() {
+        let sm = KvStateMachine::new();
+        // A pre-feature payload has no version byte: it begins with `applied`
+        // (u64 LE). First byte 0x08 != KV_SNAPSHOT_VERSION, so it is rejected.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&8u64.to_le_bytes()); // "applied" = 8
+        legacy.extend_from_slice(&0u32.to_le_bytes()); // kv count = 0
+        legacy.extend_from_slice(&0u32.to_le_bytes()); // sessions count = 0
+        assert!(matches!(
+            sm.restore(&legacy),
+            Err(KvError::MalformedSnapshot)
+        ));
+
+        // Any version byte other than the current one is rejected too.
+        let mut wrong = vec![2u8]; // KV_SNAPSHOT_VERSION is 1
+        wrong.extend_from_slice(&0u64.to_le_bytes());
+        wrong.extend_from_slice(&0u32.to_le_bytes());
+        wrong.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            sm.restore(&wrong),
+            Err(KvError::MalformedSnapshot)
+        ));
+        // State is untouched by a rejected restore.
+        assert_eq!(sm.applied_index(), 0);
+        assert!(sm.get_with_index(b"k").unwrap() == (None, None));
+    }
+
+    /// I6: delete makes the key absent (`(None, None)` — no index exposed);
+    /// a later put gets a fresh, higher origin index.
+    #[test]
+    fn delete_makes_key_absent_and_reput_raises_index() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v1"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_delete(1, 2, b"k"))
+            .unwrap();
+        assert_eq!(sm.get_with_index(b"k").unwrap(), (None, None));
+        sm.apply(3, &KvStateMachine::encode_put(1, 3, b"k", b"v2"))
+            .unwrap();
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v2".to_vec()), Some(3)),
+            "re-put after delete must carry an index above the whole history"
+        );
     }
 }
