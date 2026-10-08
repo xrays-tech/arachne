@@ -1,8 +1,9 @@
 # 开发计划：对拍 etcd 后的功能增量（P0–P2）
 
-> 状态：**定稿落档**（2026-10-08；已并入 @oracle 对路线图的评审修正，评审依据本仓代码 + `dev-docs/arachne-kv-commit-index-design.md` + `dev-docs/plan-commit-index-followups.md`）。
+> 状态：**M1–M4（P0–P2）已全部实现并合入主干**（2026-10-08；M1 `4ad459d` / M2 `6281557` / M3 `2356b46` / M4 `c41ed57`；每里程碑过 Oracle 门禁，必修项落地并有聚焦测试）。
 > 用途：**供新 session 在本仓独立执行**——本文件自包含，含：目标、路线与依赖、每项功能的 API/内部机制/代码锚点/不变量/测试/验收/坑、格式升级打包策略、执行编排建议。
 > 前置事实（新 session 直接信任，如需复核见 §12）：当前版本 v0.3.1；仓库 crates.io 已发布 5 crate；`get_stale_with_index` 已交付（value 溯源序号）；`put_with_index` 已关闭（下游确认不需要，#9）；快照存储 `FORMAT_VERSION = 2`（`arachne/src/storage/meta.rs:48`）。
+> 完成情况锚点：P0 管线见 runtime `WatchEvents`/`outcomes` 通道；P1-A `get_stale_prefix/range`；P1-B `multi_put`；P1-C `cas` + `KV_SNAPSHOT_VERSION` 2 / `FORMAT_VERSION` 3（runbook `runbook-format-v3-upgrade.md`）；P2 `watch`（快照 + 写入集事件）。
 
 ---
 
