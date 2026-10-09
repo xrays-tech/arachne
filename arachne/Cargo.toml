@@ -9,7 +9,10 @@ description = "Arachne: transport-agnostic product core (consensus, WAL storage,
 #   Handles transparently forward commands to the leader over tonic; peerless
 #   `Arachne::start` no longer requires an ambient tokio runtime; new leaders
 #   self-report in `leader_hint()` immediately.
-version = "0.3.1"
+# 0.4.0: P0-P2 vs-etcd features — per-command outcome pipeline, consistent
+#   prefix/range reads, atomic multi-put, compare-and-swap, prefix watch;
+#   breaking storage format v3 (KV_SNAPSHOT_VERSION 2, FORMAT_VERSION 3).
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
