@@ -67,6 +67,10 @@ pub struct Metrics {
     /// `dispatch_watch_events`), so this is an internal-backpressure signal,
     /// not a silent consumer gap.
     watch_events_dropped_total: AtomicU64,
+    /// Total `multi_get` commands handled by this node's actor (Gate-1 Q7).
+    /// Incremented once per handled `Command::MultiGet`, independent of how
+    /// many keys the caller batched or how many times the caller looped.
+    multi_get_commands_total: AtomicU64,
 }
 
 impl Metrics {
@@ -220,6 +224,16 @@ impl Metrics {
     /// Event batches dropped at the apply→actor boundary.
     pub fn watch_events_dropped(&self) -> u64 {
         self.watch_events_dropped_total.load(Ordering::Relaxed)
+    }
+
+    /// Count one `multi_get` command handled by the actor (Gate-1 Q7).
+    pub fn inc_multi_get_commands(&self) {
+        self.multi_get_commands_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `multi_get` commands handled so far.
+    pub fn multi_get_commands(&self) -> u64 {
+        self.multi_get_commands_total.load(Ordering::Relaxed)
     }
 
     /// Sessions in the state machine's table.
@@ -415,6 +429,12 @@ impl Metrics {
             "Local snapshots that exceeded the 1s budget (they block apply).",
             self.snapshot_slow_total.load(Ordering::Relaxed),
         );
+        counter(
+            &mut out,
+            "arachne_multi_get_commands_total",
+            "multi_get commands handled by this node's actor.",
+            self.multi_get_commands_total.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -498,6 +518,7 @@ mod tests {
             "arachne_proposal_busy_total",
             "arachne_snapshot_slow_total",
             "arachne_session_count",
+            "arachne_multi_get_commands_total",
         ] {
             assert!(text.contains(name), "missing {name}");
         }
@@ -549,5 +570,18 @@ mod tests {
         assert!(!m.is_ready(), "no leader yet");
         m.set_leader_id(2);
         assert!(m.is_ready(), "a leader is now known");
+    }
+
+    #[test]
+    fn multi_get_commands_counter_tracks_actor_handling() {
+        let m = Metrics::new();
+        assert_eq!(m.multi_get_commands(), 0);
+        m.inc_multi_get_commands();
+        m.inc_multi_get_commands();
+        m.inc_multi_get_commands();
+        assert_eq!(m.multi_get_commands(), 3);
+        let text = m.render();
+        assert!(text.contains("# TYPE arachne_multi_get_commands_total counter"));
+        assert!(text.contains("arachne_multi_get_commands_total 3"));
     }
 }

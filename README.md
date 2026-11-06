@@ -11,7 +11,7 @@ The consensus, WAL and KV state machine form the `arachne-kv` core. By design th
 ## Embedding
 
 Add the core with the transport you want (published to
-[crates.io](https://crates.io/crates/arachne-kv), v0.1):
+[crates.io](https://crates.io/crates/arachne-kv), v0.5):
 
 ```shell
 $ cargo add arachne-kv
@@ -21,9 +21,9 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-arachne-kv = "0.1"                            # default: pulls tonic transport
+arachne-kv = "0.5"                            # default: pulls tonic transport
 # or a transport-free lean core (zero external crates):
-# arachne-kv = { version = "0.1", default-features = false }
+# arachne-kv = { version = "0.5", default-features = false }
 # or a local checkout / workspace member instead of crates.io:
 # arachne-kv = { path = "../arachne" }
 ```
@@ -54,7 +54,7 @@ returns `AlreadyInitialized`; static reads before `start` (or after
 `NotInitialized`. For multi-node clusters or membership control, use `Runtime`
 / `Handle` directly.
 
-`Handle` is the full client surface: `put` / `get` / `get_stale` / `delete`, membership operations (`add_learner`, `promote_learner`, `remove_member`, `transfer_leader`, `membership`), raw proposal hooks, and `leader_hint` for redirects. The four membership operations take a **`RaftId`** (`u64`) — the member's **1-based ordinal in `initial_cluster`** (the i-th member ⇒ raft id = i+1) — whereas `leader_hint()` / the `NotLeader` hint return the leader's **address identity** (`NodeId` string + `SocketAddr`), *not* a `RaftId`; to derive the hinted leader's `RaftId` look up its `NodeId`'s position in `initial_cluster` (1-based). The complete assembly — including how to wire the tonic transport and an HTTP front-end — is the `arachne-node` binary's `node.rs`, which serves as the reference integration.
+`Handle` is the full client surface: `put` / `get` / `get_stale` / `get_stale_range` / `get_stale_with_index` / `delete`, `multi_get` (batched exact-key reads sharing one applied index), index-returning writes (`put_with_index` / `multi_put_with_index` / `delete_with_index`), `wait_applied` (local applied-index wait), `watch` (prefix snapshot + events), membership operations (`add_learner`, `promote_learner`, `remove_member`, `transfer_leader`, `membership`), raw proposal hooks, and `leader_hint` for redirects. The four membership operations take a **`RaftId`** (`u64`) — the member's **1-based ordinal in `initial_cluster`** (the i-th member ⇒ raft id = i+1) — whereas `leader_hint()` / the `NotLeader` hint return the leader's **address identity** (`NodeId` string + `SocketAddr`), *not* a `RaftId`; to derive the hinted leader's `RaftId` look up its `NodeId`'s position in `initial_cluster` (1-based). The complete assembly — including how to wire the tonic transport and an HTTP front-end — is the `arachne-node` binary's `node.rs`, which serves as the reference integration.
 
 ## Consistency semantics
 
@@ -65,10 +65,14 @@ The operation set is deliberately small, and the consistency story is stated up 
 | `put` / `delete` | linearizable write — appended to the raft log, committed on quorum persistence, replied after apply |
 | `get` | linearizable read by default — served via **ReadIndex**; a non-leader node redirects or reports `NotLeader` |
 | `get_stale` | stale read — served from the local state machine, documented as **not guaranteed monotone** across calls. *Lagging read:* after a write commits, the local state machine catches up within millisecond scale (measured ≤7 ms), so a `get_stale` immediately after the commit may still return `None`/a stale value — a single `None` is **not** an authoritative denial that the key is absent. For authoritative reads, use the linearizable `get` |
+| `multi_get(Stale)` | batched stale read — every value plus **one** `applied_index` for the whole batch, served from the local state machine (no quorum; works on a minority follower). Input order is preserved, missing keys are `None`, and an over-limit batch is rejected (`InvalidArgument`) rather than truncated |
+| `multi_get(Linearizable)` | batched linearizable read — reuses **ReadIndex** (leader + quorum); all values are observed at one applied index |
+| `put_with_index` / `multi_put_with_index` / `delete_with_index` | linearizable write that also returns the **effective log index** of the write (dedup returns the original index within the session TTL + grace; a forwarded write returns the leader's index) |
+| `wait_applied` | local applied-index wait — no quorum, no redirect, **not a barrier**; returns once the local state machine has applied the index (immediately if already caught up) or `Timeout` |
 
 Arachne is a **CP** system: at most one leader at a time, writes and linearizable reads require a quorum, and when the quorum is lost every linearizable operation fails (`QuorumUnavailable`) rather than degrading to read-mostly or splitting the brain. `get_stale` keeps working in that state, with the staleness caveat above.
 
-Errors are explicit and typed: `NotLeader` (with a leader hint when known), `QuorumUnavailable`, `Busy` (proposal/read queue full), `Timeout` (bounded wait elapsed, result unknown), `SessionTableFull` / `SessionExpired` for the write-session machinery, `ShuttingDown`, and `Unrecoverable` for fatal storage errors.
+Errors are explicit and typed: `NotLeader` (with a leader hint when known), `QuorumUnavailable`, `Busy` (proposal/read queue full), `Timeout` (bounded wait elapsed, result unknown), `SessionTableFull` / `SessionExpired` for the write-session machinery, `Unsupported` (an old peer cannot serve `multi_get`/indexed writes; terminal, not executed), `ShuttingDown`, and `Unrecoverable` for fatal storage errors.
 
 ## Persistence
 

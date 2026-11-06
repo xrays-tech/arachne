@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use arachne_kv_seam::seam::{ApplyOutcome, CommandSink, ForwardCommand, ForwardOutcome, TransportMessage};
-use arachne_kv_seam::types::NodeId;
+use arachne_kv_seam::types::{LogIndex, NodeId};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -21,8 +21,8 @@ use crate::error::ERR_HELLO_MISSING;
 use crate::handshake::validate_hello;
 use crate::proto::raft_transport_server::RaftTransport;
 use crate::proto::{
-    forward_result, BytesValue, CasFailed, ForwardReply, ForwardRequest, ForwardResult, RaftEnvelope,
-    SendReply, SnapshotChunk, SnapshotRequest,
+    forward_result, BytesValue, CasFailed, ForwardReply, ForwardRequest, ForwardResult,
+    MultiGetReply, OptionalBytesValue, RaftEnvelope, SendReply, SnapshotChunk, SnapshotRequest,
 };
 use crate::snapshot::{RateLimiter, SnapshotProvider};
 
@@ -268,6 +268,8 @@ impl RaftTransport for RaftTransportService {
             leader_node_id: String::new(),
             leader_addr: String::new(),
             result: None,
+            commit_index: None,
+            multi_get: None,
         };
 
         // A missing handshake is rejected *unconditionally*, exactly as for `Send`.
@@ -314,6 +316,21 @@ impl RaftTransport for RaftTransportService {
             // 1 = read (ReadIndex); 2 = stale read. Both carry a key.
             1 => ForwardCommand::Read { key: request.key },
             2 => ForwardCommand::GetStale { key: request.key },
+            // 3 = multi_get: the keys ride `keys` in request order and the
+            // requested consistency rides `linearizable`.
+            3 => ForwardCommand::MultiGet {
+                keys: request.keys,
+                linearizable: request.linearizable,
+            },
+            // 4 = propose_with_index: the same write payload/session fields as
+            // kind=0, but the reply additionally carries the applied log index.
+            4 => ForwardCommand::ProposeWithIndex {
+                cmd: request.cmd,
+                client_id: request.client_id,
+                seq_no: request.seq_no,
+            },
+            // Any unknown kind is rejected *before* the sink runs, so
+            // `unknown_kind` honestly means "nothing was executed".
             _ => {
                 reply.ok = false;
                 reply.error_code = "unknown_kind".to_string();
@@ -326,6 +343,8 @@ impl RaftTransport for RaftTransportService {
                 value,
                 leader_hint,
                 result,
+                multi,
+                index,
             }) => {
                 // A hint means this node is not the (current) leader:
                 // report `not_leader` with a fresh hint so the caller can
@@ -353,6 +372,14 @@ impl RaftTransport for RaftTransportService {
                     // collapse (seam `ForwardOutcome` doc): `None` and "no
                     // outcome" are indistinguishable over the wire.
                     reply.result = encode_forward_result(result);
+                    // Indexed writes: the applied log index of an entry that
+                    // established the write. Every other kind leaves it absent
+                    // (`None`), which is also what an old node sends.
+                    reply.commit_index = encode_commit_index(index);
+                    // Batched reads: one entry per requested key plus the
+                    // applied index the values were observed at. Every other
+                    // kind leaves the field absent (`None`).
+                    reply.multi_get = encode_multi_get(multi);
                 }
             }
             // `Err(code)` carries the stable code produced by the sink
@@ -394,6 +421,32 @@ fn encode_forward_result(result: Option<ApplyOutcome>) -> Option<ForwardResult> 
         }),
         Some(ApplyOutcome::None) | None => None,
     }
+}
+
+/// Encode a seam write index into the wire `commit_index` field.
+///
+/// Presence is the contract: `Some(i)` becomes a present `optional uint64`
+/// (a real applied-write index), while `None` stays absent so an old /
+/// non-indexed reply is distinguishable from a fabricated `0`.
+fn encode_commit_index(index: Option<LogIndex>) -> Option<u64> {
+    index
+}
+
+/// Encode a seam batched-read outcome into the wire `MultiGetReply`.
+///
+/// An absent `multi` (a read/write, any failure, or a non-`multi_get` command)
+/// stays absent on the wire. A present result becomes one `OptionalBytesValue`
+/// per requested key, in order: `Some(data)` — including a present *empty*
+/// value — keeps `data` present, while `None` leaves it absent. The wrapper's
+/// message presence is what distinguishes those two cases on the wire.
+fn encode_multi_get(multi: Option<(Vec<Option<Vec<u8>>>, LogIndex)>) -> Option<MultiGetReply> {
+    multi.map(|(values, applied_index)| MultiGetReply {
+        values: values
+            .into_iter()
+            .map(|data| OptionalBytesValue { data })
+            .collect(),
+        applied_index,
+    })
 }
 
 #[cfg(test)]
@@ -439,5 +492,88 @@ mod tests {
         // `None` outcome and absent outcome are both the absent envelope.
         assert_eq!(encode_forward_result(Some(ApplyOutcome::None)), None);
         assert_eq!(encode_forward_result(None), None);
+    }
+
+    /// All per-element presence shapes encode without loss: present non-empty,
+    /// present empty (data present), and absent (data absent).
+    #[test]
+    fn encode_multi_get_preserves_presence_shapes() {
+        // Present, non-empty.
+        assert_eq!(
+            encode_multi_get(Some((vec![Some(b"value".to_vec())], 11))),
+            Some(MultiGetReply {
+                values: vec![OptionalBytesValue {
+                    data: Some(b"value".to_vec()),
+                }],
+                applied_index: 11,
+            })
+        );
+
+        // Present but empty: `data` stays present so the decoder can tell it
+        // apart from an absent key.
+        assert_eq!(
+            encode_multi_get(Some((vec![Some(Vec::new())], 12))),
+            Some(MultiGetReply {
+                values: vec![OptionalBytesValue {
+                    data: Some(Vec::new()),
+                }],
+                applied_index: 12,
+            })
+        );
+
+        // Absent key: the element exists, `data` does not.
+        assert_eq!(
+            encode_multi_get(Some((vec![None], 13))),
+            Some(MultiGetReply {
+                values: vec![OptionalBytesValue { data: None }],
+                applied_index: 13,
+            })
+        );
+    }
+
+    /// A mixed batch encodes in request order with the applied index; missing
+    /// keys become entries whose `data` is absent.
+    #[test]
+    fn encode_multi_get_preserves_mixed_batch_and_index() {
+        assert_eq!(
+            encode_multi_get(Some((
+                vec![
+                    Some(b"first".to_vec()),
+                    None,
+                    Some(Vec::new()),
+                    Some(b"fourth".to_vec()),
+                ],
+                42,
+            ))),
+            Some(MultiGetReply {
+                values: vec![
+                    OptionalBytesValue {
+                        data: Some(b"first".to_vec()),
+                    },
+                    OptionalBytesValue { data: None },
+                    OptionalBytesValue {
+                        data: Some(Vec::new()),
+                    },
+                    OptionalBytesValue {
+                        data: Some(b"fourth".to_vec()),
+                    },
+                ],
+                applied_index: 42,
+            })
+        );
+    }
+
+    /// An absent batched-read result stays absent on the wire.
+    #[test]
+    fn encode_multi_get_absent_is_absent() {
+        assert_eq!(encode_multi_get(None), None);
+    }
+
+    /// `commit_index` presence round-trips: a real index is present, while
+    /// `None` stays absent (never encoded as `0`).
+    #[test]
+    fn encode_commit_index_preserves_presence() {
+        assert_eq!(encode_commit_index(Some(42)), Some(42));
+        assert_eq!(encode_commit_index(None), None);
     }
 }

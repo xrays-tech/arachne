@@ -38,6 +38,13 @@ pub enum KvError {
     /// Unrecoverable — fail-stop.
     #[error("state machine store lock poisoned")]
     PoisonedLock,
+    /// A `multi_get` would return more value bytes than
+    /// [`MAX_MULTI_GET_RESULT_BYTES`].
+    ///
+    /// Detected while cloning under the read lock; the caller must split the
+    /// batch. Never returned as a partial result.
+    #[error("multi_get result exceeds MAX_MULTI_GET_RESULT_BYTES")]
+    ResultTooLarge,
 }
 
 /// Command opcodes (part of the wire format; fixed).
@@ -78,6 +85,28 @@ pub const MAX_MULTI_PUT_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 /// checks run; `Handle::validate_multi_put` rejects beyond this.
 pub const MAX_MULTI_PUT_ENTRIES: usize = 4096;
 
+/// The largest number of keys a single `multi_get` may name.
+///
+/// Enforced at the `Handle` boundary *before* dispatch, so an over-limit batch
+/// never reaches the runtime actor (fail-stop discipline; mirrors
+/// [`MAX_MULTI_PUT_ENTRIES`]).
+pub const MAX_MULTI_GET_ENTRIES: usize = 4096;
+
+/// The upper bound on a `multi_get` **request's** total key bytes (4 MiB).
+///
+/// Enforced at the `Handle` boundary before dispatch: value sizes are unknown
+/// until the read, but key sizes are caller-supplied.
+pub const MAX_MULTI_GET_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The upper bound on a `multi_get` **result's** total value bytes (4 MiB).
+///
+/// Value sizes are not known before the read, so this is the only check that
+/// can run inside the read lock. On breach the state machine returns
+/// [`KvError::ResultTooLarge`] immediately (never a truncated/partial result);
+/// the runtime maps it to `InvalidArgument` telling the caller to split the
+/// batch.
+pub const MAX_MULTI_GET_RESULT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The largest number of entries a single range/prefix stale read will return,
 /// regardless of the caller-supplied `limit` (M2-P1A, §4.2). The state machine
 /// clamps to this so a caller can never ask it to clone the whole map under the
@@ -99,7 +128,15 @@ pub const MAX_STALE_RANGE_ENTRIES: usize = 10_000;
 /// `0/1/2` (`+ CasFailed`) so a failed CAS outcome survives
 /// snapshot→restore; the same single M3 format package bumps the storage
 /// `FORMAT_VERSION` (§2.2).
-const KV_SNAPSHOT_VERSION: u8 = 2;
+///
+/// v3 (Phase 2): every session record now carries the **effective index** —
+/// the log index of the entry that established the write (the original index
+/// on a deduped replay) — as 8 LE bytes after the existing outcome encoding.
+/// A v2 payload is rejected with [`KvError::MalformedSnapshot`] (fail-stop):
+/// fabricating `index 0` would leak an illegal public value and be persisted
+/// forever. The same format package bumps the storage `FORMAT_VERSION` to 4
+/// (no new opcodes; see `dev-docs/runbook-format-v4-upgrade.md`).
+const KV_SNAPSHOT_VERSION: u8 = 3;
 
 /// The kind of command, parsed from its opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +244,28 @@ struct SessionKey {
     seq_no: u64,
 }
 
+/// A cached session outcome plus the **effective index** of the write that
+/// produced it (Phase 2, design §5.3/§7.1).
+///
+/// `outcome` is what the write API returns on a fresh apply and on a deduped
+/// replay alike. `index` is the log index of the entry that actually
+/// established the write:
+///
+/// * first application of `Put`/`MultiPut`/`Delete`/`CAS` → that command's
+///   `index`;
+/// * deduped replay → the **original** index recorded on the first apply
+///   (never the replay entry's index);
+/// * a session-GC/no-op entry is not recorded in this table at all.
+///
+/// The index must be snapshotted with the outcome; otherwise a replay after a
+/// restart would lose the original index (and a fabricated `0` would leak into
+/// the public API).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRecord {
+    outcome: ApplyOutcome,
+    index: LogIndex,
+}
+
 /// The in-memory KV + session-table state machine.
 ///
 /// `Clone` is cheap (clones the `Arc<RwLock<Store>>` reference, not the data)
@@ -239,8 +298,9 @@ struct Store {
     /// (D-Ord) so a reader never sees `version >= C` with entry `C` missing.
     applied: LogIndex,
     kv: BTreeMap<Vec<u8>, Entry>,
-    /// Session table: `(client_id, seq_no)` → the cached apply result.
-    sessions: BTreeMap<SessionKey, ApplyOutcome>,
+    /// Session table: `(client_id, seq_no)` → the cached apply result plus the
+    /// effective (original) log index of the write that produced it.
+    sessions: BTreeMap<SessionKey, SessionRecord>,
 }
 
 impl KvStateMachine {
@@ -717,9 +777,10 @@ impl StateMachine for KvStateMachine {
             .map_err(|_| KvError::PoisonedLock)?;
         let mut buf = Vec::new();
         // First byte: state-machine snapshot format version (KV_SNAPSHOT_VERSION).
-        // Rest of the payload: applied (u64 LE), kv entries, sessions — the
-        // kv entry now appends an 8-byte LE `index` (value's origin) after
-        // `[klen][k][vlen][v]`; sessions are unchanged.
+        // Rest of the payload: applied (u64 LE), kv entries, sessions. The kv
+        // entry appends an 8-byte LE `index` (value's origin) after
+        // `[klen][k][vlen][v]`; each session appends an 8-byte LE effective
+        // index after its existing outcome encoding (v3, Phase 2).
         buf.push(KV_SNAPSHOT_VERSION);
         buf.extend_from_slice(&guard.applied.to_le_bytes());
 
@@ -734,10 +795,10 @@ impl StateMachine for KvStateMachine {
         }
 
         buf.extend_from_slice(&(guard.sessions.len() as u32).to_le_bytes());
-        for (session, outcome) in &guard.sessions {
+        for (session, record) in &guard.sessions {
             buf.extend_from_slice(&session.client_id.to_le_bytes());
             buf.extend_from_slice(&session.seq_no.to_le_bytes());
-            match outcome {
+            match &record.outcome {
                 ApplyOutcome::None => buf.push(0),
                 ApplyOutcome::Value(val) => {
                     buf.push(1);
@@ -763,6 +824,9 @@ impl StateMachine for KvStateMachine {
                     }
                 }
             }
+            // v3: the effective index of the write that produced the outcome
+            // (the original index on a deduped replay).
+            buf.extend_from_slice(&record.index.to_le_bytes());
         }
         Ok(buf)
     }
@@ -822,6 +886,29 @@ impl KvStateMachine {
         index: LogIndex,
         command: &[u8],
     ) -> Result<(ApplyOutcome, Vec<WatchEvent>), KvError> {
+        self.apply_with_events_and_index(index, command)
+            .map(|(outcome, _effective, events)| (outcome, events))
+    }
+
+    /// Apply `command` at `index` and return the outcome, the **effective
+    /// index** of the write, and the write-set watch events.
+    ///
+    /// The effective index is the index the index-returning write APIs report:
+    ///
+    /// * first application of `Put`/`MultiPut`/`Delete`/`CAS` → `index`;
+    /// * deduped replay → the **original** index stored in its
+    ///   [`SessionRecord`] (never the replay entry's index);
+    /// * no-op / session-GC entries → `index` (not exposed by a write API).
+    ///
+    /// This exists because a post-apply re-read of the store is **wrong**: two
+    /// writes in the same apply batch would both observe the last value's
+    /// origin (design §5.3 / commit-index design §9.1). The index has to be
+    /// carried out of the same locked apply that computed the outcome.
+    pub fn apply_with_events_and_index(
+        &self,
+        index: LogIndex,
+        command: &[u8],
+    ) -> Result<(ApplyOutcome, LogIndex, Vec<WatchEvent>), KvError> {
         // The write lock is held for the whole apply. We mutate the maps FIRST
         // and bump `applied` LAST (D-Ord), so a reader never sees `version >= C`
         // with entry `C` missing.
@@ -839,7 +926,9 @@ impl KvStateMachine {
         // advances the index but changes no state.
         if command.is_empty() {
             guard.applied = index;
-            return Ok((ApplyOutcome::None, Vec::new()));
+            // A no-op is not exposed by a write API; the effective index is
+            // simply the entry's own index.
+            return Ok((ApplyOutcome::None, index, Vec::new()));
         }
 
         if command.first() == Some(&OP_SESSION_GC) {
@@ -848,7 +937,7 @@ impl KvStateMachine {
                 guard.sessions.remove(&session);
             }
             guard.applied = index;
-            return Ok((ApplyOutcome::None, Vec::new()));
+            return Ok((ApplyOutcome::None, index, Vec::new()));
         }
 
         // Atomic multi-put (M2-P1B): one command applies a whole key set under
@@ -862,6 +951,12 @@ impl KvStateMachine {
         if command.first() == Some(&OP_MULTI_PUT) {
             let (session, entries) = Self::parse_multi_put(command)?;
             let cached = guard.sessions.get(&session).cloned();
+            // A replay reports the original batch's index; a first apply
+            // reports this entry's index (all keys share one atomic apply).
+            let effective_index = cached
+                .as_ref()
+                .map(|record| record.index)
+                .unwrap_or(index);
             let mut events = Vec::new();
             if cached.is_none() {
                 // Collect final value per key (last occurrence wins), then one
@@ -876,10 +971,16 @@ impl KvStateMachine {
                 for (key, val) in keys {
                     events.push(WatchEvent::put(index, &key, &val));
                 }
-                guard.sessions.insert(session, ApplyOutcome::None);
+                guard.sessions.insert(
+                    session,
+                    SessionRecord {
+                        outcome: ApplyOutcome::None,
+                        index,
+                    },
+                );
             }
             guard.applied = index;
-            return Ok((ApplyOutcome::None, events));
+            return Ok((ApplyOutcome::None, effective_index, events));
         }
 
         // Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`.
@@ -892,8 +993,8 @@ impl KvStateMachine {
         if command.first() == Some(&OP_CAS) {
             let (session, key, pred, success) = Self::parse_cas(command)?;
             let cached = guard.sessions.get(&session).cloned();
-            let (outcome, events) = match cached {
-                Some(cached) => (cached, Vec::new()),
+            let (outcome, effective_index, events) = match cached {
+                Some(record) => (record.outcome, record.index, Vec::new()),
                 None => {
                     // Evaluate the predicate against the CURRENT stored state
                     // (still under the write lock; no torn read).
@@ -939,21 +1040,28 @@ impl KvStateMachine {
                         )
                     };
                     // Record BOTH outcomes — success and failure — in the
-                    // session table (failure too: §6.2.2).
-                    guard.sessions.insert(session, outcome.clone());
-                    (outcome, events)
+                    // session table (failure too: §6.2.2). Both carry this
+                    // entry's index as the write's effective index.
+                    guard.sessions.insert(
+                        session,
+                        SessionRecord {
+                            outcome: outcome.clone(),
+                            index,
+                        },
+                    );
+                    (outcome, index, events)
                 }
             };
             guard.applied = index;
-            return Ok((outcome, events));
+            return Ok((outcome, effective_index, events));
         }
 
         let (session, op, key, val) = Self::parse_command(command)?;
 
         // Idempotency: a replayed session returns its cached result without
         // re-mutating the store — and produces no events (first-apply only).
-        let (outcome, events) = match guard.sessions.get(&session) {
-            Some(cached) => (cached.clone(), Vec::new()),
+        let (outcome, effective_index, events) = match guard.sessions.get(&session) {
+            Some(record) => (record.outcome.clone(), record.index, Vec::new()),
             None => {
                 let (outcome, event) = match op {
                     Op::Put => {
@@ -981,14 +1089,20 @@ impl KvStateMachine {
                 if let Some(event) = event {
                     events.push(event);
                 }
-                guard.sessions.insert(session, outcome.clone());
-                (outcome, events)
+                guard.sessions.insert(
+                    session,
+                    SessionRecord {
+                        outcome: outcome.clone(),
+                        index,
+                    },
+                );
+                (outcome, index, events)
             }
         };
 
         // Version is bumped LAST (D-Ord).
         guard.applied = index;
-        Ok((outcome, events))
+        Ok((outcome, effective_index, events))
     }
 
     /// Read the applied value **and** its origin index under a *single* read
@@ -1022,6 +1136,48 @@ impl KvStateMachine {
                 Ok((Some(e.val.clone()), Some(e.index)))
             }
         }
+    }
+
+    /// Batched exact-key read: every requested key's value plus one
+    /// **applied index** for the whole batch, observed under a *single* read
+    /// lock (design §4.1 M1/M2/M3).
+    ///
+    /// The result preserves input order; duplicate keys produce duplicate
+    /// entries; a missing key is `None`; an empty `keys` slice yields
+    /// `(vec![], applied)`. The version is read **first**, then the map
+    /// (D-Arc/D-Ord), so the values and `applied` always belong to the same
+    /// state.
+    ///
+    /// Value bytes are accumulated while cloning under the lock. If they would
+    /// exceed [`MAX_MULTI_GET_RESULT_BYTES`], the read fails immediately with
+    /// [`KvError::ResultTooLarge`] — never a partial result.
+    pub fn multi_get(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<(Vec<Option<Vec<u8>>>, LogIndex), KvError> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| KvError::PoisonedLock)?;
+        // Read the version first (D-Arc), then the map, atomically.
+        let applied = guard.applied;
+        let mut values = Vec::with_capacity(keys.len());
+        let mut total_bytes: u64 = 0;
+        for key in keys {
+            match guard.kv.get(*key) {
+                None => values.push(None),
+                Some(entry) => {
+                    total_bytes = total_bytes.saturating_add(entry.val.len() as u64);
+                    if total_bytes > MAX_MULTI_GET_RESULT_BYTES {
+                        // Fail before cloning the over-limit value into the
+                        // result: no partial batch ever escapes.
+                        return Err(KvError::ResultTooLarge);
+                    }
+                    values.push(Some(entry.val.clone()));
+                }
+            }
+        }
+        Ok((values, applied))
     }
 
     /// Consistent **range** read (M2-P1A): every `(key, val)` in `[start, end)`
@@ -1190,7 +1346,7 @@ fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
                 ApplyOutcome::Value(val)
             }
             // M3: a cached failed CAS. Layout mirrors the encoder:
-            // `[tag=2][current_index:u64][has_value:1][val]*` (KV_SNAPSHOT_VERSION 2).
+            // `[tag=2][current_index:u64][has_value:1][val]*` (KV_SNAPSHOT_VERSION 2+).
             2 => {
                 let current_index = read_u64(&mut cursor)?;
                 let has_value = read_u8(&mut cursor)?;
@@ -1212,7 +1368,12 @@ fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
             }
             _ => return Err(KvError::MalformedSnapshot),
         };
-        sessions.insert(SessionKey { client_id, seq_no }, outcome);
+        // v3: the effective index follows the outcome encoding.
+        let index = read_u64(&mut cursor)?;
+        sessions.insert(
+            SessionKey { client_id, seq_no },
+            SessionRecord { outcome, index },
+        );
     }
 
     // A well-formed snapshot has no trailing bytes.
@@ -1556,6 +1717,50 @@ mod tests {
         assert_eq!(sm2.snapshot().unwrap(), snap);
     }
 
+    /// v3: a snapshot round-trip preserves each session's **effective
+    /// (original) index**, so a replay after restart still reports the index of
+    /// the entry that actually established the write — not the replay's index.
+    #[test]
+    fn snapshot_roundtrip_preserves_session_effective_index() {
+        let sm = KvStateMachine::new();
+        let cmd = KvStateMachine::encode_put(7, 1, b"k", b"v");
+        let (_, first, _) = sm.apply_with_events_and_index(1, &cmd).unwrap();
+        assert_eq!(first, 1, "first apply reports its own entry index");
+
+        let snap = sm.snapshot().unwrap();
+        let sm2 = KvStateMachine::new();
+        sm2.restore(&snap).unwrap();
+
+        // Replay the same session at a later index: the cached **original**
+        // index comes back, and no event is emitted.
+        let (outcome, replay, events) = sm2.apply_with_events_and_index(2, &cmd).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Value(b"v".to_vec()));
+        assert_eq!(replay, 1, "a replay reports the original index");
+        assert!(events.is_empty(), "a deduped replay emits no events");
+
+        // A fresh session reports its own entry index.
+        let (_, fresh, _) = sm2
+            .apply_with_events_and_index(3, &KvStateMachine::encode_put(8, 1, b"k2", b"v2"))
+            .unwrap();
+        assert_eq!(fresh, 3);
+    }
+
+    /// A v2 snapshot payload (no per-session effective index) is fail-stop:
+    /// accepting it would force a fabricated `index 0` into the public API.
+    #[test]
+    fn v2_snapshot_payload_is_rejected() {
+        let mut v2 = Vec::new();
+        v2.push(2u8); // old KV_SNAPSHOT_VERSION
+        v2.extend_from_slice(&0u64.to_le_bytes()); // applied
+        v2.extend_from_slice(&0u32.to_le_bytes()); // kv count
+        v2.extend_from_slice(&0u32.to_le_bytes()); // session count
+        let sm = KvStateMachine::new();
+        assert!(matches!(
+            sm.restore(&v2),
+            Err(KvError::MalformedSnapshot)
+        ));
+    }
+
     /// I5: a legacy / unknown snapshot payload is **rejected** (fail-stop) —
     /// no fabricated origin is ever accepted, and `index 0` never surfaces.
     #[test]
@@ -1573,7 +1778,7 @@ mod tests {
         ));
 
         // Any version byte other than the current one is rejected too.
-        let mut wrong = vec![3u8]; // KV_SNAPSHOT_VERSION is 2 (bumped at M3)
+        let mut wrong = vec![4u8]; // KV_SNAPSHOT_VERSION is 3 (bumped in Phase 2)
         wrong.extend_from_slice(&0u64.to_le_bytes());
         wrong.extend_from_slice(&0u32.to_le_bytes());
         wrong.extend_from_slice(&0u32.to_le_bytes());
@@ -1702,6 +1907,70 @@ mod tests {
     fn multi_put_command_session_is_attributed() {
         let cmd = KvStateMachine::encode_multi_put(55, 3, &[(b"a", b"1")]);
         assert_eq!(KvStateMachine::command_session(&cmd), Some((55, 3)));
+    }
+
+    // ---- Phase 1: multi_get -------------------------------------------------
+
+    /// Input order is preserved, duplicate keys repeat their result, and a
+    /// missing key is `None` (never an error).
+    #[test]
+    fn multi_get_preserves_order_duplicates_and_missing() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"b", b"2"))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_put(1, 2, b"a", b"1"))
+            .unwrap();
+
+        let (values, applied) = sm
+            .multi_get(&[b"a", b"missing", b"b", b"a"])
+            .unwrap();
+        assert_eq!(applied, 2, "one applied index covers the whole batch");
+        assert_eq!(
+            values,
+            vec![
+                Some(b"1".to_vec()),
+                None,
+                Some(b"2".to_vec()),
+                Some(b"1".to_vec()),
+            ],
+            "order preserved; missing=None; duplicate keys repeat"
+        );
+    }
+
+    /// An empty key set is legal: empty values plus the current applied index.
+    #[test]
+    fn multi_get_empty_returns_current_applied() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"k", b"v"))
+            .unwrap();
+        let (values, applied) = sm.multi_get(&[]).unwrap();
+        assert!(values.is_empty());
+        assert_eq!(applied, 1);
+    }
+
+    /// The result byte budget is enforced while cloning under the read lock:
+    /// a batch whose *accumulated* value bytes exceed
+    /// [`MAX_MULTI_GET_RESULT_BYTES`] fails with `ResultTooLarge` and never
+    /// returns a partial batch.
+    #[test]
+    fn multi_get_rejects_over_limit_result() {
+        let sm = KvStateMachine::new();
+        // Two values, each just under half the cap: separately readable, but
+        // together over it.
+        let half = (MAX_MULTI_GET_RESULT_BYTES / 2 + 1) as usize;
+        let big = vec![0xABu8; half];
+        sm.apply(1, &KvStateMachine::encode_put(1, 1, b"a", &big))
+            .unwrap();
+        sm.apply(2, &KvStateMachine::encode_put(1, 2, b"b", &big))
+            .unwrap();
+
+        // A single key is under the cap.
+        assert!(sm.multi_get(&[b"a"]).is_ok());
+        // The combined batch is over it: fail, do not truncate.
+        assert!(matches!(
+            sm.multi_get(&[b"a", b"b"]),
+            Err(KvError::ResultTooLarge)
+        ));
     }
 
     // ---- M2-P1A: consistent range read --------------------------------------

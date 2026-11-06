@@ -2,8 +2,8 @@
 
 > 状态：**M1–M4（P0–P2）已全部实现并合入主干**（2026-10-08；M1 `4ad459d` / M2 `6281557` / M3 `2356b46` / M4 `c41ed57`；每里程碑过 Oracle 门禁，必修项落地并有聚焦测试）。
 > 用途：**供新 session 在本仓独立执行**——本文件自包含，含：目标、路线与依赖、每项功能的 API/内部机制/代码锚点/不变量/测试/验收/坑、格式升级打包策略、执行编排建议。
-> 前置事实（新 session 直接信任，如需复核见 §12）：当前版本 v0.3.1；仓库 crates.io 已发布 5 crate；`get_stale_with_index` 已交付（value 溯源序号）；`put_with_index` 已关闭（下游确认不需要，#9）；快照存储 `FORMAT_VERSION = 2`（`arachne/src/storage/meta.rs:48`）。
-> 完成情况锚点：P0 管线见 runtime `WatchEvents`/`outcomes` 通道；P1-A `get_stale_prefix/range`；P1-B `multi_put`；P1-C `cas` + `KV_SNAPSHOT_VERSION` 2 / `FORMAT_VERSION` 3（runbook `runbook-format-v3-upgrade.md`）；P2 `watch`（快照 + 写入集事件）。
+> 前置事实（新 session 直接信任，如需复核见 §12）：当前版本 v0.5.0；仓库 crates.io 已发布 5 crate；`get_stale_with_index` 已交付（value 溯源序号）；`put_with_index` 已**重新打开并于 v0.5.0 交付**（连同 `multi_put_with_index` / `delete_with_index`，不再是 #9 的关闭状态）；快照存储 `KV_SNAPSHOT_VERSION = 3`、`FORMAT_VERSION = 4`（`arachne/src/state_machine/kv.rs`、`arachne/src/storage/meta.rs`）。
+> 完成情况锚点：P0 管线见 runtime `WatchEvents`/`outcomes` 通道；P1-A `get_stale_prefix/range`；P1-B `multi_put`；P1-C `cas` + `KV_SNAPSHOT_VERSION` 2 / `FORMAT_VERSION` 3（runbook `runbook-format-v3-upgrade.md`）；P2 `watch`（快照 + 写入集事件）；v0.5.0 批量读/索引可见性：`multi_get` + indexed writes + `wait_applied`，`KV_SNAPSHOT_VERSION` 3 / `FORMAT_VERSION` 4（runbook `runbook-format-v4-upgrade.md`）。
 
 ---
 
@@ -202,7 +202,7 @@ M4  P2 Watch（§7）                                  ← 依赖 M2（同一 pr
 - DeleteRange（hydra put-only 替换模型，从不删树内 key）；
 - auth/RBAC、defrag/quota、Downgrade；
 - etcd v3 wire / API 兼容层（embedding 是使用模式；追兼容拖垮 YAGNI）；
-- **不复活 `put_with_index`**（plan #9 已关闭；CAS/multi-put 如需返回 index，复用 M1 同一管线，不以旧 API 名义开新口）。
+- **`put_with_index` 已重新打开并在 v0.5.0 交付**（下游需求从可选优化升级为验收必需；与 `multi_put_with_index` / `delete_with_index` 共用 M1 同一 outcome/index 管线；不再是 plan #9 的关闭状态）。
 
 ---
 

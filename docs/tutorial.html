@@ -252,6 +252,32 @@ let (voters, learners) = handle.membership().await?;
         </p>
       </div>
 
+      <h3>批量读、索引可见性与 Hydra 形状（Phase 1–3）</h3>
+      <p>
+        <code>multi_get</code> 让一次精确 key 集合的读取共享<strong>一个</strong> applied index；
+        indexed writes 返回写入实际生效的 log index；<code>wait_applied</code> 在本地等待状态机追平。
+        三者组合可闭环「读到 head → 等追平 → 批量读实体」：
+      </p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">text</span></div>
+<pre><code data-lang="text">(token, head_index) = get_stale_with_index(head_key)
+wait_applied(head_index, MATERIALIZE_WAIT)
+entities = multi_get(entity_keys, Stale)   // entity indices are older than head
+</code></pre>
+      </div>
+      <p>写入侧的两个形状（整批一次 apply，各自返回 effective index）：</p>
+      <div class="code-block">
+        <div class="code-head"><span class="code-lang">text</span></div>
+<pre><code data-lang="text">let entity_index = multi_put_with_index(chunk)
+let final_index = multi_put_with_index(&amp;[(manifest,..),(retain,..),(head,..)])
+</code></pre>
+      </div>
+      <p>
+        <strong>前提</strong>：entity/head 的 publish 顺序必须保证 entity index &lt; head index
+        （Hydra 当前就是先写 entity、再写 head）。Arachne 只保证「同一状态机、按 log 顺序 apply」，
+        不解释树的语义；<code>wait_applied</code> 不是 quorum barrier，也不替代线性读。
+      </p>
+
       <h2>5. 多节点：参考节点怎么装配</h2>
       <p>
         多节点集群也可以直接走 facade：<code>Arachne::start(ClusterConfig::member(..))</code>
@@ -473,7 +499,7 @@ for _ in 0..500 {
         <li><code>SessionTableFull</code> / <code>SessionExpired</code> —— 写会话表机制。</li>
         <li><code>ShuttingDown</code> / <code>Unrecoverable</code> —— 节点关停 / 致命存储错误（进程应 fail-stop）。</li>
       </ul>
-      <p>完整 16 个变体、各字段与 HTTP 状态码映射见 <a href="api-reference.html">API Reference</a>。</p>
+      <p>完整 17 个变体、各字段与 HTTP 状态码映射见 <a href="api-reference.html">API Reference</a>。</p>
 
       <h2>9. 下一步</h2>
       <div class="card-grid">

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Arachne API Reference —— server::Arachne 全方法、client::Handle 全客户端 API、WalConfig、ArachneError 16 变体、HTTP 接口表。">
+<meta name="description" content="Arachne API Reference —— server::Arachne 全方法、client::Handle 全客户端 API、WalConfig、ArachneError 17 变体、HTTP 接口表。">
 <title>API Reference · Arachne 文档</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -139,6 +139,56 @@
 
       <div class="api-method">
         <div class="sig">
+          <code>pub async fn multi_get(keys: &amp;[&amp;[u8]], consistency: ReadConsistency) -&gt; Result&lt;MultiGetResult, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-amber">批量读</span></span>
+        </div>
+        <div class="desc">
+          <p>批量精确读：整批共享一个 <code>applied_index</code>；输入顺序保留、缺键 <code>None</code>、重复 key 产生重复结果、空集合法。<code>Stale</code> 走本地状态机（无 quorum，少数派 follower 可用）；<code>Linearizable</code> 复用 ReadIndex。语义与限制同 <code>Handle::multi_get</code>（见第 3 节）。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn put_with_index(key: &amp;[u8], value: &amp;[u8]) -&gt; Result&lt;u64, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-mono">index</span></span>
+        </div>
+        <div class="desc">
+          <p>线性化写，返回使本次写入<strong>实际生效</strong>的 log entry index（<code>Index = u64</code>）。语义与 dedup/转发规则同 <code>Handle::put_with_index</code>；旧 peer → <code>Unsupported</code>。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn multi_put_with_index(entries: &amp;[(&amp;[u8], &amp;[u8])]) -&gt; Result&lt;u64, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-mono">index</span></span>
+        </div>
+        <div class="desc">
+          <p>原子多键写，返回整批共享的 effective index（一次 apply）。语义同 <code>Handle::multi_put_with_index</code>。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn delete_with_index(key: &amp;[u8]) -&gt; Result&lt;u64, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-mono">index</span></span>
+        </div>
+        <div class="desc">
+          <p>线性化删除，返回该 delete entry 的 index（即使 key 原本不存在）。语义同 <code>Handle::delete_with_index</code>。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
+          <code>pub async fn wait_applied(index: Index, timeout: Duration) -&gt; Result&lt;Index, ArachneError&gt;</code>
+          <span class="badges"><span class="badge badge-teal">async</span><span class="badge badge-amber">本地等待</span></span>
+        </div>
+        <div class="desc">
+          <p>等待本地状态机应用水位到达 <code>index</code>：已追平立即返回当前 applied，否则在 apply 推进时唤醒，超时 <code>Timeout</code>；取消安全；<code>index == 0</code> 为 no-op。纯本地、无 quorum、不重定向，<strong>不是</strong> quorum barrier。语义同 <code>Handle::wait_applied</code>。</p>
+        </div>
+      </div>
+
+      <div class="api-method">
+        <div class="sig">
           <code>pub async fn delete(key: &amp;[u8]) -&gt; Result&lt;(), ArachneError&gt;</code>
           <span class="badges"><span class="badge badge-teal">async</span></span>
         </div>
@@ -216,6 +266,39 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <h3>批量读与索引可见性（Phase 1–3）</h3>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>方法 / 类型（签名）</th><th>语义</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>multi_get(&amp;self, keys: &amp;[&amp;[u8]], consistency: ReadConsistency) -&gt; Result&lt;MultiGetResult, ArachneError&gt;</code></td>
+              <td>批量精确读：整批共享<strong>一个</strong> <code>applied_index</code>（同一次读锁），无撕裂。<code>Stale</code> 走本地状态机（无 quorum，任意节点/少数派可用）；<code>Linearizable</code> 复用 ReadIndex（leader + quorum）。输入顺序严格保留；缺键 = <code>None</code>；重复 key 产生重复结果。<strong>限制</strong>：<code>MAX_MULTI_GET_ENTRIES = 4096</code>、请求 key 总字节 4 MiB、结果 value 总字节 4 MiB、in-flight 16 MiB（超限 → <code>Busy</code>）；超限<strong>不截断</strong>（count/key bytes/value bytes 三类可区分的 <code>InvalidArgument</code>）。</td>
+            </tr>
+            <tr>
+              <td><code>ReadConsistency</code> / <code>MultiGetResult</code> / <code>Index</code></td>
+              <td><code>ReadConsistency::{Stale, Linearizable}</code>；<code>MultiGetResult { values: Vec&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt;, applied_index: Index }</code>；<code>Index = u64</code>（与 <code>get_stale_with_index</code> 的 value 溯源 index 同源、跨 key/节点可比）。均从 crate 根导出。</td>
+            </tr>
+            <tr>
+              <td><code>put_with_index</code> / <code>multi_put_with_index</code> / <code>delete_with_index</code></td>
+              <td>线性化写，返回使写入<strong>实际生效</strong>的 log entry index。同 <code>(client_id, seq_no)</code> 重放返回<strong>原始</strong> index（仅在 session TTL+grace 内保证；GC 后的重试是新 session，返回新 index）。follower 转发写入返回 <strong>leader</strong> 的 index；旧 peer → <code>Unsupported</code>。<code>multi_put_with_index</code> 整批共享一个 index；<code>delete_with_index</code> 即使 key 不存在也返回该 delete entry 的 index。</td>
+            </tr>
+            <tr>
+              <td><code>wait_applied(&amp;self, index: Index, timeout: Duration) -&gt; Result&lt;Index, ArachneError&gt;</code></td>
+              <td>本地、无 quorum、不重定向（少数派 follower 可用）；已追平立即返回当前 applied（可 ≥ index），否则在 apply 推进时唤醒，超时返回 <code>Timeout</code>；取消安全（drop future 后 waiter 被剪枝）；<code>index == 0</code> 为 no-op（零 timeout 优先返回 <code>Timeout</code>）。等待的是状态机 applied index，<strong>不是</strong> quorum barrier，也不替代线性读。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          <strong>旧对端线协议门控</strong>：<code>multi_get</code> 与 indexed writes 经 <code>Forward</code> RPC 使用新 kind（3/4）。旧 peer 对未知 kind 返回 <code>unknown_kind</code>，或省略 <code>commit_index</code> / <code>multi_get</code> 字段 → <code>ArachneError::Unsupported</code>（terminal，操作未执行），<strong>绝不</strong>静默回退为逐 key 读或伪造 index 0。
+        </p>
       </div>
 
       <h3>成员操作（async）</h3>
@@ -359,11 +442,11 @@
         </table>
       </div>
 
-      <h2>5. ArachneError —— 全部 16 个变体</h2>
+      <h2>5. ArachneError —— 全部 17 个变体</h2>
       <p>
         每个客户端操作（<code>put</code> / <code>delete</code> / <code>get</code> /
-        <code>get_stale</code>）都解析为一个值或其中一种错误。下表按用途分组，附真实
-        <code>Display</code> 文案与参考节点 HTTP 面映射。
+        <code>get_stale</code> / <code>multi_get</code> / <code>wait_applied</code>）都解析为一个值或
+        其中一种错误。下表按用途分组，附真实 <code>Display</code> 文案与参考节点 HTTP 面映射。
       </p>
       <div class="table-wrap">
         <table class="doc-table">
@@ -385,6 +468,7 @@
             <tr><td><code>ShuttingDown</code></td><td>节点正在关闭。</td><td><span class="nowrap">503</span></td></tr>
             <tr><td><code>DataDirLocked</code></td><td>数据目录被另一进程锁定。</td><td><span class="nowrap">—</span></td></tr>
             <tr><td><code>Unrecoverable(String)</code></td><td>致命条件（存储损坏、状态机不变式被破坏……）。进程应 fail-stop。</td><td><span class="nowrap">500 Internal Server Error</span></td></tr>
+            <tr><td><code>Unsupported(String)</code></td><td>对端不支持所请求的能力（旧 peer 的 <code>multi_get</code> / indexed write、wire <code>unknown_kind</code> 或缺少字段）。<strong>terminal</strong>：操作<strong>未执行</strong>，对同一 peer 重试同一调用无益。</td><td><span class="nowrap">—</span></td></tr>
             <tr><td><code>AlreadyInitialized</code></td><td>本进程内 facade 已被初始化，礼貌拒绝第二个 <code>Arachne::start</code>。</td><td><span class="nowrap">—</span></td></tr>
             <tr><td><code>NotInitialized</code></td><td>在 <code>start</code> 前或 <code>shutdown</code> 后调用 facade 静态方法。</td><td><span class="nowrap">—</span></td></tr>
           </tbody>

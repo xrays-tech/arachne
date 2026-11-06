@@ -52,7 +52,15 @@ use crate::storage::crc32c::crc32c;
 /// (`OP_MULTI_PUT`, `OP_CAS`) are not understood by older nodes. Both
 /// versions bump exactly once together per plan `dev-docs/plan-vs-etcd.md`
 /// §2.2; see `dev-docs/runbook-format-v3-upgrade.md`.
-pub const FORMAT_VERSION: u32 = 3;
+///
+/// v4 (Phase 2): the KV snapshot payload rose to
+/// [`KV_SNAPSHOT_VERSION`](crate::state_machine::kv::KV_SNAPSHOT_VERSION) 3
+/// (each session record now persists the write's effective index). **There are
+/// no new command opcodes**: the WAL command stream is still parseable by a v3
+/// binary. The break is the session snapshot format + upgrade policy, so an old
+/// data directory fails at open with a format mismatch. See
+/// `dev-docs/runbook-format-v4-upgrade.md`.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Magic number identifying a valid META file.
 const META_MAGIC: u32 = 0x41_52_41_4D; // "ARAM" in ASCII
@@ -462,8 +470,8 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_three() {
-        assert_eq!(FORMAT_VERSION, 3);
+    fn format_version_is_four() {
+        assert_eq!(FORMAT_VERSION, 4);
     }
 
     #[test]

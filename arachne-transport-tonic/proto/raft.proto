@@ -104,14 +104,22 @@ message SendReply {
 
 // A forwarded client command (propsol v0.2.19).
 message ForwardRequest {
-  // The operation: 0 = propose (write), 1 = read (ReadIndex), 2 = stale read.
+  // The operation: 0 = propose (write), 1 = read (ReadIndex), 2 = stale read,
+  // 3 = multi_get (batched exact-key read), 4 = propose_with_index.
+  //
+  // 4 = propose_with_index is the same write as kind=0 (payload in `cmd`,
+  // session in `client_id`/`seq_no`) but the reply additionally carries the
+  // applied log entry index in `ForwardReply.commit_index`. It is a distinct
+  // kind, never a reuse of 0: an old node answers `unknown_kind` for it
+  // *before* executing anything, so a new client's `Unsupported` honestly
+  // means "nothing was applied".
   //
   // `kind` is a 0-based discriminant (proto3 leaves 0 as the default): a
   // `Default(ForwardRequest)` would read as an empty propose and is rejected
   // by the handshake / payload validation below, so no separate "kind must
   // be set" check is needed.
   uint32 kind = 1;
-  // The encoded state-machine command (for a propose).
+  // The encoded state-machine command (for a propose: `kind` 0 or 4).
   bytes cmd = 2;
   // The key (for a read / stale read).
   bytes key = 3;
@@ -123,6 +131,15 @@ message ForwardRequest {
   // The sender's handshake. Validated before the command runs, exactly as
   // for `Send` (propsol §5.6). Its `node_id` is the sender of the command.
   Hello hello = 6;
+  // The keys for a `multi_get` (`kind = 3`), in input order. Empty for every
+  // other kind; `key` above retains its single-key semantics for reads.
+  repeated bytes keys = 7;
+  // The consistency requested for a `multi_get` (`kind = 3`): `true` =
+  // linearizable (the target must apply its ReadIndex gate and answer
+  // `not_leader` if it is not the leader); `false` = stale local read. Ignored
+  // for every other kind (and defaults to `false`, the pre-field Stale
+  // behavior).
+  bool linearizable = 8;
 }
 
 // The server's verdict on a forwarded command (propsol v0.2.19).
@@ -141,6 +158,31 @@ message ForwardReply {
   // (M1). Absent on reads, on any failure, and on old nodes that predate the
   // field (the rolling-compatibility default, see `ForwardResult`).
   ForwardResult result = 6;
+  // The applied log entry index of a successful `ProposeWithIndex`
+  // (`kind = 4`): the index of the entry that actually established the write
+  // (the original index on a deduped replay). Presence distinguishes a real
+  // index from an "old node / non-indexed reply"; `0` is never a valid
+  // applied-write index, but presence is still the contract. Absent on every
+  // other kind, on any failure, and on old nodes that predate the field.
+  optional uint64 commit_index = 7;
+  // The batched-read reply (only for `kind = 3`); absent on every other kind,
+  // on any failure, and on old nodes that predate the field.
+  MultiGetReply multi_get = 8;
+}
+
+// The reply to a `multi_get` (`kind = 3`).
+message MultiGetReply {
+  // One entry per requested key, in order.
+  repeated OptionalBytesValue values = 1;
+  // The state-machine applied index all values were observed at.
+  uint64 applied_index = 2;
+}
+
+// One batch-read entry with explicit presence: the message element ALWAYS
+// exists, and `data` presence distinguishes a present (possibly empty) value
+// from an absent key.
+message OptionalBytesValue {
+  optional bytes data = 1;
 }
 
 // The per-command apply outcome of a forwarded `Propose` (M1/M3). The

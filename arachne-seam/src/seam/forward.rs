@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::seam::transport::Transport;
 use crate::seam::ApplyOutcome;
-use crate::types::NodeId;
+use crate::types::{LogIndex, NodeId};
 
 /// A client command that a non-leader node forwards to the leader.
 ///
@@ -51,6 +51,21 @@ pub enum ForwardCommand {
         /// The session sequence number.
         seq_no: u64,
     },
+    /// Index-returning propose (Phase 2): the same write as [`Self::Propose`],
+    /// but the reply carries the log index of the entry that **actually
+    /// established** the write (the original index on a deduped replay).
+    ///
+    /// This is a distinct wire kind from `Propose` (not a reuse of it): an old
+    /// leader must reject the kind *before* executing, so a new client's
+    /// `Unsupported` honestly means "nothing was applied".
+    ProposeWithIndex {
+        /// The encoded state-machine command.
+        cmd: Vec<u8>,
+        /// The session client id (propsol §2.3).
+        client_id: u64,
+        /// The session sequence number.
+        seq_no: u64,
+    },
     /// Linearizable read (ReadIndex on the leader).
     Read {
         /// The key to read.
@@ -60,6 +75,20 @@ pub enum ForwardCommand {
     GetStale {
         /// The key to read.
         key: Vec<u8>,
+    },
+    /// Batched exact-key read (`multi_get`) at the requested consistency.
+    ///
+    /// `linearizable = false` (`Stale`) reads the target's local state machine
+    /// under one lock and returns one `applied_index` for the whole batch,
+    /// with no quorum. `linearizable = true` requires the target to apply its
+    /// ReadIndex gate (and answer `NotLeader` if it is not the leader), so the
+    /// forwarded read keeps the caller's linearizable semantics.
+    MultiGet {
+        /// The keys to read, in input order.
+        keys: Vec<Vec<u8>>,
+        /// `true` = linearizable (ReadIndex on the target); `false` = stale
+        /// local read.
+        linearizable: bool,
     },
 }
 
@@ -102,6 +131,14 @@ pub struct ForwardOutcome {
     /// Present only on a successful `Propose`: the apply outcome the target
     /// computed. See the doc on the struct for the rolling-compatibility note.
     pub result: Option<ApplyOutcome>,
+    /// Present only on a successful `MultiGet`: the values in request order
+    /// (`None` = absent) plus the applied index they were observed at.
+    pub multi: Option<(Vec<Option<Vec<u8>>>, LogIndex)>,
+    /// Present only on a successful `ProposeWithIndex`: the log index of the
+    /// applied entry that established the write (the original index on a
+    /// deduped replay). Absent on old peers, reads, and non-indexed writes; the
+    /// caller maps absence to `Unsupported`.
+    pub index: Option<LogIndex>,
 }
 
 /// Sink the *leader* offers to the transport: it accepts forwarded commands

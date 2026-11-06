@@ -46,23 +46,23 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
 use slog::Logger;
-use tokio::sync::{mpsc, oneshot, watch};
 use std::future::Future;
+use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::client::{ArachneError, Handle};
+use crate::client::{ArachneError, Handle, ReadConsistency};
 use crate::consensus::{
     CommittedEntry, HeldSnapshot, NodeError, RaftNode, RaftNodeConfig, conf_change_identity,
     learner_caught_up,
 };
 use crate::metrics::Metrics;
 use crate::profile::ProfileConfig;
-use crate::state_machine::{KvStateMachine, WatchEvent};
+use crate::state_machine::{KvError, KvStateMachine, WatchEvent};
 use crate::storage::WalStorage;
 use crate::types::Timestamp;
 use crate::{
@@ -72,16 +72,135 @@ use arachne_kv_seam::seam::{
     ApplyOutcome, CommandSink, ForwardCommand, ForwardOutcome, ForwardTransport,
 };
 
+/// The shared in-flight budget for `multi_get` request key bytes (Gate-1 MF2).
+///
+/// `MAX_PENDING_READS` bounds the *entry count* of the pending-read queue, but
+/// a single `Many` entry can carry up to 4 MiB of keys. This budget (16 MiB
+/// total) bounds the aggregate payload in flight across the three hand-off
+/// windows: the client command channel, the `ForwardCommandSink`, and the
+/// actor's pending ReadIndex registration. A reservation that would exceed the
+/// budget is refused with [`ArachneError::Busy`] (retryable, distinct from the
+/// `InvalidArgument` "split the batch" remedy).
+pub const MAX_INFLIGHT_MULTI_GET_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A shared atomic byte budget for in-flight `multi_get` payloads.
+///
+/// Cheap to clone via `Arc`; every reservation returns an RAII
+/// [`MultiGetBudgetGuard`] that releases its bytes on drop (including when a
+/// future is cancelled).
+///
+/// **Interval containment (why the actor reserve is not redundant):** on every
+/// current path the Handle (or the `ForwardCommandSink`) reserves first and
+/// holds its guard until the reply — i.e. across the whole `tx.send`/actor
+/// window — so that outer reservation strictly contains the actor's
+/// pending-guard interval. The actor-side reserve is therefore
+/// defense-in-depth: it can never be the first to fail today, but it keeps the
+/// invariant local to the queue that actually holds the payload (and remains
+/// correct if a future caller bypasses the Handle/sink). Do not remove it as
+/// "dead".
+#[derive(Debug, Default)]
+pub struct MultiGetBudget {
+    used: AtomicU64,
+}
+
+impl MultiGetBudget {
+    /// A fresh budget with nothing reserved.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve `bytes` against the budget, or return `None` if that would
+    /// exceed [`MAX_INFLIGHT_MULTI_GET_BYTES`].
+    ///
+    /// The returned guard releases the reservation when dropped.
+    pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<MultiGetBudgetGuard> {
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(bytes);
+            if next > MAX_INFLIGHT_MULTI_GET_BYTES {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(MultiGetBudgetGuard {
+                        budget: Arc::clone(self),
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Bytes currently reserved (test/diagnostic surface).
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII reservation against a [`MultiGetBudget`]: releases its bytes on drop.
+#[derive(Debug)]
+pub struct MultiGetBudgetGuard {
+    budget: Arc<MultiGetBudget>,
+    bytes: u64,
+}
+
+impl Drop for MultiGetBudgetGuard {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 /// A [`CommandSink`] backed by this node's runtime actor: forwarded client
 /// commands are run against the local runtime and the answer is sent back to
 /// the leader's `Forward` RPC caller.
 pub struct ForwardCommandSink {
     tx: mpsc::Sender<Command>,
+    /// Shared `multi_get` in-flight byte budget (Gate-1 MF2).
+    multi_get_budget: Arc<MultiGetBudget>,
 }
 
 impl ForwardCommandSink {
-    pub fn new(tx: mpsc::Sender<Command>) -> Self {
-        Self { tx }
+    pub fn new(tx: mpsc::Sender<Command>, multi_get_budget: Arc<MultiGetBudget>) -> Self {
+        Self {
+            tx,
+            multi_get_budget,
+        }
+    }
+}
+
+/// Wire code for a forward whose target runtime is already gone while its
+/// listener is still bound. This is retryable (the caller may re-find the new
+/// leader), never a terminal `Unrecoverable`.
+const UNAVAILABLE_CODE: &str = "unavailable";
+
+/// Map an [`ArachneError`] to the stable wire code that
+/// [`crate::client::Handle`] reverses.
+///
+/// `not_leader` never appears here: it is signalled structurally by a
+/// [`ForwardOutcome::leader_hint`] so the client can re-redirect. Everything
+/// else must map to a stable code — collapsing `Busy`/`Timeout`/… into
+/// `unrecoverable` would tell the client a retryable condition is terminal
+/// (Gate-2 should-fix #4).
+fn stable_code(error: &ArachneError) -> &'static str {
+    match error {
+        ArachneError::QuorumUnavailable => "quorum_unavailable",
+        ArachneError::Timeout => "timeout",
+        ArachneError::Busy => "busy",
+        ArachneError::SessionExpired => "session_expired",
+        ArachneError::SessionTableFull => "session_table_full",
+        ArachneError::ShuttingDown => "shutting_down",
+        ArachneError::InvalidArgument(_) => "invalid_argument",
+        ArachneError::Unsupported(_) => "unsupported",
+        // A `not_leader` error is handled structurally before this helper; if
+        // one leaks here it is still not a client-visible verdict, so fall
+        // through to the generic unrecoverable code.
+        _ => "unrecoverable",
     }
 }
 
@@ -92,19 +211,24 @@ impl CommandSink for ForwardCommandSink {
     ) -> Pin<Box<dyn Future<Output = Result<ForwardOutcome, String>> + Send + '_>> {
         Box::pin(async move {
             match cmd {
-                ForwardCommand::Propose { cmd, client_id, seq_no } => {
+                ForwardCommand::Propose {
+                    cmd,
+                    client_id,
+                    seq_no,
+                } => {
                     let (ack_tx, ack_rx) = oneshot::channel::<Result<ApplyOutcome, ArachneError>>();
-                    self.tx.send(Command::Propose {
+                    self.tx
+                        .send(Command::Propose {
                         cmd,
                         client_id,
                         seq_no,
                         ack: ack_tx,
                     })
                     .await
-                    .map_err(|_| "command channel closed".to_string())?;
+                        .map_err(|_| UNAVAILABLE_CODE.to_string())?;
                     let result = match ack_rx.await {
                         Ok(res) => res,
-                        Err(_) => return Err("ack channel closed".to_string()),
+                        Err(_) => return Err(UNAVAILABLE_CODE.to_string()),
                     };
                     match result {
                         // Success: carry the per-entry apply outcome written back
@@ -115,27 +239,72 @@ impl CommandSink for ForwardCommandSink {
                             value: None,
                             leader_hint: None,
                             result: Some(outcome),
+                            multi: None,
+                            index: None,
                         }),
                         // Not leader: no outcome, just the hint to re-redirect.
                         Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
                             value: None,
                             leader_hint,
                             result: None,
+                            multi: None,
+                            index: None,
                         }),
-                        Err(e) => Err(format!("forward propose failed: {}", e)),
+                        Err(e) => Err(stable_code(&e).to_string()),
                     }
                 }
-                ForwardCommand::Read { key } => {
-                    let (ack_tx, ack_rx) = oneshot::channel::<Result<Option<Vec<u8>>, ArachneError>>();
-                    self.tx.send(Command::Read {
-                        key,
+                ForwardCommand::ProposeWithIndex {
+                    cmd,
+                    client_id,
+                    seq_no,
+                } => {
+                    // A distinct wire kind from `Propose` (Gate-1 MF1): an old
+                    // leader rejects the kind before executing, so the client's
+                    // `Unsupported` honestly means "nothing was applied".
+                    let (ack_tx, ack_rx) = oneshot::channel::<Result<LogIndex, ArachneError>>();
+                    self.tx
+                        .send(Command::ProposeWithIndex {
+                            cmd,
+                            client_id,
+                            seq_no,
                         ack: ack_tx,
                     })
                     .await
-                    .map_err(|_| "command channel closed".to_string())?;
+                        .map_err(|_| UNAVAILABLE_CODE.to_string())?;
                     let result = match ack_rx.await {
                         Ok(res) => res,
-                        Err(_) => return Err("ack channel closed".to_string()),
+                        Err(_) => return Err(UNAVAILABLE_CODE.to_string()),
+                    };
+                    match result {
+                        // The effective index rides alone; this reply kind has
+                        // no outcome/value of its own.
+                        Ok(index) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint: None,
+                            result: None,
+                            multi: None,
+                            index: Some(index),
+                        }),
+                        Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint,
+                            result: None,
+                            multi: None,
+                            index: None,
+                        }),
+                        Err(e) => Err(stable_code(&e).to_string()),
+                    }
+                }
+                ForwardCommand::Read { key } => {
+                    let (ack_tx, ack_rx) =
+                        oneshot::channel::<Result<Option<Vec<u8>>, ArachneError>>();
+                    self.tx
+                        .send(Command::Read { key, ack: ack_tx })
+                        .await
+                        .map_err(|_| UNAVAILABLE_CODE.to_string())?;
+                    let result = match ack_rx.await {
+                        Ok(res) => res,
+                        Err(_) => return Err(UNAVAILABLE_CODE.to_string()),
                     };
                     match result {
                         // A read's answer rides in `value`; there is no apply
@@ -144,39 +313,98 @@ impl CommandSink for ForwardCommandSink {
                             value,
                             leader_hint: None,
                             result: None,
+                            multi: None,
+                            index: None,
                         }),
                         Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
                             value: None,
                             leader_hint,
                             result: None,
+                            multi: None,
+                            index: None,
                         }),
-                        Err(e) => Err(format!("forward read failed: {}", e)),
+                        Err(e) => Err(stable_code(&e).to_string()),
                     }
                 }
                 ForwardCommand::GetStale { key } => {
-                    let (ack_tx, ack_rx) = oneshot::channel::<Result<Option<Vec<u8>>, ArachneError>>();
-                    self.tx.send(Command::GetStale {
-                        key,
-                        ack: ack_tx,
-                    })
+                    let (ack_tx, ack_rx) =
+                        oneshot::channel::<Result<Option<Vec<u8>>, ArachneError>>();
+                    self.tx
+                        .send(Command::GetStale { key, ack: ack_tx })
                     .await
-                    .map_err(|_| "command channel closed".to_string())?;
+                        .map_err(|_| UNAVAILABLE_CODE.to_string())?;
                     let result = match ack_rx.await {
                         Ok(res) => res,
-                        Err(_) => return Err("ack channel closed".to_string()),
+                        Err(_) => return Err(UNAVAILABLE_CODE.to_string()),
                     };
                     match result {
                         Ok(value) => Ok(ForwardOutcome {
                             value,
                             leader_hint: None,
                             result: None,
+                            multi: None,
+                            index: None,
                         }),
                         Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
                             value: None,
                             leader_hint,
                             result: None,
+                            multi: None,
+                            index: None,
                         }),
-                        Err(e) => Err(format!("forward get_stale failed: {}", e)),
+                        Err(e) => Err(stable_code(&e).to_string()),
+                    }
+                }
+                ForwardCommand::MultiGet { keys, linearizable } => {
+                    // Gate-1 MF2: reserve the forwarded payload before it
+                    // enters this node's command channel. Over budget is
+                    // retryable (`Busy`), surfaced as the stable `busy` code.
+                    let bytes = keys.iter().map(|k| k.len() as u64).sum::<u64>();
+                    let Some(_budget) = self.multi_get_budget.try_reserve(bytes) else {
+                        return Err("busy".to_string());
+                    };
+                    let (ack_tx, ack_rx) = oneshot::channel::<
+                        Result<(Vec<Option<Vec<u8>>>, LogIndex), ArachneError>,
+                    >();
+                    // Preserve the caller's consistency across the wire: a
+                    // forwarded Linearizable multi_get must still pass through
+                    // this node's ReadIndex gate (and answer `NotLeader` when
+                    // it is not the leader), never be served stale.
+                    let consistency = if linearizable {
+                        ReadConsistency::Linearizable
+                    } else {
+                        ReadConsistency::Stale
+                    };
+                    self.tx
+                        .send(Command::MultiGet {
+                            keys,
+                            consistency,
+                            ack: ack_tx,
+                        })
+                        .await
+                        .map_err(|_| UNAVAILABLE_CODE.to_string())?;
+                    let result = match ack_rx.await {
+                        Ok(res) => res,
+                        Err(_) => return Err(UNAVAILABLE_CODE.to_string()),
+                    };
+                    match result {
+                        // A multi-get's answer rides in `multi` (values +
+                        // applied index); `value`/`result` stay absent.
+                        Ok((values, applied_index)) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint: None,
+                            result: None,
+                            multi: Some((values, applied_index)),
+                            index: None,
+                        }),
+                        Err(ArachneError::NotLeader { leader_hint }) => Ok(ForwardOutcome {
+                            value: None,
+                            leader_hint,
+                            result: None,
+                            multi: None,
+                            index: None,
+                        }),
+                        Err(e) => Err(stable_code(&e).to_string()),
                     }
                 }
             }
@@ -254,6 +482,24 @@ pub enum Command {
         /// up after apply (which would mis-read a concurrent same-batch write).
         ack: oneshot::Sender<Result<ApplyOutcome, ArachneError>>,
     },
+    /// Propose a command and reply with the **effective index** of the write
+    /// (Phase 2): the log index of the entry that actually established it, or
+    /// the original index on a deduped replay.
+    ///
+    /// Same proposal path and validation as [`Command::Propose`]; only the
+    /// reply shape differs. The index comes from the apply task's write-back
+    /// pipeline — it is never obtained by re-reading the state machine after
+    /// apply (that would return the last same-batch writer's index).
+    ProposeWithIndex {
+        /// The encoded state-machine command.
+        cmd: Vec<u8>,
+        /// The session client id (propsol §2.3).
+        client_id: u64,
+        /// The session sequence number.
+        seq_no: u64,
+        /// Reply channel: `Ok(effective_index)` once applied.
+        ack: oneshot::Sender<Result<LogIndex, ArachneError>>,
+    },
     /// Read this node's applied state (stale read, propsol N1).
     GetStale {
         /// The key to read.
@@ -286,6 +532,18 @@ pub enum Command {
         /// Reply channel: `(entries, applied_index, truncated)` where
         /// `truncated` means more keys existed past `limit`.
         ack: oneshot::Sender<Result<(Vec<(Vec<u8>, Vec<u8>)>, LogIndex, bool), ArachneError>>,
+    },
+    /// Batched exact-key read (`multi_get`). `Stale` is served on a worker
+    /// directly from this node's state machine (no quorum); `Linearizable`
+    /// joins the ReadIndex gate as a `Many` pending read.
+    MultiGet {
+        /// The keys to read, in caller order.
+        keys: Vec<Vec<u8>>,
+        /// The requested consistency mode.
+        consistency: ReadConsistency,
+        /// Reply channel: values (input order, `None` = absent) plus the
+        /// applied index observed under the same read lock.
+        ack: oneshot::Sender<Result<(Vec<Option<Vec<u8>>>, LogIndex), ArachneError>>,
     },
     /// Register a watch over a prefix (M4/P2, designs D2/D3/D5).
     ///
@@ -335,6 +593,23 @@ pub enum Command {
         /// Reply channel with `(leader id, address)` if a leader is known.
         ack: oneshot::Sender<Option<(NodeId, SocketAddr)>>,
     },
+    /// Wait until this node's **state machine** has applied at least `index`
+    /// (Phase 3). Purely local: no redirect, no quorum, so a minority follower
+    /// can serve it. `index == 0` is a no-op that replies with the current
+    /// applied index immediately.
+    ///
+    /// The wait is event-driven: the apply task's progress change wakes the
+    /// actor, which resolves waiters after `absorb_progress`. `deadline` is the
+    /// caller's deadline (the client-side timeout is primary; the actor-side
+    /// check is a safety net evaluated on progress/tick, never a poll loop).
+    WaitApplied {
+        /// The log index whose application is awaited.
+        index: LogIndex,
+        /// Absolute deadline after which the wait replies `Timeout`.
+        deadline: Instant,
+        /// Reply channel: the observed applied index (`>= index` on success).
+        ack: oneshot::Sender<Result<LogIndex, ArachneError>>,
+    },
 }
 
 /// Configuration for a [`Runtime`].
@@ -366,14 +641,53 @@ enum SessionBand {
     Fresh,
 }
 
+/// What a pending proposal will reply with once its entry is applied.
+///
+/// A single enum keeps the proposal's reply shape tied to the command that
+/// created it, so an outcome reply can never be answered with an index (or
+/// vice versa).
+enum PendingReply {
+    /// [`Command::Propose`]: the per-entry apply outcome.
+    Outcome(oneshot::Sender<Result<ApplyOutcome, ArachneError>>),
+    /// [`Command::ProposeWithIndex`]: the effective index of the write.
+    Index(oneshot::Sender<Result<LogIndex, ArachneError>>),
+}
+
+impl PendingReply {
+    /// Reply with the applied outcome and its effective index, matching the
+    /// shape the caller asked for.
+    fn send_applied(self, outcome: ApplyOutcome, effective_index: LogIndex) {
+        match self {
+            PendingReply::Outcome(ack) => {
+                let _ = ack.send(Ok(outcome));
+            }
+            PendingReply::Index(ack) => {
+                let _ = ack.send(Ok(effective_index));
+            }
+        }
+    }
+
+    /// Reply with a failure (timeout, shutdown, apply-task failure).
+    fn send_error(self, error: ArachneError) {
+        match self {
+            PendingReply::Outcome(ack) => {
+                let _ = ack.send(Err(error));
+            }
+            PendingReply::Index(ack) => {
+                let _ = ack.send(Err(error));
+            }
+        }
+    }
+}
+
 /// A proposal awaiting commit+apply.
 struct Pending {
     client_id: u64,
     seq_no: u64,
-    /// Reply channel. M1: the `Ok` half now carries the per-entry
+    /// Reply channel/kind. M1: the `Ok` half carries the per-entry
     /// [`ApplyOutcome`] (written back by the apply task), so the client never
-    /// has to look the result up after apply.
-    ack: Option<oneshot::Sender<Result<ApplyOutcome, ArachneError>>>,
+    /// has to look the result up after apply. Phase 2 adds the index shape.
+    ack: Option<PendingReply>,
     deadline: Instant,
     /// The log index carrying this proposal's entry, once the actor has handed
     /// it to the apply task. `None` until then; the reply follows the applied
@@ -419,6 +733,38 @@ impl Watcher {
     }
 }
 
+/// What a pending linear read will reply with once its ReadIndex gate passes.
+///
+/// A single enum binds the request shape to its reply channel, so a `One`
+/// can never be answered with a `Many` reply (or vice versa).
+enum PendingReadKind {
+    /// A single-key linearizable read.
+    One {
+        key: Vec<u8>,
+        ack: oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>,
+    },
+    /// A batched linearizable read: values in input order + one applied index.
+    Many {
+        keys: Vec<Vec<u8>>,
+        ack: oneshot::Sender<Result<(Vec<Option<Vec<u8>>>, LogIndex), ArachneError>>,
+    },
+}
+
+impl PendingReadKind {
+    /// Reply with a failure (the request is being discarded). Consumes the
+    /// request so the reply channel is used exactly once.
+    fn send_error(self, error: ArachneError) {
+        match self {
+            PendingReadKind::One { ack, .. } => {
+                let _ = ack.send(Err(error));
+            }
+            PendingReadKind::Many { ack, .. } => {
+                let _ = ack.send(Err(error));
+            }
+        }
+    }
+}
+
 /// A linearizable (ReadIndex) read awaiting quorum confirmation and apply
 /// (propsol §5.4).
 struct PendingRead {
@@ -426,21 +772,42 @@ struct PendingRead {
     /// `None` = not yet stamped into a round (C3 coalescing pending); `Some(t)`
     /// = stamped with round token `t` and awaiting quorum confirmation.
     token: Option<NonZeroU64>,
-    /// The key to read once the read index is applied.
-    key: Vec<u8>,
-    /// Reply channel, taken exactly once on resolution.
-    ack: Option<oneshot::Sender<Result<Option<Vec<u8>>, ArachneError>>>,
+    /// The request shape and reply channel.
+    kind: PendingReadKind,
     /// Deadline for the current wait (quorum round or apply window).
     deadline: Instant,
     /// The quorum-confirmed read index, once raft reports it (`None` until then).
     read_index: Option<LogIndex>,
     /// How many times this read has been issued (`1` initially; one retry allowed).
     attempts: u8,
+    /// Gate-1 MF2 reservation for a `Many` request's key bytes. Held for the
+    /// whole pending window; `Drop` releases it on resolve/timeout/failure.
+    _budget: Option<MultiGetBudgetGuard>,
+}
+
+/// A local `wait_applied` waiter (Phase 3, design §5.4).
+///
+/// Resolved from the actor's synchronous drive cycle against the **state
+/// machine's** applied index (Gate-1 Q6 — not raft's possibly-ahead view). No
+/// state-machine lock is held across an await: the actor reads the index once
+/// per cycle, then operations on these waiters are pure.
+struct PendingApplied {
+    /// The index the caller is waiting for.
+    index: LogIndex,
+    /// Absolute deadline (caller-supplied; the client-side timeout is primary).
+    deadline: Instant,
+    /// Reply channel. `None` only transiently while being drained; a closed
+    /// receiver means the caller dropped/cancelled and the waiter is pruned.
+    ack: Option<oneshot::Sender<Result<LogIndex, ArachneError>>>,
 }
 
 /// Upper bound on concurrent pending ReadIndex reads (propsol §4.1/§7: 4096).
 /// Beyond this, new reads are rejected with `Busy`.
 const MAX_PENDING_READS: usize = 4096;
+
+/// Upper bound on concurrent `wait_applied` waiters per node (design §5.4).
+/// Beyond this, new waits are rejected with `Busy` (retryable).
+const MAX_PENDING_APPLIED_WAITS: usize = 4096;
 
 /// How many apply batches may sit in the channel in front of the apply task.
 ///
@@ -571,13 +938,16 @@ struct ApplyTask {
     progress: watch::Sender<ApplyProgress>,
     applied_bytes_total: u64,
     failed: Option<String>,
-    /// Per-entry outcomes, applied → actor. One `(LogIndex, ApplyOutcome)` per
-    /// applied entry; the actor buffers them in `received_outcomes` and uses
-    /// them to answer the matching [`Pending`] (M1 write-back). Bounded so a
+    /// Per-entry outcomes, applied → actor. One `(entry_index, ApplyOutcome,
+    /// effective_index)` per applied entry; the actor buffers them in
+    /// `received_outcomes` and uses them to answer the matching [`Pending`]
+    /// (M1 write-back). `effective_index` is the index the write actually
+    /// established (the original index on a deduped replay), so an
+    /// index-returning write never re-reads the store after apply. Bounded so a
     /// slow actor cannot grow memory without bound; a full channel simply
     /// backpressures apply (raft's applied index lags the apply task, exactly
     /// as it already does against the applies channel).
-    outcomes: mpsc::Sender<(LogIndex, ApplyOutcome)>,
+    outcomes: mpsc::Sender<(LogIndex, ApplyOutcome, LogIndex)>,
     /// Per-batch write-set watch events, applied → actor (M4/P2, design D1).
     /// **Independent** of `outcomes` so watch delivery never couples to a
     /// write's response latency or the `received_outcomes` buffer.
@@ -655,13 +1025,14 @@ impl ApplyTask {
                 // delivery here). They travel on an independent channel so
                 // watch never couples to a reply's latency.
                 for (index, data) in batch.entries {
-                    let (outcome, events) = match self.sm.apply_with_events(index, &data) {
-                        Ok(pair) => pair,
+                    let (outcome, effective_index, events) =
+                        match self.sm.apply_with_events_and_index(index, &data) {
+                            Ok(triple) => triple,
                         Err(e) => {
                             return self.fail(format!("state machine apply failed: {e}"));
                         }
                     };
-                    if let Err(_) = self.outcomes.send((index, outcome)).await {
+                    if let Err(_) = self.outcomes.send((index, outcome, effective_index)).await {
                         // Actor dropped (runtime going away): nothing more to
                         // deliver, and the state is already durable in `sm`.
                         return false;
@@ -740,9 +1111,10 @@ enum Outcome {
     Command(Option<Command>),
     /// A background snapshot fetch finished (rev T).
     SnapshotFetched(Option<SnapshotFetchDone>),
-    /// A per-entry outcome arrived from the apply task (M1). The index names
-    /// the entry; the `ApplyOutcome` is what the matching [`Pending`] replies with.
-    AppliedOutcome((LogIndex, ApplyOutcome)),
+    /// A per-entry outcome arrived from the apply task (M1). The first index
+    /// names the entry; the outcome and the effective index are what the
+    /// matching [`Pending`] replies with.
+    AppliedOutcome((LogIndex, ApplyOutcome, LogIndex)),
     /// A per-batch write-set event batch arrived from the apply task (M4/P2).
     /// The actor folds the burst, filters each watcher by prefix + strict
     /// `filter`, and enqueues — disconnecting a watcher that cannot keep up
@@ -762,6 +1134,10 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     /// lock that does not contend with writes. Held as an `Arc` so the actor and
     /// the apply task both own a handle to the same store.
     sm: Arc<KvStateMachine>,
+    /// Shared in-flight `multi_get` byte budget (Gate-1 MF2). The local
+    /// `Handle`s, the `ForwardCommandSink`, and this actor all reserve from the
+    /// same budget.
+    multi_get_budget: Arc<MultiGetBudget>,
     /// The apply task's published progress.
     progress: watch::Receiver<ApplyProgress>,
     /// Woken by the storage when an offloaded flush completes (propsol P).
@@ -822,6 +1198,10 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     pending_transfer: Vec<PendingTransfer>,
     /// Linearizable reads awaiting quorum confirmation / apply (propsol §5.4).
     pending_reads: Vec<PendingRead>,
+    /// Local `wait_applied` waiters (Phase 3). Resolved on every drive cycle
+    /// against the state machine's applied index; bounded by
+    /// [`MAX_PENDING_APPLIED_WAITS`].
+    pending_applied: Vec<PendingApplied>,
     /// Wait timeout for a ReadIndex round / apply window (`2 × election_timeout`).
     read_index_timeout: Duration,
     /// Monotonic source of ReadIndex tokens (8-byte big-endian `ctx`).
@@ -868,11 +1248,12 @@ pub struct Runtime<T: Transport + Clone + ForwardTransport, Tr: TransportRx> {
     command_sink: Arc<ForwardCommandSink>,
     /// Per-entry outcomes, applied → actor (M1). The sender was handed to the
     /// apply task; this receiver is drained by the actor loop below.
-    outcomes: mpsc::Receiver<(LogIndex, ApplyOutcome)>,
-    /// Outcomes buffered by log index (applied but not yet answered). Drained
-    /// when the matching [`Pending`] is resolved or the index goes stale; kept
-    /// bounded by the outstanding-proposal count (one index, one proposal).
-    received_outcomes: BTreeMap<LogIndex, ApplyOutcome>,
+    outcomes: mpsc::Receiver<(LogIndex, ApplyOutcome, LogIndex)>,
+    /// Outcomes buffered by *entry* index (applied but not yet answered):
+    /// `(outcome, effective_index)`. Drained when the matching [`Pending`] is
+    /// resolved or the index goes stale; kept bounded by the
+    /// outstanding-proposal count (one index, one proposal).
+    received_outcomes: BTreeMap<LogIndex, (ApplyOutcome, LogIndex)>,
     /// Write-set watch events, applied → actor (M4/P2, design D1). The apply
     /// task delivers batches non-blockingly; the actor drains them and polls
     /// every registered watcher against its prefix + filter.
@@ -1006,12 +1387,19 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         raft_to_node.insert(config.self_raft_id, config.self_node_id.clone());
 
         let (tx, commands) = mpsc::channel(1024);
-        let command_sink = Arc::new(ForwardCommandSink::new(tx.clone()));
+        // One shared budget for this node: every local handle, the forward
+        // sink, and the actor's pending-read registration reserve from it.
+        let multi_get_budget = Arc::new(MultiGetBudget::new());
+        let command_sink = Arc::new(ForwardCommandSink::new(
+            tx.clone(),
+            Arc::clone(&multi_get_budget),
+        ));
         let handle = Handle::new_local(
             config.self_node_id.clone(),
             tx,
             forwarder,
             &config.profile,
+            Arc::clone(&multi_get_budget),
         );
         // One fetch at a time: raft hands one snapshot at a time, so a deep
         // queue would only hide a bug.
@@ -1025,6 +1413,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             apply_task: Some(apply_task),
             applies,
             sm,
+            multi_get_budget,
             progress,
             durability,
             stop: Arc::clone(&stop),
@@ -1059,9 +1448,8 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             pending_conf: Vec::new(),
             pending_transfer: Vec::new(),
             pending_reads: Vec::new(),
-            read_index_timeout: Duration::from_millis(
-                config.profile.read_index_timeout_ms.max(1),
-            ),
+            pending_applied: Vec::new(),
+            read_index_timeout: Duration::from_millis(config.profile.read_index_timeout_ms.max(1)),
             next_read_token: 1,
             propose_timeout: Duration::from_millis(config.profile.election_timeout_ms.max(1)),
             session_clock: None,
@@ -1126,7 +1514,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 _ = tick.tick() => Outcome::Tick,
                 out = self.outcomes.recv() => match out {
                     // A per-entry outcome: buffer it for `reply_pendings`.
-                    Some((index, outcome)) => Outcome::AppliedOutcome((index, outcome)),
+                    Some((index, outcome, effective_index)) => {
+                        Outcome::AppliedOutcome((index, outcome, effective_index))
+                    }
                     // The apply task is gone (its sender dropped), so there can
                     // be no more outcomes. Identical fail-stop to the
                     // `Progress(Err(_))` branch (the task publishes its failure
@@ -1179,9 +1569,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // M1). Fold the burst into one buffer + one cycle so a replay
                 // does not force one `drive_cycle` per entry.
                 Outcome::AppliedOutcome(out) => {
-                    self.received_outcomes.insert(out.0, out.1);
+                    self.received_outcomes.insert(out.0, (out.1, out.2));
                     while let Ok(out) = self.outcomes.try_recv() {
-                        self.received_outcomes.insert(out.0, out.1);
+                        self.received_outcomes.insert(out.0, (out.1, out.2));
                     }
                 }
                 // M4/P2 watch: fold the whole event burst, then distribute each
@@ -1328,6 +1718,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
 
         self.resolve_transfers();
         self.resolve_reads();
+        self.resolve_applied_waits();
         self.reply_pendings();
         self.maybe_collect_sessions();
         if !self.maybe_snapshot() {
@@ -1372,7 +1763,8 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
 
     /// Bytes committed but not yet applied — the backpressure signal (Q7).
     fn apply_backlog_bytes(&self) -> u64 {
-        self.sent_bytes_total.saturating_sub(self.applied_bytes_total)
+        self.sent_bytes_total
+            .saturating_sub(self.applied_bytes_total)
     }
 
     /// Stage committed entries and dispatch as much as log order allows.
@@ -1409,9 +1801,11 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // `apply_conf_change` report the failure with its own error.
                 continue;
             };
-            if let Some(p) = self.pending_conf.iter_mut().find(|p| {
-                p.index.is_none() && p.node_id == node_id && p.change_type == change_type
-            }) {
+            if let Some(p) = self
+                .pending_conf
+                .iter_mut()
+                .find(|p| p.index.is_none() && p.node_id == node_id && p.change_type == change_type)
+            {
                 p.index = Some(*index);
             }
         }
@@ -1760,60 +2154,13 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 client_id,
                 seq_no,
                 ack,
-            } => {
-                if self.node.leader_id() != self.raft_id {
-                    let _ = ack.send(Err(ArachneError::NotLeader {
-                        leader_hint: self.hint(),
-                    }));
-                    return;
-                }
-                // Q7: the bound is on committed-but-unapplied bytes — the log
-                // the client cannot see yet — so a lagging apply path sheds
-                // proposals instead of growing without bound (propsol N).
-                if self.apply_backlog_bytes() >= self.proposal_queue_bytes {
-                    self.metrics.inc_proposal_busy();
-                    let _ = ack.send(Err(ArachneError::Busy));
-                    return;
-                }
-                // Session bands (propsol v0.2.15 R1): a retry past the TTL but
-                // inside the grace window is answered "result unknown" instead
-                // of being proposed again.
-                let band = self.session_band(client_id, seq_no);
-                if band == SessionBand::Grace {
-                    let _ = ack.send(Err(ArachneError::SessionExpired));
-                    return;
-                }
-                // `max_sessions` (propsol v0.2.15 R2): only a *new* session can be
-                // turned away, and only before proposing — a committed entry
-                // cannot be refused by the state machine without breaking
-                // replica agreement, and refusing to record it would turn a
-                // retry into a fresh command. GC is what makes the cap
-                // recoverable, which is why the two land together.
-                if band == SessionBand::Fresh
-                    && self.max_sessions > 0
-                    && self.live_sessions >= self.max_sessions
-                {
-                    let _ = ack.send(Err(ArachneError::SessionTableFull));
-                    return;
-                }
-                match self.node.propose(&cmd) {
-                    Ok(()) => self.pending.push(Pending {
+            } => self.start_proposal(cmd, client_id, seq_no, PendingReply::Outcome(ack)),
+            Command::ProposeWithIndex {
+                cmd,
                         client_id,
                         seq_no,
-                        ack: Some(ack),
-                        deadline: Instant::now() + self.propose_timeout,
-                        index: None,
-                    }),
-                    Err(_) => {
-                        // A dropped proposal means we are (effectively) not the
-                        // leader any more; never hang — report and let the
-                        // client redirect.
-                        let _ = ack.send(Err(ArachneError::NotLeader {
-                            leader_hint: self.hint(),
-                        }));
-                    }
-                }
-            }
+                ack,
+            } => self.start_proposal(cmd, client_id, seq_no, PendingReply::Index(ack)),
             Command::Membership { ack } => {
                 let result = self
                     .node
@@ -1947,7 +2294,12 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // read-index gate, whole path safe to leave the actor thread.
                 self.spawn_read_reply_with_index(key, ack);
             }
-            Command::GetStaleRange { start, end, limit, ack } => {
+            Command::GetStaleRange {
+                start,
+                end,
+                limit,
+                ack,
+            } => {
                 // Consistent range stale read (M2-P1A): everything in `[start,
                 // end)` plus the applied index, under one read lock. Same weak
                 // local path as the other stale reads — off-actor reply (P4
@@ -2018,15 +2370,146 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 // read). `token` is a placeholder until that commit.
                  self.pending_reads.push(PendingRead {
                      token: None,
-                     key,
-                     ack: Some(ack),
+                    kind: PendingReadKind::One { key, ack },
                      deadline: Instant::now() + self.read_index_timeout,
                      read_index: None,
                      attempts: 1,
+                    _budget: None,
                  });
+            }
+            Command::MultiGet {
+                keys,
+                consistency,
+                ack,
+            } => {
+                // Gate-1 Q7: one handled command, regardless of key count.
+                self.metrics.inc_multi_get_commands();
+                match consistency {
+                    ReadConsistency::Stale => {
+                        // Whole path is local and has no read-index gate, so it
+                        // can leave the actor (same shape as `GetStale`).
+                        self.spawn_multi_get(keys, ack);
+                    }
+                    ReadConsistency::Linearizable => {
+                        // Same gate as `Command::Read`.
+                        if self.node.leader_id() != self.raft_id {
+                            let _ = ack.send(Err(ArachneError::NotLeader {
+                                leader_hint: self.hint(),
+                            }));
+                            return;
+                        }
+                        if self.pending_reads.len() >= MAX_PENDING_READS {
+                            let _ = ack.send(Err(ArachneError::Busy));
+                            return;
+                        }
+                        // Gate-1 MF2: reserve the key payload for the whole
+                        // pending window. `_budget` is held by the entry and
+                        // released on resolve/timeout/failure. This reserve is
+                        // defense-in-depth: the Handle/sink guard is already
+                        // held until the reply and therefore contains this
+                        // interval, so on current paths this cannot be the
+                        // first reservation to fail (see `MultiGetBudget`).
+                        let bytes = keys.iter().map(|k| k.len() as u64).sum::<u64>();
+                        let Some(budget) = self.multi_get_budget.try_reserve(bytes) else {
+                            let _ = ack.send(Err(ArachneError::Busy));
+                            return;
+                        };
+                        self.pending_reads.push(PendingRead {
+                            token: None,
+                            kind: PendingReadKind::Many { keys, ack },
+                            deadline: Instant::now() + self.read_index_timeout,
+                            read_index: None,
+                            attempts: 1,
+                            _budget: Some(budget),
+                        });
+                    }
+                }
             }
             Command::LeaderHint { ack } => {
                 let _ = ack.send(self.hint());
+            }
+            Command::WaitApplied {
+                index,
+                deadline,
+                ack,
+            } => {
+                // Gate-1 Q6: the authoritative applied index is the **state
+                // machine's** (it includes ConfChange no-op placeholders, with
+                // no holes), not raft's `applied`, which may lead it by the
+                // work still queued for the apply task.
+                let applied = self.sm.applied_index();
+                if index == 0 || applied >= index {
+                    let _ = ack.send(Ok(applied));
+                    return;
+                }
+                // Backpressure: like the pending-read queue, a full waiter queue
+                // is retryable (`Busy`), never an unbounded growth.
+                if self.pending_applied.len() >= MAX_PENDING_APPLIED_WAITS {
+                    let _ = ack.send(Err(ArachneError::Busy));
+                    return;
+                }
+                self.pending_applied.push(PendingApplied {
+                    index,
+                    deadline,
+                    ack: Some(ack),
+                });
+            }
+        }
+    }
+
+    /// Register a proposal (`Propose` / `ProposeWithIndex`) with the actor.
+    ///
+    /// Both commands share every gate (leader, proposal backlog, session
+    /// bands/cap); only the reply shape differs, so the logic lives here once.
+    fn start_proposal(&mut self, cmd: Vec<u8>, client_id: u64, seq_no: u64, ack: PendingReply) {
+        if self.node.leader_id() != self.raft_id {
+            ack.send_error(ArachneError::NotLeader {
+                leader_hint: self.hint(),
+            });
+            return;
+        }
+        // Q7: the bound is on committed-but-unapplied bytes — the log the
+        // client cannot see yet — so a lagging apply path sheds proposals
+        // instead of growing without bound (propsol N).
+        if self.apply_backlog_bytes() >= self.proposal_queue_bytes {
+            self.metrics.inc_proposal_busy();
+            ack.send_error(ArachneError::Busy);
+            return;
+        }
+        // Session bands (propsol v0.2.15 R1): a retry past the TTL but inside
+        // the grace window is answered "result unknown" instead of being
+        // proposed again.
+        let band = self.session_band(client_id, seq_no);
+        if band == SessionBand::Grace {
+            ack.send_error(ArachneError::SessionExpired);
+            return;
+        }
+        // `max_sessions` (propsol v0.2.15 R2): only a *new* session can be
+        // turned away, and only before proposing — a committed entry cannot be
+        // refused by the state machine without breaking replica agreement, and
+        // refusing to record it would turn a retry into a fresh command. GC is
+        // what makes the cap recoverable, which is why the two land together.
+        if band == SessionBand::Fresh
+            && self.max_sessions > 0
+            && self.live_sessions >= self.max_sessions
+        {
+            ack.send_error(ArachneError::SessionTableFull);
+            return;
+        }
+        match self.node.propose(&cmd) {
+            Ok(()) => self.pending.push(Pending {
+                client_id,
+                seq_no,
+                ack: Some(ack),
+                deadline: Instant::now() + self.propose_timeout,
+                index: None,
+            }),
+            Err(_) => {
+                // A dropped proposal means we are (effectively) not the leader
+                // any more; never hang — report and let the client redirect.
+                ack.send_error(ArachneError::NotLeader {
+                    leader_hint: self.hint(),
+                });
             }
         }
     }
@@ -2074,14 +2557,14 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                         if now >= p.deadline
                             && let Some(ack) = p.ack.take()
                         {
-                            let _ = ack.send(Err(ArachneError::Timeout));
+                            ack.send_error(ArachneError::Timeout);
                         }
                         continue;
-                    },
+                    }
                 };
-                if let Some(outcome) = self.received_outcomes.get(&index) {
+                if let Some((outcome, effective_index)) = self.received_outcomes.get(&index) {
                     if let Some(ack) = p.ack.take() {
-                        let _ = ack.send(Ok(outcome.clone()));
+                        ack.send_applied(outcome.clone(), *effective_index);
                     }
                     // The index is now answered; drop the buffered outcome so
                     // `received_outcomes` stays bounded (one index, one
@@ -2095,7 +2578,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                     // rather than hang.
                     if now >= p.deadline {
                         if let Some(ack) = p.ack.take() {
-                            let _ = ack.send(Err(ArachneError::Timeout));
+                            ack.send_error(ArachneError::Timeout);
                         }
                     } else {
                         still.push(p);
@@ -2103,7 +2586,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 }
             } else if now >= p.deadline {
                 if let Some(ack) = p.ack.take() {
-                    let _ = ack.send(Err(ArachneError::Timeout));
+                    ack.send_error(ArachneError::Timeout);
                 }
             } else {
                 still.push(p);
@@ -2114,11 +2597,8 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         // proposal is gone (answered above, or timed out), its outcome is
         // orphaned (applied-after-timeout); prune so `received_outcomes` is
         // bounded by the count of outstanding proposals.
-        let live: std::collections::HashSet<_> = self
-            .pending
-            .iter()
-            .filter_map(|p| p.index)
-            .collect();
+        let live: std::collections::HashSet<_> =
+            self.pending.iter().filter_map(|p| p.index).collect();
         self.received_outcomes
             .retain(|index, _| live.contains(index));
     }
@@ -2130,10 +2610,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
     /// nowhere to go: removing the only voter would leave an empty
     /// configuration, which raft cannot represent.
     fn choose_transferee(&self) -> Result<RaftId, ArachneError> {
-        let voters = self
-            .node
-            .voter_ids()
-            .map_err(|e| ArachneError::Unrecoverable(format!("reading the voter set failed: {e}")))?;
+        let voters = self.node.voter_ids().map_err(|e| {
+            ArachneError::Unrecoverable(format!("reading the voter set failed: {e}"))
+        })?;
         voters
             .into_iter()
             .filter(|v| *v != self.raft_id)
@@ -2201,11 +2680,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         let mut still = Vec::with_capacity(drained.len());
         for mut r in drained {
             if self.node.leader_id() != self.raft_id {
-                let _ = r.ack.take().map(|ack| {
-                    ack.send(Err(ArachneError::NotLeader {
-                        leader_hint: self.hint(),
-                    }))
-                });
+                let hint = self.hint();
+                r.kind
+                    .send_error(ArachneError::NotLeader { leader_hint: hint });
                 continue;
             }
 
@@ -2214,13 +2691,12 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 Some(idx) if self.applied_index >= idx
             );
             if applied {
-                if let Some(ack) = r.ack.take() {
                     // The actor-side gate above (`self.applied_index >=
                     // read_index`) is the authority. As a redundant safety net,
-                    // confirm the shared state machine's published version is
-                    // at least the confirmed read index — the SM's applied index
-                    // is monotonic and the gate already implies this, so the
-                    // alert must never fire.
+                // confirm the shared state machine's published version is at
+                // least the confirmed read index — the SM's applied index is
+                // monotonic and the gate already implies this, so the alert
+                // must never fire.
                     if let Some(read_index) = r.read_index {
                         let version = self.sm.applied_index();
                         if version < read_index {
@@ -2232,25 +2708,29 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                             );
                         }
                     }
-                    // Read the value directly from the shared state machine:
-                    // a read lock that does not contend with the apply task's
-                    // write lock (2.2 drops the per-linear-read `reads` mpsc hop).
-                    // P4 4.1: the version alert (actor-side, on `applied_index`)
-                    // stays on the actor; only the `sm.get` + oneshot reply moves
-                    // to a spawned worker, so linear reads no longer serialise
-                    // behind the actor's current-thread tick.
-                    let key = std::mem::take(&mut r.key);
+                // Read directly from the shared state machine on a worker: a
+                // read lock that does not contend with the apply task's write
+                // lock (2.2 drops the per-linear-read `reads` mpsc hop). P4
+                // 4.1: the version alert stays on the actor; only the SM read +
+                // oneshot reply moves off-thread. Dispatch by kind so a `Many`
+                // request never tries to reply with a single value.
+                match r.kind {
+                    PendingReadKind::One { key, ack } => {
                     self.spawn_read_reply(key, ack);
+                }
+                    PendingReadKind::Many { keys, ack } => {
+                        self.spawn_multi_get(keys, ack);
+                    }
                 }
                 continue;
             }
 
         if now >= r.deadline {
             if r.attempts <= 1 {
-                // One retry: mark the read for re-issue. The next `drive_cycle`
-                // batch commit stamps it with a fresh batch token and fires a
-                // new ReadIndex round (C3: retries ride the same cycle-level
-                // coalescing as fresh reads).
+                    // One retry: mark the read for re-issue. The next
+                    // `drive_cycle` batch commit stamps it with a fresh batch
+                    // token and fires a new ReadIndex round (C3: retries ride
+                    // the same cycle-level coalescing as fresh reads).
                 r.attempts += 1;
                 r.read_index = None;
                 r.token = None;
@@ -2258,7 +2738,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 still.push(r);
             } else {
                 self.metrics.inc_read_index_timeout();
-                let _ = r.ack.take().map(|ack| ack.send(Err(ArachneError::Timeout)));
+                    r.kind.send_error(ArachneError::Timeout);
             }
             continue;
         }
@@ -2267,6 +2747,53 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         }
          self.pending_reads = still;
      }
+
+    /// Resolve local `wait_applied` waiters (Phase 3, design §5.4).
+    ///
+    /// Reads the **state machine's** applied index once per cycle (short read
+    /// lock, released immediately; no lock is held across an await), then for
+    /// each waiter:
+    /// * `applied >= index` → `Ok(applied)` (may be `>= index`);
+    /// * caller dropped/cancelled → prune (no send);
+    /// * deadline passed → `Timeout`;
+    /// * otherwise keep until the next progress event/tick.
+    ///
+    /// Event-driven, never polled: the apply task's progress change wakes the
+    /// actor and every such wake ends in a `drive_cycle`.
+    fn resolve_applied_waits(&mut self) {
+        let applied = self.sm.applied_index();
+        let now = Instant::now();
+        // Drain so the `&mut self.pending_applied` borrow is released before we
+        // touch `self.sm`/`self.hint()`-style helpers; the retained waits are
+        // restored at the end.
+        let drained: Vec<PendingApplied> = self.pending_applied.drain(..).collect();
+        let mut still = Vec::with_capacity(drained.len());
+        for mut wait in drained {
+            let Some(ack) = wait.ack.take() else {
+                continue;
+            };
+            if applied >= wait.index {
+                let _ = ack.send(Ok(applied));
+                continue;
+            }
+            // Cancellation safety: the caller dropped the future, so the
+            // receiver is closed. Prune it now instead of holding the entry
+            // until its deadline.
+            if ack.is_closed() {
+                continue;
+            }
+            if now >= wait.deadline {
+                let _ = ack.send(Err(ArachneError::Timeout));
+                continue;
+            }
+            still.push(PendingApplied {
+                index: wait.index,
+                deadline: wait.deadline,
+                ack: Some(ack),
+            });
+        }
+        self.pending_applied = still;
+    }
 
     /// P4 4.1 — hand a read's SM value-fetch and oneshot reply to a worker
     /// task, off the actor's current-thread loop.
@@ -2284,9 +2811,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
     ) {
         let sm = Arc::clone(&self.sm);
         tokio::spawn(async move {
-            let value: Result<Option<Vec<u8>>, ArachneError> = sm
-                .get(&key)
-                .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+            let value: Result<Option<Vec<u8>>, ArachneError> = sm.get(&key).map_err(|e| {
+                ArachneError::Unrecoverable(format!("state machine read failed: {e}"))
+            });
             let _ = ack.send(value);
         });
     }
@@ -2306,9 +2833,9 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
     ) {
         let sm = Arc::clone(&self.sm);
         tokio::spawn(async move {
-            let read = sm
-                .get_with_index(&key)
-                .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+            let read = sm.get_with_index(&key).map_err(|e| {
+                ArachneError::Unrecoverable(format!("state machine read failed: {e}"))
+            });
             let reply = match read {
                 Ok((None, _)) => Ok(None),
                 Ok((Some(val), Some(index))) => Ok(Some((val, index))),
@@ -2336,9 +2863,38 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
     ) {
         let sm = Arc::clone(&self.sm);
         tokio::spawn(async move {
-            let reply = sm
-                .get_range_with_index(&start, &end, limit)
-                .map_err(|e| ArachneError::Unrecoverable(format!("state machine read failed: {e}")));
+            let reply = sm.get_range_with_index(&start, &end, limit).map_err(|e| {
+                ArachneError::Unrecoverable(format!("state machine read failed: {e}"))
+            });
+            let _ = ack.send(reply);
+        });
+    }
+
+    /// Off-actor worker for [`Command::MultiGet`] (both `Stale` and the
+    /// post-gate `Linearizable` dispatch path).
+    ///
+    /// The state-machine read takes one read lock, reads `applied` first, and
+    /// clones the batch under it, so values and `applied_index` are coherent.
+    /// `KvError::ResultTooLarge` is a caller-visible `InvalidArgument` (the
+    /// remedy is to split the batch, not to retry unchanged).
+    fn spawn_multi_get(
+        &self,
+        keys: Vec<Vec<u8>>,
+        ack: oneshot::Sender<Result<(Vec<Option<Vec<u8>>>, LogIndex), ArachneError>>,
+    ) {
+        let sm = Arc::clone(&self.sm);
+        tokio::spawn(async move {
+            let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            let reply = match sm.multi_get(&key_refs) {
+                Ok((values, applied_index)) => Ok((values, applied_index)),
+                Err(KvError::ResultTooLarge) => Err(ArachneError::InvalidArgument(
+                    "multi_get result exceeds MAX_MULTI_GET_RESULT_BYTES (4 MiB); split the batch"
+                        .into(),
+                )),
+                Err(e) => Err(ArachneError::Unrecoverable(format!(
+                    "state machine read failed: {e}"
+                ))),
+            };
             let _ = ack.send(reply);
         });
     }
@@ -2419,13 +2975,19 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         }
         for mut p in self.pending.drain(..) {
             if let Some(ack) = p.ack.take() {
-                let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
+                ack.send_error(ArachneError::Unrecoverable(message.to_string()));
             }
         }
         // Also fail all in-flight ReadIndex reads (a fatal error means the
         // process is failing stop).
-        for mut r in self.pending_reads.drain(..) {
-            if let Some(ack) = r.ack.take() {
+        for r in self.pending_reads.drain(..) {
+            r.kind
+                .send_error(ArachneError::Unrecoverable(message.to_string()));
+        }
+        // And every local `wait_applied` waiter (Phase 3): a fail-stop can no
+        // longer make progress, so the waiters must not be left hanging.
+        for wait in self.pending_applied.drain(..) {
+            if let Some(ack) = wait.ack {
                 let _ = ack.send(Err(ArachneError::Unrecoverable(message.to_string())));
             }
         }
@@ -2538,8 +3100,7 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 if attempt > 0 {
                     // Back off a little: a peer that was busy, or a file that
                     // was momentarily unavailable, must not become a hot loop.
-                    tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt).min(8)))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt).min(8))).await;
                 }
                 result = match transport
                     .fetch_snapshot(node_id.clone(), index, term, &task_dest)
@@ -2572,9 +3133,10 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
     /// failure path here is simply "report failure and let raft retry": no
     /// metadata was restored that the storage cannot back.
     async fn finish_snapshot_fetch(&mut self, done: SnapshotFetchDone) {
-        let is_current = self.snapshot_fetch.as_ref().is_some_and(|f| {
-            f.held.from == done.from && f.held.index == done.index
-        });
+        let is_current = self
+            .snapshot_fetch
+            .as_ref()
+            .is_some_and(|f| f.held.from == done.from && f.held.index == done.index);
         if !is_current {
             // Superseded by a newer snapshot: drop the bytes and say nothing.
             let _ = std::fs::remove_file(&done.dest);
@@ -2673,8 +3235,10 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         self.metrics.set_leader_id(self.node.leader_id());
         self.metrics
             .set_is_leader(self.node.leader_id() == self.raft_id);
-        self.metrics.set_dropped_sends(self.node.dropped_send_count());
-        self.metrics.set_read_index_pending(self.pending_reads.len() as u64);
+        self.metrics
+            .set_dropped_sends(self.node.dropped_send_count());
+        self.metrics
+            .set_read_index_pending(self.pending_reads.len() as u64);
         self.metrics.set_session_count(self.live_sessions);
     }
 
@@ -2776,5 +3340,116 @@ where
             handle: Some(handle),
             stop: Arc::clone(&stop),
         })
+    }
+}
+
+#[cfg(test)]
+mod multi_get_budget_tests {
+    use super::*;
+
+    /// The shared budget refuses an over-limit reservation and releases every
+    /// RAII guard on drop (the cancellation/failure path).
+    #[test]
+    fn budget_enforces_limit_and_releases_on_drop() {
+        let budget = Arc::new(MultiGetBudget::new());
+        assert_eq!(budget.used(), 0);
+
+        let first = budget
+            .try_reserve(MAX_INFLIGHT_MULTI_GET_BYTES - 1)
+            .expect("under the cap");
+        assert_eq!(budget.used(), MAX_INFLIGHT_MULTI_GET_BYTES - 1);
+        assert!(
+            budget.try_reserve(2).is_none(),
+            "a reservation past the cap is refused"
+        );
+        let exact = budget.try_reserve(1).expect("exactly at the cap");
+        assert_eq!(budget.used(), MAX_INFLIGHT_MULTI_GET_BYTES);
+
+        drop(first);
+        assert_eq!(budget.used(), 1);
+        let after = budget.try_reserve(1).expect("freed bytes are reusable");
+        assert_eq!(budget.used(), 2);
+
+        drop(exact);
+        drop(after);
+        assert_eq!(budget.used(), 0, "all guards released their bytes");
+    }
+
+    /// `stable_code` is the wire half of the client's `code_to_error`: every
+    /// retryable/actionable error must map to its own stable token so a peer
+    /// never collapses it into terminal `Unrecoverable` (Gate-2 should-fix #4).
+    #[test]
+    fn stable_code_round_trip_tokens() {
+        assert_eq!(stable_code(&ArachneError::Busy), "busy");
+        assert_eq!(stable_code(&ArachneError::Timeout), "timeout");
+        assert_eq!(
+            stable_code(&ArachneError::QuorumUnavailable),
+            "quorum_unavailable"
+        );
+        assert_eq!(
+            stable_code(&ArachneError::InvalidArgument("bad".into())),
+            "invalid_argument"
+        );
+        assert_eq!(
+            stable_code(&ArachneError::Unsupported("old peer".into())),
+            "unsupported"
+        );
+    }
+
+    /// A forward to a runtime whose actor is already gone (listener still
+    /// bound, command receiver dropped) must surface the retryable
+    /// `"unavailable"` wire code, never a terminal `Unrecoverable`.
+    #[tokio::test]
+    async fn forward_sink_reports_unavailable_when_runtime_is_gone() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let sink = ForwardCommandSink::new(tx, Arc::new(MultiGetBudget::new()));
+        let result = sink
+            .sink(ForwardCommand::GetStale { key: b"k".to_vec() })
+            .await;
+        assert!(
+            matches!(result, Err(ref code) if code == UNAVAILABLE_CODE),
+            "a dead runtime sink must report the retryable unavailable code, got {result:?}"
+        );
+    }
+
+    /// A forwarded `multi_get` must preserve its requested consistency: the
+    /// sink must pass `Linearizable` through to the actor (never hardcode
+    /// `Stale`, which would bypass the leader's ReadIndex gate over the wire).
+    #[tokio::test]
+    async fn forward_sink_preserves_multi_get_consistency() {
+        let cases = [
+            (true, ReadConsistency::Linearizable),
+            (false, ReadConsistency::Stale),
+        ];
+        for (linearizable, expected) in cases {
+            let (tx, mut rx) = mpsc::channel(1);
+            let budget = Arc::new(MultiGetBudget::new());
+            let sink = ForwardCommandSink::new(tx, budget);
+            let keys = vec![b"a".to_vec(), b"b".to_vec()];
+            let task = tokio::spawn(async move {
+                sink.sink(ForwardCommand::MultiGet { keys, linearizable })
+                    .await
+            });
+
+            match rx.recv().await.expect("sink must send one command") {
+                Command::MultiGet {
+                    keys,
+                    consistency,
+                    ack,
+                } => {
+                    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+                    assert_eq!(
+                        consistency, expected,
+                        "linearizable={linearizable} must map to {expected:?}"
+                    );
+                    let values = vec![Some(b"1".to_vec()), None];
+                    ack.send(Ok((values.clone(), 7))).expect("reply");
+                    let outcome = task.await.expect("join").expect("sink ok");
+                    assert_eq!(outcome.multi, Some((values, 7)));
+                }
+                _ => panic!("expected Command::MultiGet"),
+            }
+        }
     }
 }

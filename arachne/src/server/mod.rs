@@ -222,10 +222,48 @@ impl Arachne {
         handle.get_stale_with_index(key).await
     }
 
+    /// Batched exact-key read (`multi_get`): values in input order plus one
+    /// applied index for the whole batch. Mirrors
+    /// [`Handle::multi_get`](crate::client::Handle::multi_get) for the
+    /// embedding facade.
+    pub async fn multi_get(
+        keys: &[&[u8]],
+        consistency: crate::ReadConsistency,
+    ) -> Result<crate::MultiGetResult, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.multi_get(keys, consistency).await
+    }
+
+    /// Wait until this node's state machine has applied at least `index`
+    /// (Phase 3). Mirrors [`Handle::wait_applied`]: local only, no redirect and
+    /// no quorum, so it works on a minority follower. `index == 0` is a no-op
+    /// returning the current applied index.
+    pub async fn wait_applied(
+        index: crate::Index,
+        timeout: std::time::Duration,
+    ) -> Result<crate::Index, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.wait_applied(index, timeout).await
+    }
+
+    /// Linearizable write that returns the effective log index of the write
+    /// (Phase 2). Mirrors [`Handle::put_with_index`].
+    pub async fn put_with_index(key: &[u8], value: &[u8]) -> Result<u64, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.put_with_index(key, value).await
+    }
+
     /// Delete a key (propose an empty value).
     pub async fn delete(key: &[u8]) -> Result<(), ArachneError> {
         let handle = Self::borrow().await?;
         handle.delete(key).await
+    }
+
+    /// Delete that returns the effective log index of the delete entry
+    /// (Phase 2). Mirrors [`Handle::delete_with_index`].
+    pub async fn delete_with_index(key: &[u8]) -> Result<u64, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.delete_with_index(key).await
     }
 
     /// Atomic multi-key write (M2-P1B): one command sets all `entries`
@@ -234,6 +272,15 @@ impl Arachne {
     pub async fn multi_put(entries: &[(&[u8], &[u8])]) -> Result<(), ArachneError> {
         let handle = Self::borrow().await?;
         handle.multi_put(entries).await
+    }
+
+    /// Atomic multi-key write that returns the shared effective log index of
+    /// the batch (Phase 2). Mirrors [`Handle::multi_put_with_index`].
+    pub async fn multi_put_with_index(
+        entries: &[(&[u8], &[u8])],
+    ) -> Result<u64, ArachneError> {
+        let handle = Self::borrow().await?;
+        handle.multi_put_with_index(entries).await
     }
 
     /// Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`,

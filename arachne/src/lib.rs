@@ -67,11 +67,15 @@ pub mod state_machine;
 pub mod storage;
 
 pub use client::ArachneError;
+pub use client::{MultiGetResult, ReadConsistency};
 pub use client::WatchSubscription;
 pub use metrics::Metrics;
 pub use runtime::{Command, Runtime, RuntimeConfig, RuntimeThread};
 pub use server::Arachne;
 pub use state_machine::{CasOp, CasPred, CasResult, WatchEvent};
+
+/// The public name for a log index (`= LogIndex`, a `u64`).
+pub type Index = LogIndex;
 
 pub use arachne_kv_seam::seam;
 pub use arachne_kv_seam::types;

@@ -33,15 +33,14 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::client::ArachneError;
-use crate::runtime::Command;
+use crate::client::{ArachneError, MultiGetResult, ReadConsistency};
+use crate::runtime::{Command, MultiGetBudget};
+use crate::state_machine::kv::{MAX_MULTI_GET_ENTRIES, MAX_MULTI_GET_REQUEST_BYTES};
 use crate::state_machine::{
     CasOp, CasPred, CasResult, KvStateMachine, MAX_MULTI_PUT_ENTRIES, MAX_MULTI_PUT_TOTAL_BYTES,
     WatchEvent,
 };
-use crate::{
-    ApplyOutcome, ForwardCommand, NodeId, ProfileConfig, RaftId, RemoteForwarder,
-};
+use crate::{ApplyOutcome, ForwardCommand, Index, NodeId, ProfileConfig, RaftId, RemoteForwarder};
 use raft_seedable::eraftpb::ConfChangeType;
 
 /// The maximum number of client-side redirects (propsol §3.3: "default 3").
@@ -72,6 +71,7 @@ impl Handle {
         tx: mpsc::Sender<Command>,
         remote: Option<Arc<dyn RemoteForwarder>>,
         profile: &ProfileConfig,
+        multi_get_budget: Arc<MultiGetBudget>,
     ) -> Self {
         Self {
             inner: Arc::new(HandleInner {
@@ -82,6 +82,7 @@ impl Handle {
                 peers: RwLock::new(HashMap::new()),
                 max_key_bytes: profile.max_key_bytes,
                 max_value_bytes: profile.max_value_bytes,
+                multi_get_budget,
                 // A write attempt is bounded by one election timeout: a write
                 // that does not commit within one election window is stalled
                 // (propsol §2.4 N3) and is reported as a Timeout.
@@ -148,6 +149,23 @@ impl Handle {
             .map(|_| ())
     }
 
+    /// Linearizable write that also returns the **effective index** of the
+    /// write (Phase 2): the log index of the entry that actually established
+    /// the value, or the original index on a deduped replay.
+    ///
+    /// Same validation and session envelope as [`Handle::put`]; the index
+    /// comes from the apply pipeline (never a post-apply re-read), so it is
+    /// correct even when another write to the same key lands in the same apply
+    /// batch (design §5.3 / commit-index design §9.1).
+    pub async fn put_with_index(&self, key: &[u8], value: &[u8]) -> Result<Index, ArachneError> {
+        self.validate_put(key, value)?;
+        let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
+        let client_id = self.inner.client_id;
+        let cmd = KvStateMachine::encode_put(client_id, seq_no, key, value);
+        self.propose_with_index_redirect(cmd, client_id, seq_no)
+            .await
+    }
+
     /// Atomic multi-key write (M2-P1B): one command, one log entry, one session
     /// that sets **all** `entries` atomically (all or nothing, single apply).
     ///
@@ -166,6 +184,23 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no)
             .await
             .map(|_| ())
+    }
+
+    /// Atomic multi-key write that also returns the **effective index**
+    /// (Phase 2): every key in the batch shares this one index because the
+    /// whole batch applies atomically in one log entry.
+    ///
+    /// Same validation and session envelope as [`Handle::multi_put`].
+    pub async fn multi_put_with_index(
+        &self,
+        entries: &[(&[u8], &[u8])],
+    ) -> Result<Index, ArachneError> {
+        self.validate_multi_put(entries)?;
+        let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
+        let client_id = self.inner.client_id;
+        let cmd = KvStateMachine::encode_multi_put(client_id, seq_no, entries);
+        self.propose_with_index_redirect(cmd, client_id, seq_no)
+            .await
     }
 
     /// Compare-and-swap (M3 §6): `compare(key, pred) → op(success|failure)`
@@ -267,6 +302,29 @@ impl Handle {
         seq_no: u64,
     ) -> Result<ApplyOutcome, ArachneError> {
         self.propose_with_redirect(cmd, client_id, seq_no).await
+    }
+
+    /// **Test-only seam — not a supported public API.**
+    ///
+    /// Propose `cmd` under an explicit session and return the effective index,
+    /// through the real redirect loop. Used by `arachne/tests/write_index.rs`
+    /// for the dedup-replay assertion: `put_with_index` mints a fresh `seq_no`
+    /// per call, so it cannot express a replay of the same
+    /// `(client_id, seq_no)` (which must report the **original** index).
+    ///
+    /// Unlike its sibling [`Handle::propose_raw`], this seam is **not**
+    /// `fault-injection`-gated: the write-index integration test must run on
+    /// the default build. It is `#[doc(hidden)]`, carries no stability
+    /// guarantee, and may change or disappear with the test that needs it.
+    #[doc(hidden)]
+    pub async fn propose_raw_with_index(
+        &self,
+        cmd: Vec<u8>,
+        client_id: u64,
+        seq_no: u64,
+    ) -> Result<Index, ArachneError> {
+        self.propose_with_index_redirect(cmd, client_id, seq_no)
+            .await
     }
 
     /// Add `node_id` to the cluster as a **learner** (propsol §5.3).
@@ -384,6 +442,18 @@ impl Handle {
         self.propose_with_redirect(cmd, client_id, seq_no)
             .await
             .map(|_| ())
+    }
+
+    /// Linearizable delete that also returns the **effective index** of the
+    /// delete entry (Phase 2). The index is returned even when the key was
+    /// already absent (write-set semantics, like [`Handle::delete`]).
+    pub async fn delete_with_index(&self, key: &[u8]) -> Result<Index, ArachneError> {
+        self.validate_key(key)?;
+        let seq_no = self.inner.seq.fetch_add(1, Ordering::SeqCst);
+        let client_id = self.inner.client_id;
+        let cmd = KvStateMachine::encode_delete(client_id, seq_no, key);
+        self.propose_with_index_redirect(cmd, client_id, seq_no)
+            .await
     }
 
     /// Linearizable read (propsol §2.1 / §5.4).
@@ -516,6 +586,92 @@ impl Handle {
         self.await_oneshot(ack_rx, deadline).await?
     }
 
+    /// Wait until this node's **state machine** has applied at least `index`
+    /// (Phase 3), returning the observed applied index (`>= index`).
+    ///
+    /// This is **local only**: the command goes to this node's own actor. It is
+    /// never redirected and never requires a quorum, so it works on a
+    /// minority follower. The wait is not a quorum barrier and does not replace
+    /// a linearizable read; combine it with a stale read after it returns when
+    /// the caller needs "the head write I already saw is applied here".
+    ///
+    /// `index == 0` is a no-op: the actor replies immediately with the current
+    /// applied index.
+    ///
+    /// The **client-side** timeout is the primary bound: it wraps both the
+    /// command send (a full command channel returns [`ArachneError::Timeout`],
+    /// never a hang) and the reply await. A zero or near-zero timeout returns
+    /// [`ArachneError::Timeout`] **immediately, without sending**, so it takes
+    /// precedence over the `index == 0` no-op (the caller gave no budget for a
+    /// round trip). The same absolute deadline is also passed to the actor as a
+    /// safety net (checked on progress/tick), so a cancelled or timed-out
+    /// waiter is pruned there too.
+    pub async fn wait_applied(
+        &self,
+        index: Index,
+        timeout: Duration,
+    ) -> Result<Index, ArachneError> {
+        let deadline = Instant::now() + timeout;
+        // A zero timeout is an immediate deadline: do not even try to send.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            return Err(ArachneError::Timeout);
+        }
+        let (ack_tx, ack_rx) = oneshot::channel();
+        // The runtime's clock is `tokio::time::Instant`; the handle's public
+        // budget is `std::time::Instant`. Pass the same instant, converted.
+        let actor_deadline = tokio::time::Instant::from_std(deadline);
+        // Bound the send by the deadline too: `mpsc::Sender::send` waits when
+        // the command channel is full, and that must surface as `Timeout`
+        // rather than an unbounded hang (design A4).
+        match tokio::time::timeout(
+            remaining,
+            self.inner.tx.send(Command::WaitApplied {
+                index,
+                deadline: actor_deadline,
+                ack: ack_tx,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ArachneError::ShuttingDown),
+            Err(_) => return Err(ArachneError::Timeout),
+        }
+        self.await_oneshot(ack_rx, deadline).await?
+    }
+
+    /// Batched exact-key read: every requested key's value plus **one**
+    /// applied index for the whole batch (design §4.1).
+    ///
+    /// Values preserve input order; duplicate keys produce duplicate entries;
+    /// a missing key is `None`. An empty `keys` slice is legal and returns an
+    /// empty result plus the current applied index.
+    ///
+    /// [`ReadConsistency::Stale`] reads this node's local state machine (no
+    /// quorum, available even on a minority follower).
+    /// [`ReadConsistency::Linearizable`] reuses the existing ReadIndex gate:
+    /// leader-served, quorum-confirmed, and redirected like [`Handle::get`].
+    ///
+    /// All argument bounds are checked **before** dispatch with distinct
+    /// `InvalidArgument` messages: entry count
+    /// ([`MAX_MULTI_GET_ENTRIES`]), per-key size (`max_key_bytes`), and total
+    /// request key bytes ([`MAX_MULTI_GET_REQUEST_BYTES`]). The result value
+    /// bytes are bounded inside the state machine
+    /// ([`crate::state_machine::kv::MAX_MULTI_GET_RESULT_BYTES`]) and surface
+    /// as `InvalidArgument` telling the caller to split the batch.
+    pub async fn multi_get(
+        &self,
+        keys: &[&[u8]],
+        consistency: ReadConsistency,
+    ) -> Result<MultiGetResult, ArachneError> {
+        self.validate_multi_get(keys)?;
+        match consistency {
+            ReadConsistency::Stale => self.multi_get_stale(keys).await,
+            ReadConsistency::Linearizable => self.multi_get_with_redirect(keys).await,
+        }
+    }
+
     /// Open a **watch** over a byte prefix (M4/P2, design D3/D5): a consistent
     /// prefix snapshot at the current applied watermark + a stream of write-set
     /// events *after* that watermark.
@@ -576,10 +732,7 @@ impl Handle {
         {
             return None;
         }
-        self.await_oneshot(ack_rx, deadline)
-            .await
-            .ok()
-            .flatten()
+        self.await_oneshot(ack_rx, deadline).await.ok().flatten()
     }
 
     // ---- redirect (propsol §3.3) --------------------------------------------
@@ -592,11 +745,35 @@ impl Handle {
     fn code_to_error(code: &str) -> ArachneError {
         match code {
             "quorum_unavailable" => ArachneError::QuorumUnavailable,
+            // A runtime can be aborted while its listener is still bound. A
+            // forward to that dead sink is retryable (the client will re-find
+            // the new leader), never a terminal error. The two literal strings
+            // are the legacy pre-`unavailable` wire codes.
+            "unavailable" | "command channel closed" | "ack channel closed" => {
+                ArachneError::QuorumUnavailable
+            }
             "timeout" => ArachneError::Timeout,
             "busy" => ArachneError::Busy,
             "session_expired" => ArachneError::SessionExpired,
             "session_table_full" => ArachneError::SessionTableFull,
             "shutting_down" => ArachneError::ShuttingDown,
+            // A peer rejected a command kind it does not understand. This is
+            // terminal (the command was not executed), so it must not be
+            // collapsed into `Unrecoverable`.
+            "unknown_kind" => {
+                ArachneError::Unsupported("peer does not support the requested command kind".into())
+            }
+            // The leader rejected the arguments after they reached it. The
+            // stable code carries no message, so keep the message generic but
+            // truthful (rejected, not executed).
+            "invalid_argument" => ArachneError::InvalidArgument(
+                "the leader rejected the forwarded request as invalid".into(),
+            ),
+            // A peer that cannot execute the requested capability. Terminal:
+            // the operation was not executed.
+            "unsupported" => {
+                ArachneError::Unsupported("peer does not support the requested capability".into())
+            }
             // Anything else is an unrecoverable condition on the leader side
             // (unknown kind, unavailable sink, …).
             other => ArachneError::Unrecoverable(format!("forwarded request failed: {other}")),
@@ -624,10 +801,11 @@ impl Handle {
         leader_addr: SocketAddr,
         req: &Request,
         deadline: Instant,
-    ) -> Result<Result<ApplyOutcome, ArachneError>, ArachneError> {
-        // Only writes are forwardable in M1. `ConfChange`/`TransferLeader` are
-        // only ever proposed by the node itself to a known in-process peer,
-        // so they never reach this path; refuse rather than hang if they do.
+    ) -> Result<Result<WriteReply, ArachneError>, ArachneError> {
+        // Only writes are forwardable in M1/Phase 2. `ConfChange`/
+        // `TransferLeader` are only ever proposed by the node itself to a known
+        // in-process peer, so they never reach this path; refuse rather than
+        // hang if they do.
         let forward_cmd = match req {
             Request::Propose {
                 cmd,
@@ -638,13 +816,24 @@ impl Handle {
                 client_id: *client_id,
                 seq_no: *seq_no,
             },
+            Request::ProposeWithIndex {
+                cmd,
+                client_id,
+                seq_no,
+            } => ForwardCommand::ProposeWithIndex {
+                cmd: cmd.clone(),
+                client_id: *client_id,
+                seq_no: *seq_no,
+            },
             _ => return Err(ArachneError::QuorumUnavailable),
         };
+        let wants_index = matches!(req, Request::ProposeWithIndex { .. });
 
         match tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
             remote.forward(leader_id, leader_addr, forward_cmd),
-        ).await
+        )
+        .await
         {
             Ok(Ok(outcome)) => {
                 // A `not_leader` outcome carries a *fresh* hint (re-redirect);
@@ -656,7 +845,18 @@ impl Handle {
                     Some((id, a)) => Ok(Err(ArachneError::NotLeader {
                         leader_hint: Some((id, a)),
                     })),
-                    None => Ok(Ok(outcome.result.unwrap_or(ApplyOutcome::None))),
+                    None if wants_index => match outcome.index {
+                        Some(index) => Ok(Ok(WriteReply::Index(index))),
+                        // An old leader that somehow answered ok without the
+                        // field (protocol bug or pre-Phase-2 peer) must not be
+                        // read as index 0.
+                        None => Ok(Err(ArachneError::Unsupported(
+                            "leader does not support index-returning writes".into(),
+                        ))),
+                    },
+                    None => Ok(Ok(WriteReply::Outcome(
+                        outcome.result.unwrap_or(ApplyOutcome::None),
+                    ))),
                 }
             }
             // A stable code from the leader's command sink (a non-`not_leader`
@@ -677,7 +877,7 @@ impl Handle {
         wire_addr: Option<SocketAddr>,
         req: &Request,
         deadline: Instant,
-    ) -> Result<Result<ApplyOutcome, ArachneError>, ArachneError> {
+    ) -> Result<Result<WriteReply, ArachneError>, ArachneError> {
         // In-process: a known in-process peer (self or a registered peer).
         if self.handle_for(target_id).is_some() {
             return self.send_request(target_id, req, deadline).await;
@@ -708,7 +908,25 @@ impl Handle {
             client_id,
             seq_no,
         })
-        .await
+        .await?
+        .into_outcome()
+    }
+
+    /// Propose `cmd` under `(client_id, seq_no)` and return the effective index
+    /// the apply pipeline carried back.
+    async fn propose_with_index_redirect(
+        &self,
+        cmd: Vec<u8>,
+        client_id: u64,
+        seq_no: u64,
+    ) -> Result<Index, ArachneError> {
+        self.request_with_redirect(Request::ProposeWithIndex {
+            cmd,
+            client_id,
+            seq_no,
+        })
+        .await?
+        .into_index()
     }
 
     /// Send `req` to the leader, following hints, under one deadline.
@@ -722,13 +940,10 @@ impl Handle {
     /// over the wire otherwise (the multi-process case). A fresh hint re-feeds
     /// the loop toward the current leader.
     ///
-    /// Returns the applied [`ApplyOutcome`] for a write (M1 write-back). Reads
-    /// and membership changes do not go through this path; the caller maps the
-    /// outcome to its public shape.
-    async fn request_with_redirect(
-        &self,
-        req: Request,
-    ) -> Result<ApplyOutcome, ArachneError> {
+    /// Returns the [`WriteReply`] for a write (M1 outcome or Phase 2 index).
+    /// Reads and membership changes do not go through this path; the caller
+    /// maps the reply to its public shape.
+    async fn request_with_redirect(&self, req: Request) -> Result<WriteReply, ArachneError> {
         let deadline = Instant::now() + self.inner.timeout;
         let order = self.target_order();
         let mut pos = 0usize;
@@ -771,7 +986,7 @@ impl Handle {
                 Err(e) => return Err(e),
             };
             match result {
-                Ok(outcome) => return Ok(outcome),
+                Ok(reply) => return Ok(reply),
                 // Re-redirect to the (possibly fresh) leader the node named.
                 Err(ArachneError::NotLeader { leader_hint }) => {
                     if self.max_redirects == 0 {
@@ -808,10 +1023,7 @@ impl Handle {
                 Some((id, a)) => (id.clone(), Some(a.clone())),
                 None => (order[pos].clone(), None),
             };
-            let result = match self
-                .reach_get(&target_id, wire_addr, key, deadline)
-                .await
-            {
+            let result = match self.reach_get(&target_id, wire_addr, key, deadline).await {
                 Ok(res) => res,
                 // A peer that cannot accept the request is unreachable; an
                 // unreachable peer means the cluster cannot confirm a read index.
@@ -847,6 +1059,213 @@ impl Handle {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Local `multi_get`: send to **this** node's actor and await, with the
+    /// whole send+await bounded by one deadline (a full command channel must
+    /// return `Timeout`, not hang — Gate-1 should-fix).
+    ///
+    /// The shared budget reservation is held for the whole send+await and is
+    /// released by its `Drop` guard on every exit path (including cancellation).
+    async fn multi_get_stale(&self, keys: &[&[u8]]) -> Result<MultiGetResult, ArachneError> {
+        let deadline = Instant::now() + self.inner.timeout;
+        let owned: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
+        let bytes: u64 = owned.iter().map(|k| k.len() as u64).sum();
+        let Some(_budget) = self.inner.multi_get_budget.try_reserve(bytes) else {
+            return Err(ArachneError::Busy);
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            return Err(ArachneError::Timeout);
+        }
+        tokio::time::timeout(
+            remaining,
+            self.inner.tx.send(Command::MultiGet {
+                keys: owned,
+                consistency: ReadConsistency::Stale,
+                ack: ack_tx,
+            }),
+        )
+        .await
+        .map_err(|_| ArachneError::Timeout)?
+        .map_err(|_| ArachneError::ShuttingDown)?;
+        let (values, applied_index) = self.await_oneshot(ack_rx, deadline).await??;
+        Ok(MultiGetResult {
+            values,
+            applied_index,
+        })
+    }
+
+    /// Linearizable `multi_get`: a dedicated redirect loop mirroring
+    /// [`Handle::get_with_redirect`] (never the write loop — the reply shape
+    /// and deadline budget differ).
+    async fn multi_get_with_redirect(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<MultiGetResult, ArachneError> {
+        // Reads use the longer read budget (the actor's ReadIndex wait plus its
+        // one retry).
+        let deadline = Instant::now() + self.inner.read_timeout;
+        let owned: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
+        let order = self.target_order();
+        let mut pos = 0usize;
+        let mut redirects = 0u32;
+        let mut unreachable = 0u32;
+        // The most recent known leader (see `request_with_redirect`).
+        let mut hint: Option<(NodeId, SocketAddr)> = None;
+        loop {
+            let (target_id, wire_addr) = match &hint {
+                Some((id, a)) => (id.clone(), Some(a.clone())),
+                None => (order[pos].clone(), None),
+            };
+            let result = match self
+                .reach_multi_get(&target_id, wire_addr, &owned, deadline)
+                .await
+            {
+                Ok(res) => res,
+                // A peer that cannot accept the request is unreachable; an
+                // unreachable peer means the cluster cannot confirm a read index.
+                Err(ArachneError::ShuttingDown) if target_id != self.inner.self_id => {
+                    if hint.is_none() {
+                        unreachable += 1;
+                        if unreachable + 1 >= order.len() as u32 {
+                            return Err(ArachneError::QuorumUnavailable);
+                        }
+                        pos = (pos + 1) % order.len();
+                        continue;
+                    } else {
+                        return Err(ArachneError::QuorumUnavailable);
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            match result {
+                Ok((values, applied_index)) => {
+                    return Ok(MultiGetResult {
+                        values,
+                        applied_index,
+                    });
+                }
+                // Re-redirect to the (possibly fresh) leader the node named.
+                Err(ArachneError::NotLeader { leader_hint }) => {
+                    if self.max_redirects == 0 {
+                        // Single-shot handle: surface the hint unchanged.
+                        return Err(ArachneError::NotLeader { leader_hint });
+                    }
+                    hint = leader_hint;
+                    pos = (pos + 1) % order.len();
+                    redirects += 1;
+                    if redirects > self.max_redirects {
+                        return Err(ArachneError::Timeout);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Put one `MultiGet` on one target's actor channel and await its reply.
+    ///
+    /// Both the send and the await share `deadline` (Gate-1 should-fix). The
+    /// budget is reserved on the **target** handle's shared budget (the same
+    /// budget its actor will reserve from).
+    async fn send_multi_get(
+        &self,
+        target: &NodeId,
+        keys: &[Vec<u8>],
+        deadline: Instant,
+    ) -> Result<Result<(Vec<Option<Vec<u8>>>, u64), ArachneError>, ArachneError> {
+        let Some(handle) = self.handle_for(target) else {
+            return Err(ArachneError::QuorumUnavailable);
+        };
+        let bytes: u64 = keys.iter().map(|k| k.len() as u64).sum();
+        let Some(_budget) = handle.inner.multi_get_budget.try_reserve(bytes) else {
+            return Err(ArachneError::Busy);
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            return Err(ArachneError::Timeout);
+        }
+        tokio::time::timeout(
+            remaining,
+            handle.inner.tx.send(Command::MultiGet {
+                keys: keys.to_vec(),
+                consistency: ReadConsistency::Linearizable,
+                ack: ack_tx,
+            }),
+        )
+        .await
+        .map_err(|_| ArachneError::Timeout)?
+        .map_err(|_| ArachneError::ShuttingDown)?;
+        self.await_oneshot(ack_rx, deadline).await
+    }
+
+    /// Forward a linearizable `multi_get` to the leader over the wire.
+    ///
+    /// On success the target returns the batch via [`ForwardOutcome::multi`];
+    /// an absent field means an old peer that cannot serve the request, which
+    /// is a loud, terminal [`ArachneError::Unsupported`] (never a silent
+    /// per-key fallback).
+    async fn forward_multi_get(
+        &self,
+        remote: &Arc<dyn RemoteForwarder>,
+        leader_id: NodeId,
+        leader_addr: SocketAddr,
+        keys: &[Vec<u8>],
+        deadline: Instant,
+    ) -> Result<Result<(Vec<Option<Vec<u8>>>, u64), ArachneError>, ArachneError> {
+        let forward_cmd = ForwardCommand::MultiGet {
+            keys: keys.to_vec(),
+            // This helper is only reached from the Linearizable redirect path.
+            linearizable: true,
+        };
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            remote.forward(leader_id, leader_addr, forward_cmd),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => match outcome.leader_hint {
+                Some((id, a)) => Ok(Err(ArachneError::NotLeader {
+                    leader_hint: Some((id, a)),
+                })),
+                None => match outcome.multi {
+                    Some(pair) => Ok(Ok(pair)),
+                    None => Ok(Err(ArachneError::Unsupported(
+                        "leader does not support multi_get".into(),
+                    ))),
+                },
+            },
+            // A stable code from the leader's command sink.
+            Ok(Err(code)) => Ok(Err(Handle::code_to_error(&code))),
+            // Dial/connect/timeout: the leader is unreachable.
+            Err(_) => Err(ArachneError::QuorumUnavailable),
+        }
+    }
+
+    /// Reach `target_id` for a `multi_get`, choosing the in-process or wire
+    /// path (the same shape as [`Handle::reach_get`]).
+    async fn reach_multi_get(
+        &self,
+        target_id: &NodeId,
+        wire_addr: Option<SocketAddr>,
+        keys: &[Vec<u8>],
+        deadline: Instant,
+    ) -> Result<Result<(Vec<Option<Vec<u8>>>, u64), ArachneError>, ArachneError> {
+        // In-process: a known in-process peer (self or a registered peer).
+        if self.handle_for(target_id).is_some() {
+            return self.send_multi_get(target_id, keys, deadline).await;
+        }
+        // No in-process peer: forward to the leader over the wire.
+        if let (Some(remote), Some(addr)) = (&self.inner.remote, wire_addr) {
+            return self
+                .forward_multi_get(remote, target_id.clone(), addr, keys, deadline)
+                .await;
+        }
+        // No path to the target: the cluster cannot be reached.
+        Err(ArachneError::QuorumUnavailable)
     }
 
     /// The ordered node list to try: self first, then peers in sorted order.
@@ -886,7 +1305,7 @@ impl Handle {
         target: &NodeId,
         req: &Request,
         deadline: Instant,
-    ) -> Result<Result<ApplyOutcome, ArachneError>, ArachneError> {
+    ) -> Result<Result<WriteReply, ArachneError>, ArachneError> {
         let Some(handle) = self.handle_for(target) else {
             return Err(ArachneError::QuorumUnavailable);
         };
@@ -908,7 +1327,30 @@ impl Handle {
                     })
                     .await
                     .map_err(|_| ArachneError::ShuttingDown)?;
-                self.await_oneshot(ack_rx, deadline).await
+                self.await_oneshot(ack_rx, deadline)
+                    .await
+                    .map(|r| r.map(WriteReply::Outcome))
+            }
+            Request::ProposeWithIndex {
+                cmd,
+                client_id,
+                seq_no,
+            } => {
+                let (ack_tx, ack_rx) = oneshot::channel::<Result<Index, ArachneError>>();
+                handle
+                    .inner
+                    .tx
+                    .send(Command::ProposeWithIndex {
+                        cmd: cmd.clone(),
+                        client_id: *client_id,
+                        seq_no: *seq_no,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .map_err(|_| ArachneError::ShuttingDown)?;
+                self.await_oneshot(ack_rx, deadline)
+                    .await
+                    .map(|r| r.map(WriteReply::Index))
             }
             Request::ConfChange {
                 change_type,
@@ -927,7 +1369,7 @@ impl Handle {
                     .map_err(|_| ArachneError::ShuttingDown)?;
                 self.await_oneshot(ack_rx, deadline)
                     .await
-                    .map(|r| r.map(|()| ApplyOutcome::None))
+                    .map(|r| r.map(|()| WriteReply::Outcome(ApplyOutcome::None)))
             }
             Request::TransferLeader { target: to } => {
                 let (ack_tx, ack_rx) = oneshot::channel::<Result<(), ArachneError>>();
@@ -942,7 +1384,7 @@ impl Handle {
                     .map_err(|_| ArachneError::ShuttingDown)?;
                 self.await_oneshot(ack_rx, deadline)
                     .await
-                    .map(|r| r.map(|()| ApplyOutcome::None))
+                    .map(|r| r.map(|()| WriteReply::Outcome(ApplyOutcome::None)))
             }
         }
     }
@@ -984,13 +1426,12 @@ impl Handle {
         key: &[u8],
         deadline: Instant,
     ) -> Result<Result<Option<Vec<u8>>, ArachneError>, ArachneError> {
-        let forward_cmd = ForwardCommand::Read {
-            key: key.to_vec(),
-        };
+        let forward_cmd = ForwardCommand::Read { key: key.to_vec() };
         match tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
             remote.forward(leader_id, leader_addr, forward_cmd),
-        ).await
+        )
+        .await
         {
             Ok(Ok(outcome)) => {
                 // A `not_leader` outcome carries a *fresh* hint (re-redirect);
@@ -1026,7 +1467,9 @@ impl Handle {
         }
         // No in-process peer: forward to the leader over the wire.
         if let (Some(remote), Some(addr)) = (&self.inner.remote, wire_addr) {
-            return self.forward_get(remote, target_id.clone(), addr, key, deadline).await;
+            return self
+                .forward_get(remote, target_id.clone(), addr, key, deadline)
+                .await;
         }
         // No path to the target: the cluster cannot be reached.
         Err(ArachneError::QuorumUnavailable)
@@ -1117,6 +1560,75 @@ impl Handle {
         }
         Ok(())
     }
+
+    /// Validate a `multi_get` batch before dispatch: entry count, per-key size,
+    /// and total request key bytes. Each failure carries a **distinct**
+    /// `InvalidArgument` message naming the violated bound and the remedy.
+    fn validate_multi_get(&self, keys: &[&[u8]]) -> Result<(), ArachneError> {
+        if keys.len() > MAX_MULTI_GET_ENTRIES {
+            return Err(ArachneError::InvalidArgument(format!(
+                "multi_get of {} entries exceeds MAX_MULTI_GET_ENTRIES ({}); split the batch",
+                keys.len(),
+                MAX_MULTI_GET_ENTRIES
+            )));
+        }
+        let mut total: u64 = 0;
+        for key in keys {
+            if (key.len() as u64) > self.inner.max_key_bytes {
+                return Err(ArachneError::InvalidArgument(format!(
+                    "multi_get key of {} bytes exceeds max_key_bytes ({}); use shorter keys",
+                    key.len(),
+                    self.inner.max_key_bytes
+                )));
+            }
+            total = total.saturating_add(key.len() as u64);
+        }
+        if total > MAX_MULTI_GET_REQUEST_BYTES {
+            return Err(ArachneError::InvalidArgument(format!(
+                "multi_get request total {} key bytes exceeds MAX_MULTI_GET_REQUEST_BYTES ({}); split the batch",
+                total, MAX_MULTI_GET_REQUEST_BYTES
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The successful reply shape of a write carried by the redirect loop.
+///
+/// Existing writes need only the apply outcome; the index-returning writes
+/// (Phase 2) need the effective log index. Keeping the shape explicit avoids
+/// generalising the whole write path while still sharing one redirect loop.
+#[derive(Clone, Debug)]
+enum WriteReply {
+    /// The per-entry apply outcome (M1 write-back).
+    Outcome(ApplyOutcome),
+    /// The effective index of the write (original index on a deduped replay).
+    Index(Index),
+}
+
+impl WriteReply {
+    /// Extract the apply outcome for an existing write path. An `Index` reply
+    /// here is a programming error (the request shape and reply shape are
+    /// chosen together), surfaced as an unrecoverable error rather than a
+    /// silent zero.
+    fn into_outcome(self) -> Result<ApplyOutcome, ArachneError> {
+        match self {
+            WriteReply::Outcome(outcome) => Ok(outcome),
+            WriteReply::Index(_) => Err(ArachneError::Unrecoverable(
+                "index reply on an outcome-shaped write".into(),
+            )),
+        }
+    }
+
+    /// Extract the effective index for an index-returning write.
+    fn into_index(self) -> Result<Index, ArachneError> {
+        match self {
+            WriteReply::Index(index) => Ok(index),
+            WriteReply::Outcome(_) => Err(ArachneError::Unrecoverable(
+                "outcome reply on an index-shaped write".into(),
+            )),
+        }
+    }
 }
 
 /// A request the redirect loop can carry to whichever node is the leader.
@@ -1131,14 +1643,19 @@ enum Request {
         client_id: u64,
         seq_no: u64,
     },
+    /// Index-returning propose (Phase 2). A distinct wire kind from `Propose`
+    /// so an old leader rejects it before executing (Gate-1 MF1).
+    ProposeWithIndex {
+        cmd: Vec<u8>,
+        client_id: u64,
+        seq_no: u64,
+    },
     ConfChange {
         change_type: ConfChangeType,
         node_id: RaftId,
     },
     /// `None` = any other voter (used by the automatic leader removal).
-    TransferLeader {
-        target: Option<RaftId>,
-    },
+    TransferLeader { target: Option<RaftId> },
 }
 
 struct HandleInner {
@@ -1156,6 +1673,8 @@ struct HandleInner {
     /// Key/value size limits (validated before propose).
     max_key_bytes: u64,
     max_value_bytes: u64,
+    /// Shared in-flight `multi_get` key-byte budget (Gate-1 MF2).
+    multi_get_budget: Arc<MultiGetBudget>,
     /// The total deadline for a single **write** operation (across redirects).
     timeout: Duration,
     /// The total deadline for a single **read** operation. Must exceed the
@@ -1246,4 +1765,193 @@ fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ForwardOutcome;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    /// A `RemoteForwarder` that records the forwarded command and returns a
+    /// fixed outcome, so the wire-gating behavior can be exercised without a
+    /// transport.
+    struct MockForwarder {
+        outcome: ForwardOutcome,
+        seen: Mutex<Vec<ForwardCommand>>,
+    }
+
+    impl RemoteForwarder for MockForwarder {
+        fn forward(
+            &self,
+            _to: NodeId,
+            _addr: SocketAddr,
+            c: ForwardCommand,
+        ) -> Pin<Box<dyn Future<Output = Result<ForwardOutcome, String>> + Send + '_>> {
+            self.seen.lock().expect("seen lock").push(c);
+            let outcome = self.outcome.clone();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    fn mock_remote(outcome: ForwardOutcome) -> Arc<dyn RemoteForwarder> {
+        Arc::new(MockForwarder {
+            outcome,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn handle_with_remote(remote: Arc<dyn RemoteForwarder>) -> Handle {
+        let (tx, _rx) = mpsc::channel(8);
+        Handle::new_local(
+            NodeId::from("n1"),
+            tx,
+            Some(remote),
+            &crate::Profile::Lan.config(),
+            Arc::new(MultiGetBudget::new()),
+        )
+    }
+
+    /// A peer rejecting an unknown command kind must map to the terminal
+    /// `Unsupported`, never fall through to `Unrecoverable`.
+    #[test]
+    fn unknown_kind_maps_to_unsupported() {
+        assert!(matches!(
+            Handle::code_to_error("unknown_kind"),
+            ArachneError::Unsupported(_)
+        ));
+    }
+
+    /// The new stable codes for a forwarded rejection must not fall through to
+    /// `Unrecoverable` (Gate-2 should-fix #4).
+    #[test]
+    fn stable_rejection_codes_map_to_their_variants() {
+        assert!(matches!(
+            Handle::code_to_error("invalid_argument"),
+            ArachneError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            Handle::code_to_error("unsupported"),
+            ArachneError::Unsupported(_)
+        ));
+    }
+
+    /// A forwarded `ProposeWithIndex` whose reply lacks the index is an old
+    /// peer: terminal `Unsupported`, never a fabricated index 0. A present
+    /// index is returned intact.
+    #[tokio::test]
+    async fn forward_propose_with_index_absent_index_is_unsupported() {
+        let addr: SocketAddr = "127.0.0.1:7003".parse().expect("addr");
+        let leader = NodeId::from("n2");
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let remote_absent = mock_remote(ForwardOutcome {
+            value: None,
+            leader_hint: None,
+            result: None,
+            multi: None,
+            index: None,
+        });
+        let handle = handle_with_remote(Arc::clone(&remote_absent));
+        let req = Request::ProposeWithIndex {
+            cmd: vec![1, 2, 3],
+            client_id: 1,
+            seq_no: 1,
+        };
+        let absent = handle
+            .forward_request(&remote_absent, leader.clone(), addr, &req, deadline)
+            .await;
+        assert!(
+            matches!(absent, Ok(Err(ArachneError::Unsupported(_)))),
+            "an absent index must be Unsupported, got {absent:?}"
+        );
+
+        let remote_present = mock_remote(ForwardOutcome {
+            value: None,
+            leader_hint: None,
+            result: None,
+            multi: None,
+            index: Some(7),
+        });
+        let handle = handle_with_remote(Arc::clone(&remote_present));
+        let present = handle
+            .forward_request(&remote_present, leader, addr, &req, deadline)
+            .await
+            .expect("outer ok")
+            .expect("inner ok");
+        assert!(matches!(present, WriteReply::Index(7)));
+    }
+
+    /// The client half of the runtime's `stable_code`: each stable token must
+    /// reconstruct its own variant (the reverse direction of
+    /// `runtime::tests::stable_code_round_trip_tokens`), never collapse a
+    /// retryable/actionable error into `Unrecoverable`.
+    #[test]
+    fn stable_codes_round_trip_to_their_variants() {
+        for (code, expected) in [
+            ("busy", ArachneError::Busy),
+            ("timeout", ArachneError::Timeout),
+            ("quorum_unavailable", ArachneError::QuorumUnavailable),
+            ("unavailable", ArachneError::QuorumUnavailable),
+            ("command channel closed", ArachneError::QuorumUnavailable),
+            ("ack channel closed", ArachneError::QuorumUnavailable),
+        ] {
+            assert_eq!(Handle::code_to_error(code), expected);
+        }
+        assert!(matches!(
+            Handle::code_to_error("invalid_argument"),
+            ArachneError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            Handle::code_to_error("unsupported"),
+            ArachneError::Unsupported(_)
+        ));
+    }
+
+    /// A forwarded MultiGet whose reply lacks the `multi` payload (old peer /
+    /// unsupported capability) is `Unsupported`; a present payload is returned
+    /// intact. This exercises the real `forward_multi_get` mapping.
+    #[tokio::test]
+    async fn forward_multi_get_absent_multi_is_unsupported_and_present_multi_is_ok() {
+        let addr: SocketAddr = "127.0.0.1:7002".parse().expect("addr");
+        let leader = NodeId::from("n2");
+        let keys = vec![b"b".to_vec(), b"a".to_vec()];
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        // Absent `multi` -> the target does not support the capability.
+        let remote_absent = mock_remote(ForwardOutcome {
+            value: None,
+            leader_hint: None,
+            result: None,
+            multi: None,
+            index: None,
+        });
+        let handle = handle_with_remote(Arc::clone(&remote_absent));
+        let absent = handle
+            .forward_multi_get(&remote_absent, leader.clone(), addr, &keys, deadline)
+            .await;
+        assert!(
+            matches!(absent, Ok(Err(ArachneError::Unsupported(_)))),
+            "an absent `multi` must be Unsupported, got {absent:?}"
+        );
+
+        // Present `multi` -> values plus applied index pass through untouched.
+        let values = vec![Some(b"v".to_vec())];
+        let remote_present = mock_remote(ForwardOutcome {
+            value: None,
+            leader_hint: None,
+            result: None,
+            multi: Some((values.clone(), 7)),
+            index: None,
+        });
+        let handle = handle_with_remote(Arc::clone(&remote_present));
+        let present = handle
+            .forward_multi_get(&remote_present, leader, addr, &keys, deadline)
+            .await
+            .expect("outer ok")
+            .expect("inner ok");
+        assert_eq!(present, (values, 7));
+    }
 }

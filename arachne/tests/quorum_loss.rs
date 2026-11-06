@@ -229,6 +229,30 @@ async fn losing_quorum_fails_writes_and_linearizable_reads_but_serves_stale_read
     let survivor = (0..N as usize)
         .find(|pos| *pos != leader && *pos != (leader + 1) % N as usize)
         .expect("a survivor exists");
+    // `until_put` only guarantees the *leader* applied. The survivor is a
+    // follower, so wait for its local state machine to apply the pre-outage
+    // write before isolating it — otherwise this test races the follower's
+    // apply lag under parallel load and the post-partition stale read sees
+    // `None`.
+    let mut survivor_applied = false;
+    for _ in 0..500 {
+        if nodes[survivor]
+            .handle
+            .get_stale(b"k")
+            .await
+            .expect("get_stale before partition")
+            .as_deref()
+            == Some(b"v")
+        {
+            survivor_applied = true;
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        survivor_applied,
+        "the survivor must apply the pre-outage write before the partition"
+    );
     let mut killed = Vec::new();
     for pos in [leader, (leader + 1) % N as usize] {
         nodes[pos].kill();

@@ -51,7 +51,28 @@ pub use handle::{Handle, WatchSubscription};
 
 use std::net::SocketAddr;
 
-use crate::NodeId;
+use crate::{Index, NodeId};
+
+/// Consistency mode for [`Handle::multi_get`](crate::client::Handle::multi_get).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadConsistency {
+    /// Local state-machine read; no quorum, available on any node (including a
+    /// minority follower), arbitrarily stale.
+    Stale,
+    /// Existing ReadIndex semantics: leader-served, quorum-confirmed, served
+    /// only once `applied >= read_index`.
+    Linearizable,
+}
+
+/// The result of a batched exact-key read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiGetResult {
+    /// Values in the same order as the requested keys. `None` = key absent;
+    /// duplicate requested keys produce duplicate entries.
+    pub values: Vec<Option<Vec<u8>>>,
+    /// The state-machine applied index the whole batch was observed at.
+    pub applied_index: Index,
+}
 
 /// The full error model for Arachne client operations (propsol §3.2).
 ///
@@ -123,6 +144,12 @@ pub enum ArachneError {
     /// this.
     #[error("unrecoverable: {0}")]
     Unrecoverable(String),
+    /// A peer does not support the requested capability (e.g. a forwarded
+    /// `multi_get` against an old node, or an `unknown_kind` wire reply). This
+    /// is terminal: the operation was **not** executed, so retrying the same
+    /// call against the same peer cannot help.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// The [`crate::server`] embedding facade has already been initialized in
     /// this process. A second `Arachne::start` is politely refused; the node is
     /// not overwritten. (In-process single-instance semantics.)
@@ -164,6 +191,7 @@ mod tests {
             ArachneError::ShuttingDown,
             ArachneError::DataDirLocked,
             ArachneError::Unrecoverable("corrupt".into()),
+            ArachneError::Unsupported("old peer".into()),
             ArachneError::AlreadyInitialized,
             ArachneError::NotInitialized,
         ] {
@@ -173,7 +201,7 @@ mod tests {
 
     #[test]
     fn variant_names_are_distinct() {
-        // The full variant list is present (16 variants, exhaustive: every
+        // The full variant list is present (17 variants, exhaustive: every
         // `ArachneError` variant is named here so an added variant cannot
         // slip through without this test catching it).
         let variants = vec![
@@ -191,6 +219,7 @@ mod tests {
             ArachneError::ShuttingDown,
             ArachneError::DataDirLocked,
             ArachneError::Unrecoverable(String::new()),
+            ArachneError::Unsupported(String::new()),
             ArachneError::AlreadyInitialized,
             ArachneError::NotInitialized,
         ];
@@ -198,6 +227,6 @@ mod tests {
         for v in &variants {
             assert!(seen.insert(format!("{v:?}")), "duplicate variant name");
         }
-        assert_eq!(seen.len(), 16, "the full variant list must be present");
+        assert_eq!(seen.len(), 17, "the full variant list must be present");
     }
 }

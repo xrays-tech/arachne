@@ -1,16 +1,23 @@
-//! `cargo-fuzz` target: KV state-machine snapshot restore (v0.3.0 payload).
+//! `cargo-fuzz` target: KV state-machine snapshot restore (v0.5.x payload).
+//!
+//! The target is **version-agnostic**: it feeds whatever the current
+//! `KV_SNAPSHOT_VERSION` is (currently **3**, Phase 2: each session record
+//! appends its 8-byte LE effective index after the outcome encoding). The
+//! decoder remains strict — an older v2 payload is rejected as
+//! `MalformedSnapshot` — so the fuzzer now exercises v3.
 //!
 //! Feeds arbitrary byte sequences to the KV state machine and asserts it
 //! **never panics** on any input, in two directions:
 //!
-//! 1. **`apply`**(arbitrary command bytes, M1–M3 opcodes) must never panic and
+//! 1. **`apply`**(arbitrary command bytes, M1–M4 opcodes) must never panic and
 //!    must stay **self-consistent**: a machine that applied a (possibly
 //!    malformed) command, was snapshotted, and was rebuilt from that snapshot
-//!    must be able to apply the same bytes again — including the M3
-//!    `KV_SNAPSHOT_VERSION` 2 session tag (`CasFailed`) — without panicking.
-//!    (No byte-for-byte snapshot equality is asserted here: re-applying the
-//!    same bytes at a higher index is a *different session* and legitimately
-//!    changes the applied watermark / cached outcomes.)
+//!    must be able to apply the same bytes again — including the
+//!    `KV_SNAPSHOT_VERSION` 3 session record (outcome + effective index) —
+//!    without panicking. (No byte-for-byte snapshot equality is asserted
+//!    here: re-applying the same bytes at a higher index is a *different
+//!    session* and legitimately changes the applied watermark / cached
+//!    outcomes.)
 //! 2. **`restore`**(arbitrary snapshot bytes) must land in `Ok(())` or
 //!    `Err(KvError::MalformedSnapshot)` — a panic is a fuzzer failure. On
 //!    success, `data` must be the **canonical encoding** of the decoded store:

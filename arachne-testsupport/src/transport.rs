@@ -148,6 +148,17 @@ impl InMemoryTransportFactory {
         set.insert((from, to));
     }
 
+    /// Remove a one-way firewall previously installed by [`Self::firewall`].
+    ///
+    /// Additive counterpart so a test can heal a partition and assert
+    /// convergence without tearing down the node's transport (contrast with
+    /// aborting/restarting the node). Removing a pair that is not blocked is a
+    /// no-op.
+    pub fn heal(&self, from: NodeId, to: NodeId) {
+        let mut set = self.blocked.lock().unwrap();
+        set.remove(&(from, to));
+    }
+
     /// Test observability: number of messages the firewall dropped so far.
     pub fn firewall_drop_count(&self) -> usize {
         self.dropped_by_firewall.load(Ordering::Relaxed)
