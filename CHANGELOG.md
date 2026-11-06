@@ -1,0 +1,241 @@
+# Changelog / 变更说明
+
+面向 `arachne-kv` 使用方的发布说明。内部设计/取舍见
+`dev-docs/arachne-kv-batch-read-applied-index-design.md`，升级步骤见
+`dev-docs/runbook-format-v4-upgrade.md`。
+
+---
+
+## 0.5.0 — 2026-11-06
+
+主题：**批量精确读 + 写入/应用索引可见性 + 本地 applied-index 等待**。
+对应需求：上游 Hydra 24k 实体配置树的「head 可见但 entity 尚未 apply」竞态。
+
+### 一句话总结
+
+- 24k 个 entity 的物化从 **24,000 次单 key 读** 降到 **~47 次 `multi_get`**；
+- 写入可以拿到**实际生效的 log index**，重放返回原始 index；
+- follower 可以**本地等待**状态机追平它刚观察到的 head index，不再靠重试/轮询。
+
+---
+
+## 1. 新增 API
+
+### 1.1 `multi_get` —— 精确 key 集合的批量读
+
+```rust
+use arachne_kv::{ReadConsistency, MultiGetResult};
+
+pub async fn multi_get(
+    &self,
+    keys: &[&[u8]],
+    consistency: ReadConsistency,
+) -> Result<MultiGetResult, ArachneError>;
+
+pub enum ReadConsistency {
+    Stale,        // 本地状态机；无 quorum；少数派 follower 可用；可能陈旧
+    Linearizable, // 既有 ReadIndex；leader + quorum
+}
+
+pub struct MultiGetResult {
+    pub values: Vec<Option<Vec<u8>>>, // 与输入 keys 同序；None = 缺键
+    pub applied_index: u64,           // 整批 values 被观察时的单一 applied index
+}
+```
+
+语义：
+- 整批 values 在**同一次读锁**下取得，`applied_index` 与 values 属于同一个状态，**无撕裂**；
+- 输入顺序严格保留；重复 key 产生重复结果；缺键 = `None`，不是错误；空 `keys` 合法；
+- 上限（**不截断**，超限返回 `InvalidArgument`）：
+  - 最多 `4096` 个 key；
+  - 每个 key ≤ `max_key_bytes`（默认 4 KiB）；
+  - 请求 key 总字节 ≤ 4 MiB；
+  - 返回 value 总字节 ≤ 4 MiB；
+  - 在途 `multi_get` payload 共享 16 MiB 预算，超限返回可重试的 `Busy`。
+
+### 1.2 写入返回 index
+
+```rust
+use arachne_kv::Index; // = u64
+
+pub async fn put_with_index(&self, key: &[u8], value: &[u8]) -> Result<Index, ArachneError>;
+pub async fn multi_put_with_index(&self, entries: &[(&[u8], &[u8])]) -> Result<Index, ArachneError>;
+pub async fn delete_with_index(&self, key: &[u8]) -> Result<Index, ArachneError>;
+```
+
+语义：
+- 返回**使本次写入实际生效**的 log entry index（不是「提交后回查当前值」的 index）；
+- `multi_put_with_index` 整批共享一个 index（一次原子 apply）；
+- `delete_with_index` 即使 key 不存在也返回该 delete entry 的 index；
+- 同 `(client_id, seq_no)` 重放返回**原始 index**（session 记录持久化了 effective index）；
+  - 该保证仅在 session TTL + grace 内；GC 后的重试是新 session，返回新 index；
+- follower 转发的写入返回 **leader** 的 index，不是本地猜测；
+- 旧 peer 不支持时返回 `Unsupported`（terminal，操作未执行），绝不伪造 index 0。
+
+### 1.3 `wait_applied` —— 本地 applied-index 等待
+
+```rust
+use std::time::Duration;
+
+pub async fn wait_applied(
+    &self,
+    index: Index,
+    timeout: Duration,
+) -> Result<Index, ArachneError>;
+```
+
+语义：
+- 若本地**状态机** `applied >= index`，立即返回当前 applied（可能 ≥ index）；
+- 否则在 apply 推进到 `index` 时被唤醒（事件驱动，无忙轮询）；
+- 纯本地：不 redirect、不要求 quorum，**少数派 follower 可用**；
+- 超时返回 `Timeout`；`index == 0` 为 no-op；`timeout == 0` 立即 `Timeout`；
+- 取消安全：drop future 不会泄漏 waiter；
+- **不是 quorum barrier**，不替代线性读。
+
+### 1.4 新增错误变体
+
+```rust
+ArachneError::Unsupported(String)
+```
+
+- 对端不支持所请求的能力（旧 peer 的 `multi_get` / indexed write、wire `unknown_kind` 或缺字段）；
+- **terminal**：操作未执行；对同一 peer 重试同一调用无益；
+- `ArachneError` 现为 **17 个变体**；对 `ArachneError` 做穷尽 `match` 的下游代码需要新增一个分支。
+
+---
+
+## 2. 推荐用法（Hydra 形状）
+
+### 2.1 发布
+
+```rust
+// 1) 先写实体/分片（content-addressed，幂等）
+let entity_index = handle.multi_put_with_index(&entity_chunk).await?;
+
+// 2) 最后写 manifest + head（同一事务性批次）
+let final_index = handle.multi_put_with_index(&[
+    (manifest_key, manifest_bytes),
+    (retain_key, retain_bytes),
+    (head_key, head_token),
+]).await?;
+
+// final_index 可作为整棵树的 generation
+```
+
+### 2.2 物化（关闭「head 可见、entity 缺失」竞态）
+
+```rust
+let (head, head_index) = handle
+    .get_stale_with_index(head_key)
+    .await?
+    .expect("head exists");
+
+// 等待本地状态机真正 apply 到 head index
+handle.wait_applied(head_index, MATERIALIZE_WAIT).await?;
+
+// head 已 apply ⇒ 更早写入的 entity/shard 也已 apply
+let shards = handle.multi_get(&shard_keys, ReadConsistency::Stale).await?;
+let entities = handle.multi_get(&entity_keys, ReadConsistency::Stale).await?;
+
+// 校验 digest、合并、写入本地 SQLite
+```
+
+前提（必须由应用层保证）：**entity/shard 的写入先于 head**，因此它们的 log index 小于
+`head_index`。Arachne 只保证「同一状态机按 log 顺序 apply」，不解释树/manifest/SQLite 语义。
+
+---
+
+## 3. 兼容性
+
+### 3.1 API
+
+- 既有 `put` / `get` / `get_stale` / `get_stale_with_index` / `multi_put` / `delete` /
+  `cas` / `watch` / `get_stale_prefix` / `get_stale_range` 的签名与语义**不变**；
+- 新 API 全部为 additive；
+- crate 版本 `0.4.0 → 0.5.0`。
+
+### 3.2 数据目录（破坏性）
+
+- KV 快照版本 `2 → 3`：每条 session 记录新增 8 字节 effective index；
+- storage `FORMAT_VERSION 3 → 4`；
+- **没有新增命令 opcode**；WAL 命令流对 0.3.x 二进制仍可解析，破坏性来自 **session 快照格式 + 升级策略**；
+- 旧 v3 数据目录在 0.5.0 启动打开时**直接 fail-stop**（格式不匹配）；
+- 不允许「v3 目录原地升 v4」；不允许新 leader 向旧节点发送 v3 快照；
+- 推荐：**整集群停机 → 备份旧目录 → 重播种/迁移 → 启动 0.5.0**；
+- 回滚 = 恢复升级前整目录备份 + 旧二进制。
+
+完整步骤：`dev-docs/runbook-format-v4-upgrade.md`。
+
+### 3.3 线协议
+
+- `PROTOCOL_MINOR` **保持 0**（不 bump；bump 会破坏滚动升级握手）；
+- 新增 `Forward` kind：
+  - `kind=3` = `multi_get`
+  - `kind=4` = `ProposeWithIndex`
+- 旧 peer：
+  - 对未知 kind 在**执行前**返回 `unknown_kind`；
+  - 对 index 写省略 `commit_index`；
+  - 新客户端统一映射为 `Unsupported`，**绝不**静默回退为逐 key 读或伪造 index 0。
+- `multi_get` 的 `Some(vec![])`（present empty）在 wire 上可区分于 `None`。
+
+---
+
+## 4. 错误与重试
+
+| 错误 | 含义 | 建议 |
+|---|---|---|
+| `Timeout` | 有界等待超时；写的结果**未知** | 用同一 session 重试（幂等）；`wait_applied` 可重试 |
+| `Busy` | 队列/预算满 | 稍后重试；`multi_get` 可拆小批 |
+| `QuorumUnavailable` | 无 quorum，或目标 peer runtime 已不可用（stale hint） | 重试/换节点；`multi_get(Stale)` / `wait_applied` 仍可本地工作 |
+| `NotLeader { hint }` | 不是 leader | 跟随 hint 重定向 |
+| `Unsupported` | 旧 peer / 不支持该能力 | **terminal**；升级对端，不重试同一调用 |
+| `InvalidArgument` | 超限或参数非法 | 拆批/修正参数；不会部分执行 |
+| `Unrecoverable` | 致命存储/状态机错误 | fail-stop |
+
+补充：0.5.0 修复了「stale hint 指向已退出 runtime 但 listener 仍存活」时被错误归类为
+`Unrecoverable` 的问题；现在返回可重试的 `QuorumUnavailable`。
+
+---
+
+## 5. 性能与验证摘要
+
+以下为本机 loopback 测试环境数据，**不是容量承诺**；生产请按自身硬件/网络复测。
+
+| 场景 | 结果 |
+|---|---|
+| 单节点 24k keys（200 B，512/批） | **47 条读命令**（vs 24,000），~0.8 s |
+| 真实 tonic 3 节点 24k | 每轮 47 条命令，15–38 ms；杀 leader 重选 273–379 ms；24k/24k 一致 |
+| 10 分钟混合读写 + 故障（无 pause） | **1,393.8 ops/s**、**706.7 write ops/s**；423,928 writes / 836,263 ops；24k/24k 校验；**0 fatal / 0 Unrecoverable**；survivor applied 53,124 |
+| 10 分钟 p50/p99 | write 15.5/66.1 ms；get 10.3/57.2 ms；get_stale 53 µs/7.3 ms；multi_get 315 µs/7.5 ms；wait_applied 39 µs/4.8 ms |
+
+压测脚本（`#[ignore]`，按需运行）：
+
+```bash
+cargo test -p arachne-kv --test batch_read_load -- --ignored --nocapture
+cargo test -p arachne-kv-transport-tonic --test stress_24k_tonic -- --ignored --nocapture
+cargo test -p arachne-kv --test stress_24k_partition -- --ignored --nocapture
+cargo test -p arachne-kv-transport-tonic --test stress_10min_mixed -- --ignored --nocapture
+# 快速 smoke：ARACHNE_STRESS_SECS=30 ...
+```
+
+---
+
+## 6. 已知限制 / 后续
+
+- 本发布**未**包含：多小时 soak、`docker/bench` 1w/4w/8w 吞吐 A/B、bounded fuzz 实跑、
+  Hydra 下游 4000 users + 4000 roles + 16000 API keys 的端到端验收（下游负责）。
+- 10 分钟 soak 中 RSS 从 14 MiB 增至 267 MiB；主要是 24k 数据、持续写入的 WAL/快照、
+  session 表与测试缓冲，**未证明是泄漏**；更长 soak 的内存曲线建议作为后续观察项。
+- 内部测试加固 follow-up：3 节点快照恢复的 session index 传播、forwarded `multi_get`
+  actor 侧限额复核、budget/waiter 饱和测试、`Many` 读的 INV14 l2 场景、ConfChange-index
+  wait、写负载下 deadline 精度、wait + fail-stop。
+
+---
+
+## 7. 参考
+
+- 设计：`dev-docs/arachne-kv-batch-read-applied-index-design.md`
+- 开发计划：`dev-docs/plan-batch-read-applied-index.md`
+- 升级 runbook：`dev-docs/runbook-format-v4-upgrade.md`
+- API reference：`docs/api-reference.html`
+- 教程：`docs/tutorial.html`
