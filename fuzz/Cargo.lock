@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "arachne-kv"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arachne-kv-seam",
  "futures-util",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "arachne-kv-seam"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "arbitrary"

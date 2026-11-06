@@ -12,7 +12,7 @@ description = "Arachne: transport-agnostic product core (consensus, WAL storage,
 # 0.4.0: P0-P2 vs-etcd features — per-command outcome pipeline, consistent
 #   prefix/range reads, atomic multi-put, compare-and-swap, prefix watch;
 #   breaking storage format v3 (KV_SNAPSHOT_VERSION 2, FORMAT_VERSION 3).
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
