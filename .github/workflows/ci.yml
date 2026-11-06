@@ -89,6 +89,7 @@ jobs:
           cargo test -p arachne-kv --features fault-injection --test m2_durability
           cargo test -p arachne-kv --features fault-injection --test slow_fsync
           cargo test -p arachne-kv --features fault-injection --test sessions
+          cargo test -p arachne-kv --features fault-injection --test write_index_client_id
 
       - name: Build lean core (no default features)
         run: cargo build -p arachne-kv --no-default-features

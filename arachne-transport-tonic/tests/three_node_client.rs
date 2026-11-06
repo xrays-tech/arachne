@@ -634,3 +634,175 @@ async fn follower_put_with_index_forwards_over_wire() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// A follower's index-returning **batch** write must travel the full wire path:
+/// Handle -> `ForwardRequest{kind=4}` -> server -> sink ->
+/// `Command::ProposeWithIndex` -> apply pipeline -> `ForwardReply.commit_index`
+/// -> decode -> `ForwardOutcome.index` -> public `Index`.
+///
+/// The tested follower has **no** in-process peer handles registered, so it can
+/// only succeed via the tonic `RemoteForwarder`. Both keys of the batch must
+/// share the returned index, and that index must equal the leader's own
+/// `get_stale_with_index` origin for each key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_multi_put_with_index_forwards_over_wire() {
+    let profile = ProfileConfig {
+        heartbeat_interval_ms: 10,
+        election_timeout_ms: 200,
+        rpc_timeout_ms: 100,
+        ..Profile::Lan.config()
+    };
+
+    let mut addresses: HashMap<NodeId, SocketAddr> = HashMap::new();
+    for i in 1..=3u64 {
+        addresses.insert(node_id(i), "127.0.0.1:0".parse().expect("addr"));
+    }
+
+    let factory = TonicTransportFactory::new("mb", 1, 0, Vec::new(), addresses.clone());
+    factory.start().await.expect("start transport");
+
+    let metrics: Vec<Arc<Metrics>> = (0..3).map(|_| Arc::new(Metrics::new())).collect();
+    let mut handles: Vec<Handle> = Vec::new();
+    let mut tasks = Vec::new();
+    let mut dirs = Vec::new();
+
+    for i in 1..=3u64 {
+        let dir = temp_dir(&format!("mb-n{i}"));
+        let wal = WalStorage::open(
+            &dir,
+            WalOptions {
+                cluster_id: "mb".into(),
+                node_id: format!("n{i}"),
+                config: WalConfig {
+                    fsync_policy: FsyncPolicy::Always,
+                    segment_bytes: WalConfig::default().segment_bytes,
+                },
+                created_at_millis: 0,
+                fsync_observer: None,
+            },
+        )
+        .expect("open wal");
+
+        let me = node_id(i);
+        let (tx, rx) = factory.create(me.clone());
+        let peers = (1..=3u64)
+            .filter(|j| *j != i)
+            .map(|j| (j, node_id(j)))
+            .collect();
+        let config = RuntimeConfig {
+            self_raft_id: i,
+            self_node_id: me,
+            peers,
+            addresses: addresses.clone(),
+            raft: RaftNodeConfig::from_profile(&profile),
+            profile: profile.clone(),
+            metrics: Arc::clone(&metrics[(i - 1) as usize]),
+        };
+        let (runtime, handle) = match Runtime::new(config, wal, tx, rx, &logger()) {
+            Ok(pair) => pair,
+            Err(e) => panic!("runtime build failed: {e}"),
+        };
+        // Register the node's forward sink so an inbound `Forward` RPC can
+        // actually execute against this runtime.
+        factory.set_command_sink(node_id(i), runtime.command_sink());
+        tasks.push(tokio::spawn(runtime.run()));
+        handles.push(handle);
+        dirs.push(dir);
+    }
+
+    // Wait for an election.
+    for _ in 0..800 {
+        if metrics.iter().any(|m| m.is_leader()) {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+    }
+    let leader = (0..3)
+        .find(|i| metrics[*i].is_leader())
+        .expect("a leader must be elected");
+    let follower = (0..3).find(|i| *i != leader).expect("a follower exists");
+    let third = (0..3)
+        .find(|i| *i != leader && *i != follower)
+        .expect("a third node exists");
+
+    // Deliberately do NOT register the tested follower as a peer of anyone (and
+    // do not give it any peer handles). Only the leader/third pair is linked, so
+    // the follower's batch write cannot be satisfied in-process.
+    handles[leader].register_peer(handles[third].clone());
+    handles[third].register_peer(handles[leader].clone());
+
+    // A redirect needs the follower to know the leader's hint.
+    let mut follower_knows_leader = false;
+    for _ in 0..800 {
+        if handles[follower].leader_hint().await.is_some() {
+            follower_knows_leader = true;
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        follower_knows_leader,
+        "the follower must learn the leader before forwarding can be attempted"
+    );
+
+    // Two-key batch through the follower; only the tonic kind=4 forward works.
+    let entries: [(&[u8], &[u8]); 2] = [(b"m1", b"x"), (b"m2", b"y")];
+    let mut multi_index = None;
+    let mut last_err = String::new();
+    for _ in 0..400 {
+        match handles[follower].multi_put_with_index(&entries).await {
+            Ok(index) => {
+                multi_index = Some(index);
+                break;
+            }
+            Err(e @ ArachneError::Timeout)
+            | Err(e @ ArachneError::QuorumUnavailable)
+            | Err(e @ ArachneError::NotLeader { .. }) => {
+                last_err = e.to_string();
+                tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                panic!("follower multi_put_with_index failed with a non-transient error: {e}")
+            }
+        }
+    }
+    let multi_index = multi_index.unwrap_or_else(|| {
+        panic!(
+            "follower multi_put_with_index must forward over the wire (last transient: {last_err})"
+        )
+    });
+    assert!(
+        multi_index >= 1,
+        "a forwarded indexed multi-write must carry a real applied-write index, got {multi_index}"
+    );
+
+    for (key, value) in entries {
+        let mut origin = None;
+        for _ in 0..400 {
+            match handles[leader]
+                .get_stale_with_index(key)
+                .await
+                .expect("leader get_stale_with_index")
+            {
+                Some((seen, index)) if seen == value => {
+                    origin = Some(index);
+                    break;
+                }
+                _ => tokio::time::sleep(core::time::Duration::from_millis(10)).await,
+            }
+        }
+        assert_eq!(
+            origin,
+            Some(multi_index),
+            "every key of the forwarded batch must share the returned index (key {key:?})"
+        );
+    }
+
+    for task in &tasks {
+        task.abort();
+    }
+    factory.shutdown().await;
+    for dir in &dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -725,6 +725,32 @@ impl KvStateMachine {
         guard.sessions.contains_key(&SessionKey { client_id, seq_no })
     }
 
+    /// The highest `seq_no` recorded for `client_id` (0 when it has none).
+    ///
+    /// The runtime calls this once at startup: a same-node restart on an
+    /// existing data dir resumes its sequence **above** every previously
+    /// committed session for its node-scoped client id, so a fresh process can
+    /// never reuse an old `(client_id, seq_no)` with a different payload.
+    pub fn max_session_seq(&self, client_id: u64) -> u64 {
+        let guard = self
+            .store
+            .read()
+            .expect("state machine read lock should never be poisoned");
+        // `sessions` is ordered by `(client_id, seq_no)`; the greatest key not
+        // exceeding the client's `u64::MAX` seq is its highest sequence.
+        let probe = SessionKey {
+            client_id,
+            seq_no: u64::MAX,
+        };
+        guard
+            .sessions
+            .range(..=probe)
+            .next_back()
+            .filter(|(key, _)| key.client_id == client_id)
+            .map(|(key, _)| key.seq_no)
+            .unwrap_or(0)
+    }
+
     /// Read the applied version and the kv map under a *single* read lock,
     /// returning a coherent copy. This is the D-Arc invariant in one shot: the
     /// version and the map are always observed together (no torn read). The
@@ -1478,6 +1504,23 @@ mod tests {
         // Replaying the delete (session 1/2) at index 4 must NOT remove v2.
         sm.apply(4, &delete).unwrap();
         assert_eq!(sm.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    /// `max_session_seq` reports the highest sequence for one client only; the
+    /// runtime uses it to advance a restarted handle past old sessions.
+    #[test]
+    fn max_session_seq_reports_the_highest_seq_per_client() {
+        let sm = KvStateMachine::new();
+        let cmd = KvStateMachine::encode_put(42, 7, b"k", b"v");
+        sm.apply_with_events_and_index(1, &cmd)
+            .expect("apply the session");
+
+        assert_eq!(sm.max_session_seq(42), 7);
+        assert_eq!(
+            sm.max_session_seq(43),
+            0,
+            "another client has no sessions"
+        );
     }
 
     #[test]

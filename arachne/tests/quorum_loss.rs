@@ -282,6 +282,34 @@ async fn losing_quorum_fails_writes_and_linearizable_reads_but_serves_stale_read
     .expect("a linearizable read without a quorum must not hang");
     assert_quorum_failure("get", &get);
 
+    // Index-returning writes must not fabricate an index either: there is no
+    // quorum, so they must fail with the documented error, never `Ok(index)`.
+    let put_with_index = tokio::time::timeout(
+        core::time::Duration::from_secs(10),
+        nodes[survivor].handle.put_with_index(b"k4", b"v4"),
+    )
+    .await
+    .expect("put_with_index without a quorum must not hang");
+    assert_quorum_failure("put_with_index", &put_with_index);
+
+    let multi_put_with_index = tokio::time::timeout(
+        core::time::Duration::from_secs(10),
+        nodes[survivor]
+            .handle
+            .multi_put_with_index(&[(b"k5", b"v5"), (b"k6", b"v6")]),
+    )
+    .await
+    .expect("multi_put_with_index without a quorum must not hang");
+    assert_quorum_failure("multi_put_with_index", &multi_put_with_index);
+
+    let delete_with_index = tokio::time::timeout(
+        core::time::Duration::from_secs(10),
+        nodes[survivor].handle.delete_with_index(b"k"),
+    )
+    .await
+    .expect("delete_with_index without a quorum must not hang");
+    assert_quorum_failure("delete_with_index", &delete_with_index);
+
     // The weak read is the documented opt-out: it is served from the local
     // state machine and is unaffected by the loss of quorum (propsol §2.1/N1).
     let stale = nodes[survivor]

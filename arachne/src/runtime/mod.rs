@@ -204,6 +204,99 @@ fn stable_code(error: &ArachneError) -> &'static str {
     }
 }
 
+/// Test-only override for the node-scoped client id (Gate-6 MF-A).
+///
+/// `u64::MAX` means "no override". When set, every `Runtime::new` in this
+/// process uses the value instead of `client::next_client_id`, which lets a
+/// test reproduce the same-`client_id` restart path that the seq-continuation
+/// fix protects. Feature-gated: never present in released artifacts.
+#[cfg(feature = "fault-injection")]
+static CLIENT_ID_OVERRIDE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Set (or clear) the test-only client-id override. See
+/// [`CLIENT_ID_OVERRIDE`]. Must be set **before** constructing the runtimes it
+/// should affect; the value is process-global, so a test using it must be the
+/// only runtime builder in its binary.
+#[cfg(feature = "fault-injection")]
+pub fn set_client_id_override(client_id: Option<u64>) {
+    CLIENT_ID_OVERRIDE.store(client_id.unwrap_or(u64::MAX), Ordering::SeqCst);
+}
+
+/// The highest session sequence for `client_id` across a batch of command
+/// payloads. Non-session entries (empty no-ops, ConfChange data, malformed
+/// commands) are ignored.
+fn max_session_seq_in_data<'a>(
+    datas: impl Iterator<Item = &'a [u8]>,
+    client_id: u64,
+) -> u64 {
+    let mut max_seq = 0u64;
+    for data in datas {
+        if let Some((cid, seq)) = KvStateMachine::command_session(data)
+            && cid == client_id
+        {
+            max_seq = max_seq.max(seq);
+        }
+    }
+    max_seq
+}
+
+/// The highest session sequence for `client_id` in the **retained log tail**
+/// (entries at or above `from`, i.e. the part beyond the restored snapshot).
+///
+/// The state machine has only been restored from the snapshot when the runtime
+/// chooses its client id; committed tail entries are replayed by the actor
+/// *after* `Runtime::new` returns. Scanning the tail here is what makes a
+/// restarted (same-`NodeId`) handle start above **every** old session, rather
+/// than only those captured by the last snapshot — otherwise the new process
+/// could reuse a tail session's `(client_id, seq_no)` and be silently deduped.
+///
+/// The scan is bounded in memory: entries are read in byte-sized chunks, and a
+/// single entry larger than the chunk is read on its own. Any in-range index
+/// that storage cannot return is a loud error: under-computing the max would
+/// resurrect the P0 dedup failure.
+fn log_tail_max_session_seq(
+    storage: &WalStorage,
+    from: LogIndex,
+    client_id: u64,
+) -> Result<u64, String> {
+    const CHUNK_ENTRIES: u64 = 4096;
+    const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+
+    let last = storage.last_index().map_err(|e| e.to_string())?;
+    let mut next = from.max(1);
+    let mut max_seq = 0u64;
+
+    while next <= last {
+        let high = (next + CHUNK_ENTRIES).min(last + 1);
+        let batch = storage
+            .entries(next, high, Some(CHUNK_BYTES))
+            .map_err(|e| e.to_string())?;
+        if batch.is_empty() {
+            // The next entry alone is larger than the byte cap: read just it.
+            let single = storage
+                .entries(next, next + 1, None)
+                .map_err(|e| e.to_string())?;
+            if single.is_empty() {
+                return Err(format!(
+                    "storage returned no entry for in-range index {next}"
+                ));
+            }
+            max_seq = max_seq.max(max_session_seq_in_data(
+                single.iter().map(|entry| entry.data.as_slice()),
+                client_id,
+            ));
+            next += 1;
+            continue;
+        }
+        max_seq = max_seq.max(max_session_seq_in_data(
+            batch.iter().map(|entry| entry.data.as_slice()),
+            client_id,
+        ));
+        next += batch.len() as u64;
+    }
+    Ok(max_seq)
+}
+
 impl CommandSink for ForwardCommandSink {
     fn sink(
         &self,
@@ -1310,6 +1403,39 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             )));
         }
 
+        // Node-scoped, restart-safe session identity. Hashing the node id
+        // avoids cross-host PID collisions (the Hydra regression). The starting
+        // sequence must exceed every session this client id already committed:
+        // the restored snapshot's table **plus** the log tail that the actor has
+        // not replayed yet. Otherwise a fresh process could reuse a still-log-
+        // only `(client_id, seq_no)` and have its new payload silently deduped.
+        #[cfg(feature = "fault-injection")]
+        let client_id = {
+            let override_id = CLIENT_ID_OVERRIDE.load(Ordering::SeqCst);
+            if override_id == u64::MAX {
+                crate::client::next_client_id(&config.self_node_id)
+            } else {
+                override_id
+            }
+        };
+        #[cfg(not(feature = "fault-injection"))]
+        let client_id = crate::client::next_client_id(&config.self_node_id);
+        let snapshot_max_seq = sm.max_session_seq(client_id);
+        // Scan only the still-log-only tail: entries at or below the snapshot
+        // are already in `snapshot_max_seq`, and compaction may have removed
+        // them from the retained window entirely.
+        let scan_from = storage
+            .first_index()
+            .map_err(|e| NodeError::Storage(format!("cannot read the first log index: {e}")))?
+            .max(snapshot_index.saturating_add(1));
+        let tail_max_seq = log_tail_max_session_seq(&storage, scan_from, client_id).map_err(|e| {
+            NodeError::Storage(format!("cannot scan the log tail for sessions: {e}"))
+        })?;
+        let initial_seq = snapshot_max_seq
+            .max(tail_max_seq)
+            .saturating_add(1)
+            .max(1);
+
         // The apply task and the read path both hold a handle to the same state
         // machine (propsol N): the apply task writes to it, the linear read
         // path reads it directly under a read lock.
@@ -1396,6 +1522,8 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
         ));
         let handle = Handle::new_local(
             config.self_node_id.clone(),
+            client_id,
+            initial_seq,
             tx,
             forwarder,
             &config.profile,
@@ -3451,5 +3579,50 @@ mod multi_get_budget_tests {
                 _ => panic!("expected Command::MultiGet"),
             }
         }
+    }
+
+    /// The tail scan's per-entry parse ignores non-session entries and returns
+    /// the highest sequence for the requested client only.
+    #[test]
+    fn max_session_seq_in_data_uses_highest_and_ignores_non_sessions() {
+        let datas = vec![
+            Vec::new(),
+            vec![0xFF],
+            KvStateMachine::encode_put(42, 3, b"a", b"1"),
+            KvStateMachine::encode_put(42, 7, b"b", b"2"),
+            KvStateMachine::encode_put(43, 9, b"c", b"3"),
+        ];
+        let refs: Vec<&[u8]> = datas.iter().map(|d| d.as_slice()).collect();
+
+        assert_eq!(max_session_seq_in_data(refs.iter().copied(), 42), 7);
+        assert_eq!(max_session_seq_in_data(refs.iter().copied(), 43), 9);
+        assert_eq!(
+            max_session_seq_in_data(std::iter::empty(), 42),
+            0,
+            "no entries means no sessions"
+        );
+    }
+
+    /// Every session-bearing command layout is parsed by the tail scan.
+    #[test]
+    fn max_session_seq_in_data_parses_every_session_command() {
+        use crate::state_machine::{CasOp, CasPred};
+
+        let datas = vec![
+            KvStateMachine::encode_delete(42, 1, b"a"),
+            KvStateMachine::encode_multi_put(42, 5, &[(b"b", b"2")]),
+            KvStateMachine::encode_cas(
+                42,
+                8,
+                b"c",
+                &CasPred::ValueEquals(b"old".to_vec()),
+                &CasOp::Put(b"new".to_vec()),
+            ),
+            // Another client must not contribute to client 42's maximum.
+            KvStateMachine::encode_put(7, 99, b"d", b"4"),
+        ];
+        let refs: Vec<&[u8]> = datas.iter().map(|d| d.as_slice()).collect();
+
+        assert_eq!(max_session_seq_in_data(refs.iter().copied(), 42), 8);
     }
 }

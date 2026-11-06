@@ -6,6 +6,46 @@
 
 ---
 
+## 0.5.1 — 2026-11-06
+
+主题：**P0 修复——写入 index 回退 / 静默丢写（跨主机 `client_id` 冲突）**。
+
+### P0 修复
+
+- **node-scoped `client_id`**：不再使用 `std::process::id()`。`client_id` 由
+  FNV-1a(`NodeId` + 进程内 counter) 生成，确定性、无 time/random/PID；不同
+  host/container 即使 PID 相同也不会得到同一个 `client_id`。
+- **序列续接**：`Runtime::new` 在启动时根据该 node 的 `client_id` 计算
+  `initial_seq = max_session_seq + 1`，其中 `max_session_seq` 同时覆盖
+  **快照中的 session 表**与**尚未被 actor 重放的 WAL tail**。重启后新的
+  `(client_id, seq_no)` 不会与本节点**本地已持久化**（快照 + WAL tail）的旧
+  session 重叠；因此不会把不同 payload 误判为 dedup 而返回旧 index / 静默丢弃新值。
+- **回归保护**（`--features fault-injection`）：
+  - `write_index_client_id` 用固定 `client_id` 在**同一数据目录**重启，分别
+    覆盖「session 已在快照中」和「session 只在 WAL tail」两种路径；断言重启后
+    首次 `put_with_index` 的 index 大于旧最大 index 且新 key 可见。
+  - 新增 `client_id_for` 单元测试（同 counter 不同 node、同 node 不同 counter、
+    确定性）与 tail 扫描解析单元测试。
+  - 扩展 leader churn（3 节点）、quorum-loss（indexed 写入必须失败而非伪造
+    index）与 real-tonic follower `multi_put_with_index` 测试。
+
+### 残余风险（P1）
+
+- **复制窗口内崩溃**：写入在本地状态机持久化之前崩溃时，结果仍可能是
+  unknown（既有 `Timeout` 语义）；dedup 只保护已经进入本地 session 表的
+  `(client_id, seq_no)`。
+- **单节点磁盘丢失 / 旧数据目录 re-seed 到活跃集群**：节点身份或 session
+  空间被重建后重新加入活跃集群，仍可能产生无法由本次修复覆盖的重叠；按
+  runbook 做破坏性升级/替换，不要将旧目录重新接入。
+- **完整性机制后续项**：本次不引入 payload hash / `SessionConflict`。后续
+  版本承诺以 payload hash 作为 **completeness** 机制，为同一个
+  `(client_id, seq_no)` 下不同 payload 的情况提供显式检测，而不是静默
+  dedup。
+- **运维缓解**：Hydra 侧的读回校验（read-back guard）仍是当前生产环境的
+  运行期兜底；在完整性机制交付前不要移除。
+
+---
+
 ## 0.5.0 — 2026-11-06
 
 主题：**批量精确读 + 写入/应用索引可见性 + 本地 applied-index 等待**。

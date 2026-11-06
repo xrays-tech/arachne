@@ -48,6 +48,9 @@
 mod handle;
 
 pub use handle::{Handle, WatchSubscription};
+/// The runtime's local handle needs a node-scoped client id (and its restart
+/// sequence). Kept crate-private: callers never choose a session id.
+pub(crate) use handle::next_client_id;
 
 use std::net::SocketAddr;
 

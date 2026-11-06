@@ -68,6 +68,8 @@ impl Handle {
     /// [`Handle::register_peer`] after all handles are built.
     pub(crate) fn new_local(
         self_id: NodeId,
+        client_id: u64,
+        initial_seq: u64,
         tx: mpsc::Sender<Command>,
         remote: Option<Arc<dyn RemoteForwarder>>,
         profile: &ProfileConfig,
@@ -76,8 +78,8 @@ impl Handle {
         Self {
             inner: Arc::new(HandleInner {
                 self_id,
-                client_id: next_client_id(),
-                seq: AtomicU64::new(1),
+                client_id,
+                seq: AtomicU64::new(initial_seq),
                 tx,
                 peers: RwLock::new(HashMap::new()),
                 max_key_bytes: profile.max_key_bytes,
@@ -1722,13 +1724,47 @@ impl std::fmt::Debug for WatchSubscription {
     }
 }
 
-/// The next per-handle `client_id`: the process id in the high bits (so
-/// distinct processes have distinct ids) and a per-process counter in the low
-/// bits (so distinct handles within a process have distinct ids).
-fn next_client_id() -> u64 {
+/// FNV-1a (64-bit) constants. Deterministic and dependency-free, so it is safe
+/// on every target (including the L2 model).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// A **node-scoped, restart-safe** client id for `(node_id, counter)`.
+///
+/// The old scheme used `process::id()` in the high bits, so two processes
+/// (hosts/containers) that happened to share a PID produced the same
+/// `client_id`. Because each handle's `seq_no` starts at 1, a different payload
+/// could then reuse a committed `(client_id, seq_no)`: the state machine treats
+/// it as a deduped replay and returns the *old* effective index while silently
+/// dropping the new value (the Hydra regression).
+///
+/// Hashing the *node identity* with the counter makes IDs collision-resistant
+/// across hosts without time, randomness, or the process id. This is a 64-bit
+/// hash: distinct `(node_id, counter)` inputs are **not** mathematically
+/// guaranteed to map to distinct ids (birthday bound ≈ 2^-64 per pair), but the
+/// mapping is deterministic and stable for a given node/counter.
+pub(crate) fn client_id_for(node_id: &NodeId, counter: u64) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in node_id.as_str().as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    for byte in counter.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The next process-global client id for `node_id`.
+///
+/// The counter is process-global so distinct handles in one process get
+/// distinct ids; the node-scoped hash keeps ids distinct from other nodes'
+/// handles at the same counter value.
+pub(crate) fn next_client_id(node_id: &NodeId) -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let base = (std::process::id() as u64) << 32;
-    base | COUNTER.fetch_add(1, Ordering::SeqCst)
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+    client_id_for(node_id, counter)
 }
 
 /// Recover a read guard even from a poisoned lock (the guarded data is a simple
@@ -1807,11 +1843,38 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         Handle::new_local(
             NodeId::from("n1"),
+            1,
+            1,
             tx,
             Some(remote),
             &crate::Profile::Lan.config(),
             Arc::new(MultiGetBudget::new()),
         )
+    }
+
+    /// Client ids are node-scoped **and** counter-scoped: the old
+    /// `process::id()`-based scheme gave different hosts with the same PID the
+    /// same id (Hydra's silent-dedup regression).
+    #[test]
+    fn client_ids_are_node_scoped_and_counter_scoped() {
+        let n1 = NodeId::from("n1");
+        let n2 = NodeId::from("n2");
+
+        assert_ne!(
+            client_id_for(&n1, 0),
+            client_id_for(&n2, 0),
+            "different nodes at the same counter must never collide"
+        );
+        assert_ne!(
+            client_id_for(&n1, 0),
+            client_id_for(&n1, 1),
+            "the same node at different counters must never collide"
+        );
+        assert_eq!(
+            client_id_for(&n1, 7),
+            client_id_for(&n1, 7),
+            "the mapping must be deterministic"
+        );
     }
 
     /// A peer rejecting an unknown command kind must map to the terminal
