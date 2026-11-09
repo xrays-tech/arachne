@@ -420,6 +420,13 @@ fn encode_forward_result(result: Option<ApplyOutcome>) -> Option<ForwardResult> 
             })),
         }),
         Some(ApplyOutcome::None) | None => None,
+        // Unreachable in practice: a `Conflict` outcome is turned into
+        // `Err(ArachneError::SessionConflict)` by the actor's write-back reply
+        // (`PendingReply::send_applied`), so the command sink surfaces it as
+        // `Err("session_conflict")` (the lossy wire code) and never builds a
+        // `ForwardOutcome` carrying a `Conflict` outcome. Kept for exhaustiveness
+        // (a new variant must be decided here explicitly, not silently collapse).
+        Some(ApplyOutcome::Conflict) => None,
     }
 }
 

@@ -30,6 +30,23 @@ pub enum ApplyOutcome {
         /// The current value; `None` when the key is absent.
         current_value: Option<Vec<u8>>,
     },
+    /// The command **did not apply** because its `(client_id, seq_no)` session
+    /// was already used by a **different payload** (a session conflict).
+    ///
+    /// This is the "loud fuse" that surfaces what would otherwise be silent
+    /// data loss: a replayed session whose command bytes differ from the
+    /// originally-applied ones can never be safely deduped, so it is rejected
+    /// rather than silently returning a stale result. The command's session is
+    /// still recorded (exactly-once), so a replay of the *same* conflicting
+    /// command returns this cached conflict; the original command's cached
+    /// outcome and origin index are preserved (a conflict never overwrites the
+    /// original record nor mutates any key).
+    ///
+    /// Judgment is a pure function of `(incoming command, stored digest)`, so it
+    /// is deterministic and replays identically on every node. The conflict
+    /// detection horizon equals the session retention horizon: after session GC
+    /// the record (and its digest) are gone and the session reads as fresh again.
+    Conflict,
 }
 
 /// The deterministic data store driven by the replicated log.

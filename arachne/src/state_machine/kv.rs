@@ -136,7 +136,15 @@ pub const MAX_STALE_RANGE_ENTRIES: usize = 10_000;
 /// fabricating `index 0` would leak an illegal public value and be persisted
 /// forever. The same format package bumps the storage `FORMAT_VERSION` to 4
 /// (no new opcodes; see `dev-docs/runbook-format-v4-upgrade.md`).
-const KV_SNAPSHOT_VERSION: u8 = 3;
+///
+/// v4 (session-conflict, ora-4): the session-table tag space grew to `0/1/2/3`
+/// (`+ Conflict`) so a cached **conflict outcome** survives snapshot→restore,
+/// and every session record appends an 8-byte LE `digest` (FNV-64 of the whole
+/// command) after the effective index — the digest is what lets a node rebuilt
+/// from a snapshot agree with a node rebuilt by log replay on every later
+/// conflict judgment. The same format package bumps the storage
+/// `FORMAT_VERSION` to 5 (see the upgrade runbook, fail-stop / no migration).
+const KV_SNAPSHOT_VERSION: u8 = 4;
 
 /// The kind of command, parsed from its opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +272,21 @@ struct SessionKey {
 struct SessionRecord {
     outcome: ApplyOutcome,
     index: LogIndex,
+    /// FNV-64 of the **entire command bytes** that first produced this record.
+    ///
+    /// This is what turns a session conflict from silent into loud: on an exact
+    /// `(client_id, seq_no)` hit, if the incoming command's digest differs from
+    /// this stored one, it cannot be a safe idempotent replay (it would silently
+    /// return a stale result and drop the new payload), so it is rejected with
+    /// `ApplyOutcome::Conflict` (design: session conflict review, ora-4).
+    ///
+    /// Must be snapshotted with the record: otherwise a node rebuilt from a
+    /// snapshot and a node rebuilt by log replay would disagree on every later
+    /// conflict judgment, violating the "rebuilt node replays identically"
+    /// contract. Because the digest is the only judgment input, the conflict
+    /// check is a pure function of `(incoming command, stored digest)` and is
+    /// deterministic on every node.
+    digest: u64,
 }
 
 /// The in-memory KV + session-table state machine.
@@ -849,10 +872,16 @@ impl StateMachine for KvStateMachine {
                         None => buf.push(0),
                     }
                 }
+                // v4 (session conflict): a cached conflict outcome must survive
+                // snapshot→restore too (tag = 3, no payload).
+                ApplyOutcome::Conflict => buf.push(3),
             }
             // v3: the effective index of the write that produced the outcome
             // (the original index on a deduped replay).
             buf.extend_from_slice(&record.index.to_le_bytes());
+            // v4: the payload digest (FNV-64 of the whole command) that later
+            // conflict judgments compare against.
+            buf.extend_from_slice(&record.digest.to_le_bytes());
         }
         Ok(buf)
     }
@@ -976,6 +1005,19 @@ impl KvStateMachine {
         // with the last value, not one per occurrence — design D6).
         if command.first() == Some(&OP_MULTI_PUT) {
             let (session, entries) = Self::parse_multi_put(command)?;
+            let cmd_digest = fnv64(command);
+            // Session-conflict guard (ora-4): an exact `(client_id, seq_no)`
+            // hit whose command bytes differ from the first-applied ones can
+            // never be a safe idempotent replay — it would silently return the
+            // old result and drop the new payload. Reject it loudly without
+            // mutating anything and without overwriting the original record.
+            if let Some(record) = guard.sessions.get(&session) {
+                if record.digest != cmd_digest {
+                    let original_index = record.index;
+                    guard.applied = index;
+                    return Ok((ApplyOutcome::Conflict, original_index, Vec::new()));
+                }
+            }
             let cached = guard.sessions.get(&session).cloned();
             // A replay reports the original batch's index; a first apply
             // reports this entry's index (all keys share one atomic apply).
@@ -1002,6 +1044,7 @@ impl KvStateMachine {
                     SessionRecord {
                         outcome: ApplyOutcome::None,
                         index,
+                        digest: cmd_digest,
                     },
                 );
             }
@@ -1018,6 +1061,17 @@ impl KvStateMachine {
         // to success and break the "at most one outcome" invariant, §6.2.2).
         if command.first() == Some(&OP_CAS) {
             let (session, key, pred, success) = Self::parse_cas(command)?;
+            let cmd_digest = fnv64(command);
+            // Session-conflict guard (ora-4): same rule as the other op types —
+            // an exact session hit with a different payload digest is rejected
+            // loudly rather than deduped silently into a stale result.
+            if let Some(record) = guard.sessions.get(&session) {
+                if record.digest != cmd_digest {
+                    let original_index = record.index;
+                    guard.applied = index;
+                    return Ok((ApplyOutcome::Conflict, original_index, Vec::new()));
+                }
+            }
             let cached = guard.sessions.get(&session).cloned();
             let (outcome, effective_index, events) = match cached {
                 Some(record) => (record.outcome, record.index, Vec::new()),
@@ -1073,6 +1127,7 @@ impl KvStateMachine {
                         SessionRecord {
                             outcome: outcome.clone(),
                             index,
+                            digest: cmd_digest,
                         },
                     );
                     (outcome, index, events)
@@ -1083,6 +1138,19 @@ impl KvStateMachine {
         }
 
         let (session, op, key, val) = Self::parse_command(command)?;
+        let cmd_digest = fnv64(command);
+
+        // Session-conflict guard (ora-4): an exact `(client_id, seq_no)` hit
+        // with a different command digest is rejected loudly (no mutation, no
+        // overwrite of the original record) rather than deduped into a stale
+        // result. A digest match (a genuine retry) keeps the dedup path below.
+        if let Some(record) = guard.sessions.get(&session) {
+            if record.digest != cmd_digest {
+                let original_index = record.index;
+                guard.applied = index;
+                return Ok((ApplyOutcome::Conflict, original_index, Vec::new()));
+            }
+        }
 
         // Idempotency: a replayed session returns its cached result without
         // re-mutating the store — and produces no events (first-apply only).
@@ -1120,6 +1188,7 @@ impl KvStateMachine {
                     SessionRecord {
                         outcome: outcome.clone(),
                         index,
+                        digest: cmd_digest,
                     },
                 );
                 (outcome, index, events)
@@ -1291,6 +1360,24 @@ impl KvStateMachine {
 
 // ---- small big-/little-endian cursor helpers (test-free, pure) -------------
 
+/// FNV-1a 64-bit hash of a byte slice.
+///
+/// Used as the per-session `digest` (the payload fingerprint that turns a
+/// session conflict into a loud error instead of silent data loss). FNV is
+/// chosen for determinism and zero dependencies — the state machine must be a
+/// pure function of the applied log, and the digest must agree across nodes
+/// and across snapshot/log-replay rebuilds.
+fn fnv64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, KvError> {
     let mut buf = [0u8; 8];
     cursor
@@ -1392,13 +1479,21 @@ fn decode_store(bytes: &[u8]) -> Result<Store, KvError> {
                     _ => return Err(KvError::MalformedSnapshot),
                 }
             }
+            // v4: a cached session-conflict outcome (tag = 3, no payload).
+            3 => ApplyOutcome::Conflict,
             _ => return Err(KvError::MalformedSnapshot),
         };
         // v3: the effective index follows the outcome encoding.
         let index = read_u64(&mut cursor)?;
+        // v4: the payload digest follows the effective index.
+        let digest = read_u64(&mut cursor)?;
         sessions.insert(
             SessionKey { client_id, seq_no },
-            SessionRecord { outcome, index },
+            SessionRecord {
+                outcome,
+                index,
+                digest,
+            },
         );
     }
 
@@ -1820,8 +1915,11 @@ mod tests {
             Err(KvError::MalformedSnapshot)
         ));
 
-        // Any version byte other than the current one is rejected too.
-        let mut wrong = vec![4u8]; // KV_SNAPSHOT_VERSION is 3 (bumped in Phase 2)
+        // Any version byte other than the current one is rejected too. Derive a
+        // definitely-wrong byte from the current constant so this test cannot
+        // collide when KV_SNAPSHOT_VERSION is bumped again.
+        let wrong_version = KV_SNAPSHOT_VERSION.wrapping_add(1);
+        let mut wrong = vec![wrong_version];
         wrong.extend_from_slice(&0u64.to_le_bytes());
         wrong.extend_from_slice(&0u32.to_le_bytes());
         wrong.extend_from_slice(&0u32.to_le_bytes());
@@ -1851,6 +1949,71 @@ mod tests {
             (Some(b"v2".to_vec()), Some(3)),
             "re-put after delete must carry an index above the whole history"
         );
+    }
+
+    // ---- SessionConflict (ora-4): exact session hit + different digest ------
+
+    /// Reusing an exact `(client_id, seq_no)` with a **different payload** is a
+    /// session conflict: it is rejected (never deduped into a stale result),
+    /// mutates nothing, and does not overwrite the original record. A
+    /// same-payload retry stays a genuine dedup.
+    #[test]
+    fn session_conflict_rejects_a_different_payload_for_a_used_session() {
+        let sm = KvStateMachine::new();
+        let first = KvStateMachine::encode_put(7, 1, b"k", b"v1");
+        assert_eq!(
+            sm.apply(1, &first).unwrap(),
+            ApplyOutcome::Value(b"v1".to_vec())
+        );
+        // Same session, same payload → genuine retry → cached result (dedup).
+        assert_eq!(
+            sm.apply(2, &first).unwrap(),
+            ApplyOutcome::Value(b"v1".to_vec())
+        );
+        // Same session, DIFFERENT payload → conflict, no mutation.
+        let conflicting = KvStateMachine::encode_put(7, 1, b"k", b"v2");
+        assert_eq!(sm.apply(3, &conflicting).unwrap(), ApplyOutcome::Conflict);
+        assert_eq!(
+            sm.get_with_index(b"k").unwrap(),
+            (Some(b"v1".to_vec()), Some(1)),
+            "a conflict must not mutate nor overwrite the original record"
+        );
+        // The original session's record is preserved: a same-payload retry still
+        // dedups to the first write's cached outcome.
+        assert_eq!(
+            sm.apply(4, &first).unwrap(),
+            ApplyOutcome::Value(b"v1".to_vec())
+        );
+        // Conflicts still advance the applied index (every entry is applied;
+        // only the mutation is skipped) — required for index contiguity.
+        assert_eq!(sm.applied_index(), 4);
+    }
+
+    /// The session digest survives snapshot→restore: after a restart from a
+    /// snapshot, a different payload still conflicts and a same-payload retry
+    /// still dedups.
+    #[test]
+    fn session_conflict_digest_survives_snapshot_roundtrip() {
+        let sm = KvStateMachine::new();
+        sm.apply(1, &KvStateMachine::encode_put(7, 1, b"k", b"v1"))
+            .unwrap();
+        let snap = sm.snapshot().unwrap();
+
+        let sm2 = KvStateMachine::new();
+        sm2.restore(&snap).unwrap();
+        // Different payload after restore → still a conflict (digest survived).
+        assert_eq!(
+            sm2.apply(2, &KvStateMachine::encode_put(7, 1, b"k", b"v2"))
+                .unwrap(),
+            ApplyOutcome::Conflict
+        );
+        // Same payload after restore → still dedups to the original result.
+        assert_eq!(
+            sm2.apply(3, &KvStateMachine::encode_put(7, 1, b"k", b"v1"))
+                .unwrap(),
+            ApplyOutcome::Value(b"v1".to_vec())
+        );
+        assert_eq!(sm2.get(b"k").unwrap(), Some(b"v1".to_vec()));
     }
 
     // ---- M2-P1B: atomic multi-put -------------------------------------------

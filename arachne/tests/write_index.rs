@@ -195,7 +195,7 @@ async fn dedup_replay_returns_original_index() {
         .await
         .expect("first apply");
     let replay = handle
-        .propose_raw_with_index(KvStateMachine::encode_put(CLIENT, SEQ, b"k", b"v2"), CLIENT, SEQ)
+        .propose_raw_with_index(KvStateMachine::encode_put(CLIENT, SEQ, b"k", b"v1"), CLIENT, SEQ)
         .await
         .expect("replay");
 

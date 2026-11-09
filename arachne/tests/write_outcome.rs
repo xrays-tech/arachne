@@ -17,7 +17,7 @@ use arachne_kv::consensus::RaftNodeConfig;
 use arachne_kv::runtime::{Runtime, RuntimeConfig};
 use arachne_kv::state_machine::KvStateMachine;
 use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne_kv::{ApplyOutcome, Metrics, NodeId, Profile, ProfileConfig};
+use arachne_kv::{ApplyOutcome, ArachneError, Metrics, NodeId, Profile, ProfileConfig};
 use arachne_kv_testsupport::InMemoryTransportFactory;
 use slog::Drain;
 
@@ -150,12 +150,11 @@ async fn replay_of_same_session_returns_cached_outcome() {
         .expect("propose");
     assert_eq!(first, ApplyOutcome::Value(b"first".to_vec()));
 
-    // Same session, a *different* payload than the first: dedup must win — the
-    // cached outcome from the original apply is returned, and the key keeps the
-    // first write.
+    // Same session, the SAME payload: a genuine retry → the cached outcome is
+    // returned and the command is not re-applied.
     let replay = handle
         .propose_with_outcome(
-            KvStateMachine::encode_put(42, 7, b"k", b"second"),
+            KvStateMachine::encode_put(42, 7, b"k", b"first"),
             42,
             7,
         )
@@ -165,7 +164,30 @@ async fn replay_of_same_session_returns_cached_outcome() {
     assert_eq!(
         handle.get_stale(b"k").await.expect("get_stale"),
         Some(b"first".to_vec()),
-        "the replayed session must not re-apply the second payload"
+        "a same-payload replay must not re-apply the command"
+    );
+
+    // Same session, a DIFFERENT payload: rejected as a *session conflict*
+    // (never silently deduped into a stale result), and the key keeps the first
+    // write.
+    match handle
+        .propose_with_outcome(
+            KvStateMachine::encode_put(42, 7, b"k", b"second"),
+            42,
+            7,
+        )
+        .await
+    {
+        Err(ArachneError::SessionConflict { client_id, seq_no }) => {
+            assert_eq!(client_id, 42);
+            assert_eq!(seq_no, 7);
+        }
+        other => panic!("expected SessionConflict for a different payload, got {other:?}"),
+    }
+    assert_eq!(
+        handle.get_stale(b"k").await.expect("get_stale"),
+        Some(b"first".to_vec()),
+        "a conflicting replay must not change state"
     );
 
     task.abort();

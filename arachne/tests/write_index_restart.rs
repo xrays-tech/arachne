@@ -28,7 +28,7 @@ use arachne_kv::consensus::RaftNodeConfig;
 use arachne_kv::runtime::{Runtime, RuntimeConfig};
 use arachne_kv::state_machine::KvStateMachine;
 use arachne_kv::storage::{FsyncPolicy, WalConfig, WalOptions, WalStorage};
-use arachne_kv::{Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
+use arachne_kv::{ArachneError, Metrics, NodeId, Profile, ProfileConfig, TransportFactory};
 use arachne_kv_testsupport::InMemoryTransportFactory;
 use slog::{o, Drain, Logger};
 
@@ -211,24 +211,42 @@ async fn original_index_survives_snapshot_and_restart() {
         "the original effective index survived the disk snapshot"
     );
 
-    // Replay the same session with a different payload. Dedup must win: the
-    // reply reports the original index and the value is not re-applied.
-    let replay = handle
+    // The v4 digest survived the disk snapshot: replaying the same session with
+    // a DIFFERENT payload is rejected as a session conflict (never deduped into
+    // a stale result), and the restored value is untouched.
+    match handle
         .propose_raw_with_index(
             KvStateMachine::encode_put(CLIENT, SEQ, b"anchor", b"v2"),
             CLIENT,
             SEQ,
         )
         .await
-        .expect("replay after restart");
-    assert_eq!(
-        replay, anchor,
-        "the v3 session record survived the disk snapshot (replay reports the original index)"
-    );
+    {
+        Err(ArachneError::SessionConflict { client_id, seq_no }) => {
+            assert_eq!(client_id, CLIENT);
+            assert_eq!(seq_no, SEQ);
+        }
+        other => panic!("expected SessionConflict after restart, got {other:?}"),
+    }
     assert_eq!(
         handle.get_stale(b"anchor").await.expect("stale read"),
         Some(b"v1".to_vec()),
-        "dedup must not re-apply the replay's payload"
+        "a conflicting replay must not re-apply its payload"
+    );
+
+    // Replaying the SAME payload is deduped and reports the ORIGINAL index (the
+    // recorded digest matches, so this is a genuine idempotent retry).
+    let replay = handle
+        .propose_raw_with_index(
+            KvStateMachine::encode_put(CLIENT, SEQ, b"anchor", b"v1"),
+            CLIENT,
+            SEQ,
+        )
+        .await
+        .expect("same-payload replay after restart");
+    assert_eq!(
+        replay, anchor,
+        "the v4 session record survived the disk snapshot (replay reports the original index)"
     );
 
     // A fresh write after restart is ordered strictly after the original.

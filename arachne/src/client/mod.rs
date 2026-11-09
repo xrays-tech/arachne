@@ -114,6 +114,22 @@ pub enum ArachneError {
     /// are unaffected). (M3.)
     #[error("session table full")]
     SessionTableFull,
+    /// A `(client_id, seq_no)` session was reused with a **different payload**
+    /// than the one originally applied (a session conflict). The conflicting
+    /// command was **not applied** — this is a *known-not-applied* rejection
+    /// (safe to inspect current state and retry), not an "unknown result" like
+    /// [`ArachneError::SessionExpired`]. The original command's cached result,
+    /// the origin index, and the current KV state are all unchanged.
+    ///
+    /// This is the loud fuse for what would otherwise be silent data loss: a
+    /// replayed session whose bytes differ can never be safely deduped.
+    #[error("session conflict: client {client_id} seq {seq_no} reused with a different payload (not applied)")]
+    SessionConflict {
+        /// The offending handle's client id.
+        client_id: u64,
+        /// The reused session sequence number.
+        seq_no: u64,
+    },
     /// A configuration change is already pending (single-step ConfChange
     /// discipline, propsol §5.3). (M3.)
     #[error("configuration change pending")]
@@ -188,6 +204,10 @@ mod tests {
             ArachneError::InvalidArgument("too big".into()),
             ArachneError::SessionExpired,
             ArachneError::SessionTableFull,
+            ArachneError::SessionConflict {
+                client_id: 1,
+                seq_no: 2,
+            },
             ArachneError::ConfChangePending,
             ArachneError::LeaderRemovalRequiresTransfer,
             ArachneError::ClusterIdMismatch,
@@ -204,7 +224,7 @@ mod tests {
 
     #[test]
     fn variant_names_are_distinct() {
-        // The full variant list is present (17 variants, exhaustive: every
+        // The full variant list is present (18 variants, exhaustive: every
         // `ArachneError` variant is named here so an added variant cannot
         // slip through without this test catching it).
         let variants = vec![
@@ -215,6 +235,10 @@ mod tests {
             ArachneError::InvalidArgument(String::new()),
             ArachneError::SessionExpired,
             ArachneError::SessionTableFull,
+            ArachneError::SessionConflict {
+                client_id: 0,
+                seq_no: 0,
+            },
             ArachneError::ConfChangePending,
             ArachneError::LeaderRemovalRequiresTransfer,
             ArachneError::LearnerNotCaughtUp { behind: 0, threshold: 0 },
@@ -230,6 +254,6 @@ mod tests {
         for v in &variants {
             assert!(seen.insert(format!("{v:?}")), "duplicate variant name");
         }
-        assert_eq!(seen.len(), 17, "the full variant list must be present");
+        assert_eq!(seen.len(), 18, "the full variant list must be present");
     }
 }

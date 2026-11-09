@@ -194,6 +194,7 @@ fn stable_code(error: &ArachneError) -> &'static str {
         ArachneError::Busy => "busy",
         ArachneError::SessionExpired => "session_expired",
         ArachneError::SessionTableFull => "session_table_full",
+        ArachneError::SessionConflict { .. } => "session_conflict",
         ArachneError::ShuttingDown => "shutting_down",
         ArachneError::InvalidArgument(_) => "invalid_argument",
         ArachneError::Unsupported(_) => "unsupported",
@@ -749,7 +750,29 @@ enum PendingReply {
 impl PendingReply {
     /// Reply with the applied outcome and its effective index, matching the
     /// shape the caller asked for.
-    fn send_applied(self, outcome: ApplyOutcome, effective_index: LogIndex) {
+    fn send_applied(
+        self,
+        outcome: ApplyOutcome,
+        effective_index: LogIndex,
+        client_id: u64,
+        seq_no: u64,
+    ) {
+        // A session conflict is a known-not-applied rejection, not a value:
+        // surface it as an error on either reply shape. It is set on the
+        // outcome by the state machine when an exact `(client_id, seq_no)`
+        // session is reused with a different payload digest.
+        if matches!(&outcome, ApplyOutcome::Conflict) {
+            let error = ArachneError::SessionConflict { client_id, seq_no };
+            match self {
+                PendingReply::Outcome(ack) => {
+                    let _ = ack.send(Err(error));
+                }
+                PendingReply::Index(ack) => {
+                    let _ = ack.send(Err(error));
+                }
+            }
+            return;
+        }
         match self {
             PendingReply::Outcome(ack) => {
                 let _ = ack.send(Ok(outcome));
@@ -2692,7 +2715,12 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
                 };
                 if let Some((outcome, effective_index)) = self.received_outcomes.get(&index) {
                     if let Some(ack) = p.ack.take() {
-                        ack.send_applied(outcome.clone(), *effective_index);
+                        ack.send_applied(
+                            outcome.clone(),
+                            *effective_index,
+                            p.client_id,
+                            p.seq_no,
+                        );
                     }
                     // The index is now answered; drop the buffered outcome so
                     // `received_outcomes` stays bounded (one index, one

@@ -117,18 +117,33 @@ async fn session_bands_dedup_then_expire_then_forget() {
         Some(b"v1".to_vec())
     );
 
-    // 2. Inside the TTL: the retry is proposed and deduped. Proving that means
-    //    sending a *different value* under the same session and requiring the
-    //    original to survive — exactly-once, not last-write-wins.
+    // 2. Inside the TTL: a retry of the SAME payload is deduped — exactly-once,
+    //    not last-write-wins.
     clock.advance(TTL_MS / 2);
     handle
-        .propose_raw(write(b"v2"), CLIENT, SEQ)
+        .propose_raw(write(b"v1"), CLIENT, SEQ)
         .await
-        .expect("a retry inside the TTL is accepted (and deduped)");
+        .expect("a same-payload retry inside the TTL is deduped");
     assert_eq!(
         handle.get_stale(b"k").await.expect("read"),
         Some(b"v1".to_vec()),
-        "a retry inside the TTL must not re-apply the command"
+        "a same-payload retry inside the TTL must not re-apply the command"
+    );
+
+    // 2b. A DIFFERENT payload under the same session is a *session conflict*:
+    //     it is rejected loudly (never silently deduped into a stale result),
+    //     and the original value is left untouched.
+    match handle.propose_raw(write(b"v2"), CLIENT, SEQ).await {
+        Err(ArachneError::SessionConflict { client_id, seq_no }) => {
+            assert_eq!(client_id, CLIENT);
+            assert_eq!(seq_no, SEQ);
+        }
+        other => panic!("expected SessionConflict for a different payload, got {other:?}"),
+    }
+    assert_eq!(
+        handle.get_stale(b"k").await.expect("read"),
+        Some(b"v1".to_vec()),
+        "a conflicting retry must not change state"
     );
 
     // 3. Past the TTL, inside the grace window: `SessionExpired`, and — the part
@@ -166,7 +181,7 @@ async fn session_bands_dedup_then_expire_then_forget() {
     let mut accepted = false;
     let mut last = None;
     for _ in 0..50 {
-        match handle.propose_raw(write(b"v4"), CLIENT, SEQ).await {
+        match handle.propose_raw(write(b"v1"), CLIENT, SEQ).await {
             Ok(()) => {
                 accepted = true;
                 break;
@@ -377,13 +392,28 @@ async fn s07_a_retry_storm_has_exactly_one_effect() {
                 .await
         }));
     }
+    // Every attempt carries the *same* session and a *different* value. Exactly
+    // one entry applies (the first in log order); every other attempt hits the
+    // same session with a different payload → a session conflict (never a
+    // silent stale-dedup). So the storm settles on exactly one effect.
     let mut ok = 0usize;
+    let mut conflicts = 0usize;
+    let mut timeouts = 0usize;
+    let mut unexpected = Vec::new();
     for attempt in attempts {
-        if matches!(attempt.await.expect("task"), Ok(())) {
-            ok += 1;
+        match attempt.await.expect("task") {
+            Ok(()) => ok += 1,
+            Err(ArachneError::SessionConflict { .. }) => conflicts += 1,
+            Err(ArachneError::Timeout) => timeouts += 1,
+            Err(e) => unexpected.push(e),
         }
     }
-    assert_eq!(ok, STORM, "every attempt inside the TTL is accepted and deduped");
+    assert!(
+        ok <= 1,
+        "at most one attempt's proposer observes the single applied outcome"
+    );
+    assert_eq!(ok + conflicts + timeouts, STORM);
+    assert!(unexpected.is_empty(), "unexpected storm errors: {unexpected:?}");
 
     // Whichever attempt landed first, the state is one of them and it is stable:
     // further retries must not move it.
@@ -397,14 +427,19 @@ async fn s07_a_retry_storm_has_exactly_one_effect() {
         "the value must come from the storm, got {settled:?}"
     );
     for _ in 0..10 {
-        handle
+        // A different-payload retry of the settled session is a conflict, and it
+        // must not move the value.
+        match handle
             .propose_raw(
                 KvStateMachine::encode_put(CLIENT, SEQ, b"storm", b"late"),
                 CLIENT,
                 SEQ,
             )
             .await
-            .expect("a retry is accepted");
+        {
+            Err(ArachneError::SessionConflict { .. }) => {}
+            other => panic!("a different-payload retry must conflict, got {other:?}"),
+        }
     }
     assert_eq!(
         handle.get_stale(b"storm").await.expect("read"),

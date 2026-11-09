@@ -266,6 +266,13 @@ impl Handle {
                 current_index,
                 current_value,
             }),
+            // Defensive: the runtime's write-back pipeline already maps a
+            // conflict to `Err(ArachneError::SessionConflict)`, so this arm is
+            // normally unreachable — the match must still stay exhaustive.
+            ApplyOutcome::Conflict => Err(ArachneError::SessionConflict {
+                client_id,
+                seq_no,
+            }),
         }
     }
 
@@ -758,6 +765,13 @@ impl Handle {
             "busy" => ArachneError::Busy,
             "session_expired" => ArachneError::SessionExpired,
             "session_table_full" => ArachneError::SessionTableFull,
+            // Lossy on the wire: only the stable code crosses the wire, so the
+            // `(client_id, seq_no)` diagnostics are not carried; they are 0
+            // here and are preserved only for in-process replies.
+            "session_conflict" => ArachneError::SessionConflict {
+                client_id: 0,
+                seq_no: 0,
+            },
             "shutting_down" => ArachneError::ShuttingDown,
             // A peer rejected a command kind it does not understand. This is
             // terminal (the command was not executed), so it must not be

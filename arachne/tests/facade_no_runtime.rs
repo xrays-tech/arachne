@@ -16,6 +16,14 @@
 //!
 //! This is a **synchronous** `#[test]` on purpose: `#[tokio::test]` would give
 //! the test a running runtime and hide the regression.
+
+/// Serializes the tests in this binary that touch the **process-global**
+/// `INSTANCE` facade slot. Without it, the two tests run in parallel and race:
+/// whichever `Arachne::start`-ing test gets the slot first makes the other see
+/// `AlreadyInitialized` instead of its expected verdict (a pre-existing flake,
+/// unrelated to the feature under test — it just needs isolation).
+static FACADE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod peerless {
     use std::env;
     use std::fs;
@@ -39,6 +47,9 @@ mod peerless {
     /// **no** tokio runtime at all. This is a plain sync `#[test]`.
     #[test]
     fn single_node_start_without_tokio_context() {
+        let _serial = crate::FACADE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir();
 
         // The whole point of this test: a fully synchronous assembly on a
@@ -75,6 +86,9 @@ mod no_tonic {
 
     #[tokio::test]
     async fn multi_node_requires_tonic_feature() {
+        let _serial = crate::FACADE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let n1 = NodeId::new("n1");
         let n2 = NodeId::new("n2");
         let cfg = ClusterConfig::member(

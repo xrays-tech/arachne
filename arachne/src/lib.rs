@@ -44,6 +44,7 @@
 //! | proposal / read queue full | `Busy` | `Busy` | `Busy` (read queue only) |
 //! | bounded wait timeout | `Timeout` (result unknown) | `Timeout` | succeeds |
 //! | session table full / expired | `SessionTableFull` / `SessionExpired` | n/a (reads use no session) | n/a |
+//! | session reused with a **different payload** | `SessionConflict` (known-not-applied: no mutation) | n/a | n/a |
 //! | shutting down | `ShuttingDown` | `ShuttingDown` | `ShuttingDown` |
 //! | fatal storage error | `Unrecoverable` | `Unrecoverable` | `Unrecoverable` |
 //!

@@ -60,7 +60,7 @@ use crate::storage::crc32c::crc32c;
 /// binary. The break is the session snapshot format + upgrade policy, so an old
 /// data directory fails at open with a format mismatch. See
 /// `dev-docs/runbook-format-v4-upgrade.md`.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Magic number identifying a valid META file.
 const META_MAGIC: u32 = 0x41_52_41_4D; // "ARAM" in ASCII
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn format_version_is_four() {
-        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(FORMAT_VERSION, 5);
     }
 
     #[test]
