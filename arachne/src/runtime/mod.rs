@@ -1426,6 +1426,27 @@ impl<T: Transport + Clone + ForwardTransport, Tr: TransportRx> Runtime<T, Tr> {
             )));
         }
 
+        // Visibility for the crash-window repair: `WalStorage::open` raised a
+        // persisted hard-state `commit` that lagged the snapshot index. The
+        // snapshot is authoritative, so this is safe — but an operator should
+        // know the directory needed it (and that the old binary had written an
+        // inconsistent pair). The storage is still local here, before it moves
+        // into `RaftNode`.
+        let storage_stats = storage.stats();
+        if storage_stats.hard_state_repairs() > 0 {
+            let repaired_commit = storage
+                .initial_state()
+                .map(|state| state.hard_state.commit)
+                .unwrap_or(snapshot_index);
+            slog::warn!(
+                logger,
+                "repaired a stale raft hard-state commit from the durable snapshot";
+                "snapshot_index" => snapshot_index,
+                "repaired_commit" => repaired_commit,
+                "repairs" => storage_stats.hard_state_repairs(),
+            );
+        }
+
         // Node-scoped, restart-safe session identity. Hashing the node id
         // avoids cross-host PID collisions (the Hydra regression). The starting
         // sequence must exceed every session this client id already committed:

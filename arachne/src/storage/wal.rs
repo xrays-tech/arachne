@@ -197,6 +197,26 @@ pub struct StorageStats {
     /// (`fallocate(2)` + `FALLOC_FL_KEEP_SIZE`) had to be skipped because the
     /// call failed (EOPNOTSUPP/ENOSYS/EINVAL/ENOSPC/…). Off-Linux this stays 0.
     pub segment_prealloc_skips: u64,
+    /// Number of hard-state `commit` values raised to the loaded snapshot index
+    /// by [`WalStorage::open`].
+    ///
+    /// Private so adding it does not break downstream code that constructs or
+    /// exhaustively matches this struct in a patch release; read it through
+    /// [`StorageStats::hard_state_repairs`].
+    hard_state_repairs: u64,
+}
+
+impl StorageStats {
+    /// Number of hard-state commits raised to the loaded snapshot index by
+    /// [`WalStorage::open`].
+    ///
+    /// This repairs the crash window where a snapshot was durable but META /
+    /// the hard state had not yet caught up (`commit < snapshot_index`). The
+    /// snapshot is authoritative, so the repair is safe; the counter exists so
+    /// operators can see that a data directory needed it.
+    pub fn hard_state_repairs(&self) -> u64 {
+        self.hard_state_repairs
+    }
 }
 
 /// The outcome of a [`WalStorage::force_recovery`] rewrite (propsol §6.1).
@@ -472,6 +492,13 @@ impl WalStorage {
                 ),
             });
         }
+        // The lower bound is the crash-window repair: a snapshot may be durable
+        // while META / the persisted hard state still name the previous commit
+        // (0.7.0 wrote the snapshot file and META before advancing the hard
+        // state). The snapshot is authoritative, so raise `commit` to it below
+        // and persist the repaired hard state before returning. A genuinely
+        // corrupt store is still caught by the upper-bound check above.
+        let needs_commit_repair = hard_state.commit < compacted_to;
 
         // Open the active segment: the highest-numbered existing segment,
         // or create wal-1.log if no segments exist.
@@ -509,7 +536,7 @@ impl WalStorage {
             _ => (compacted_to, ConfState::default()),
         };
 
-        Ok(Self {
+        let mut storage = Self {
             data_dir: dir.to_path_buf(),
             segment,
             segment_first_index: active_first_index,
@@ -532,7 +559,22 @@ impl WalStorage {
             offloaded: None,
             pending_flush_waker: None,
             _lock: lock_file,
-        })
+        };
+
+        if needs_commit_repair {
+            // Persist the repaired pair before returning: a second restart must
+            // see `commit >= snapshot_index` without repairing again. If this
+            // fsync fails, fail the open rather than hand raft an invalid pair.
+            let repaired = HardState {
+                term: storage.hard_state.term,
+                vote: storage.hard_state.vote.clone(),
+                commit: compacted_to,
+            };
+            storage.set_hard_state(&repaired)?;
+            storage.stats.hard_state_repairs += 1;
+        }
+
+        Ok(storage)
     }
 
     /// Return the current fsync/recovery counters.
@@ -1475,8 +1517,18 @@ impl Storage for WalStorage {
         } else {
             self.conf_state.clone()
         };
+        // Defense in depth: raft derives `raft_log.committed` from the snapshot
+        // index (`first_index - 1`), so `hs.commit` must never be below it.
+        // `open` repairs and persists the crash window, and `save_snapshot`
+        // keeps the pair consistent, but clamp here too so a future path that
+        // misses one cannot hand raft an invalid range. The upper-bound check
+        // in `open` still rejects a genuinely corrupt store.
+        let mut hard_state = self.hard_state.clone();
+        if let Some(snapshot) = &self.snapshot {
+            hard_state.commit = hard_state.commit.max(snapshot.meta.index);
+        }
         Ok(RaftState {
-            hard_state: self.hard_state.clone(),
+            hard_state,
             conf_state,
         })
     }
@@ -1722,9 +1774,22 @@ impl Storage for WalStorage {
     /// Persist `snapshot` and point META at it.
     ///
     /// File protocol: write `*.snap.tmp` → fsync → rename to `*.snap` → fsync
-    /// the data dir; then rewrite META (its own atomic protocol) with the new
-    /// snapshot pointer. The directory scan at open is the authority, so a
-    /// crash between the two steps leaves a usable, if unadvertised, snapshot.
+    /// the data dir → rewrite META (its own atomic protocol) with the new
+    /// snapshot pointer → raise+fsync the hard state's `commit` to at least the
+    /// snapshot index.
+    ///
+    /// The load path is **META-bounded**: `open` loads exactly the snapshot META
+    /// names and ignores any unadvertised `*.snap` file. META must therefore be
+    /// written before the hard-state bump, not after it: on the
+    /// `install_snapshot` (follower catch-up) path the local WAL may only reach
+    /// M < N, so a crash between "commit := N" and META would leave META naming
+    /// the old snapshot O, entries O+1..M, and a persisted commit N > M — an
+    /// unrecoverable upper-bound violation. With META-first, the only crash
+    /// window is META=N + commit=N-1, which `open` repairs (the snapshot is
+    /// authoritative and `last_entry_index = max(entries.last(), compacted_to)`
+    /// covers N even when the log is empty). A crash before META leaves the new
+    /// file unadvertised and ignored. The leader path remains correct because
+    /// `applied <= committed <= durable`; no extra quorum round is added.
     fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), StorageError> {
         if let Some(existing) = &self.snapshot
             && existing.meta.index >= snapshot.meta.index
@@ -1761,6 +1826,13 @@ impl Storage for WalStorage {
         fs::rename(&tmp_path, &final_path).map_err(StorageError::Io)?;
         fsync_dir(&self.data_dir).map_err(StorageError::Io)?;
 
+        // Ordering (MF-1): META is the authority for which snapshot is loaded,
+        // so point it at the durable file *before* advancing the hard state.
+        // The reverse order is unsafe on the follower `install_snapshot` path:
+        // the local WAL may only reach M < N, and a crash after commit := N
+        // but before META would leave META naming an older snapshot with
+        // `commit > last_entry` (bricked at open). The crash window left here
+        // (META=N, commit=N-1) is repaired by `open`.
         let mut meta = self.meta.clone();
         meta.snapshot_index = snapshot.meta.index;
         meta.snapshot_term = snapshot.meta.term;
@@ -1768,8 +1840,21 @@ impl Storage for WalStorage {
             detail: format!("failed to persist the snapshot pointer in META: {e}"),
         })?;
         self.meta = meta;
-        self.snapshot = Some(snapshot.clone());
 
+        // Now make `hs.commit >= snapshot.index`: raft derives its committed
+        // index from the snapshot, and `load_state` rejects a hard-state commit
+        // below it. `set_hard_state` fsyncs the active segment; `compact` does
+        // not depend on `hard_state.commit`, so the extra record is safe.
+        if self.hard_state.commit < snapshot.meta.index {
+            let raised = HardState {
+                term: self.hard_state.term,
+                vote: self.hard_state.vote.clone(),
+                commit: snapshot.meta.index,
+            };
+            self.set_hard_state(&raised)?;
+        }
+
+        self.snapshot = Some(snapshot.clone());
         self.prune_snapshots()?;
         Ok(())
     }
@@ -2691,6 +2776,154 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `save_snapshot` must never leave `hard_state.commit < snapshot.index`:
+    /// raft derives its committed index from the snapshot, and its `load_state`
+    /// rejects a hard-state commit below that range. A snapshot at N therefore
+    /// raises a persisted commit of N-1 to N.
+    #[test]
+    fn save_snapshot_raises_hard_state_commit_to_snapshot_index() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+                make_entry(4, 1, b"d"),
+                make_entry(5, 1, b"e"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+        storage
+            .set_hard_state(&HardState {
+                term: 4,
+                vote: Some(2),
+                commit: 2,
+            })
+            .unwrap();
+
+        storage
+            .save_snapshot(&make_snapshot(3, 1, b"state@3"))
+            .unwrap();
+
+        let state = storage.initial_state().unwrap();
+        assert!(
+            state.hard_state.commit >= 3,
+            "snapshot index 3 must raise commit (got {})",
+            state.hard_state.commit
+        );
+        assert_eq!(state.hard_state.term, 4, "term is preserved");
+        assert_eq!(state.hard_state.vote, Some(2), "vote is preserved");
+
+        // The raised commit is persisted, not just in memory.
+        drop(storage);
+        let reopened = WalStorage::open(&dir, opts).unwrap();
+        let state = reopened.initial_state().unwrap();
+        assert!(state.hard_state.commit >= 3);
+        assert_eq!(
+            reopened.stats().hard_state_repairs(),
+            0,
+            "save_snapshot already wrote a consistent pair"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Simulate the 0.7.0 crash window: snapshot durable, then the persisted
+    /// hard state still names the previous commit. `open` must repair it, log a
+    /// counter, and persist the repair so a second restart is clean.
+    #[test]
+    fn open_repairs_commit_below_snapshot_index() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+            storage
+                .append(&[
+                    make_entry(1, 1, b"a"),
+                    make_entry(2, 1, b"b"),
+                    make_entry(3, 1, b"c"),
+                    make_entry(4, 1, b"d"),
+                    make_entry(5, 1, b"e"),
+                ])
+                .unwrap();
+            storage.sync_entries().unwrap();
+            storage
+                .save_snapshot(&make_snapshot(3, 1, b"state@3"))
+                .unwrap();
+            // Rewind the persisted hard state to the pre-fix crash window.
+            storage
+                .set_hard_state(&HardState {
+                    term: 2,
+                    vote: Some(1),
+                    commit: 2,
+                })
+                .unwrap();
+        }
+
+        let reopened = WalStorage::open(&dir, opts.clone()).unwrap();
+        assert_eq!(
+            reopened.stats().hard_state_repairs(),
+            1,
+            "the first reopen repairs the lagging commit"
+        );
+        let state = reopened.initial_state().unwrap();
+        assert!(
+            state.hard_state.commit >= 3,
+            "the repaired commit covers the snapshot index (got {})",
+            state.hard_state.commit
+        );
+        assert_eq!(state.hard_state.term, 2);
+        assert_eq!(state.hard_state.vote, Some(1));
+        drop(reopened);
+
+        // The repair was persisted: a second restart must not need it again.
+        let reopened = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(
+            reopened.stats().hard_state_repairs(),
+            0,
+            "the repaired hard state survived the restart"
+        );
+        assert!(reopened.initial_state().unwrap().hard_state.commit >= 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Defense in depth: even if a future path leaves the in-memory pair
+    /// inconsistent, `initial_state` never hands raft `commit < snapshot.index`.
+    #[test]
+    fn initial_state_never_reports_commit_below_snapshot_index() {
+        let dir = temp_dir();
+        let opts = test_opts();
+        let mut storage = WalStorage::open(&dir, opts).unwrap();
+        storage
+            .append(&[
+                make_entry(1, 1, b"a"),
+                make_entry(2, 1, b"b"),
+                make_entry(3, 1, b"c"),
+            ])
+            .unwrap();
+        storage.sync_entries().unwrap();
+        storage
+            .save_snapshot(&make_snapshot(3, 1, b"state@3"))
+            .unwrap();
+        // Rewind the live hard state *after* the snapshot (not via `open`).
+        storage
+            .set_hard_state(&HardState {
+                term: 1,
+                vote: None,
+                commit: 1,
+            })
+            .unwrap();
+
+        let state = storage.initial_state().unwrap();
+        assert!(
+            state.hard_state.commit >= 3,
+            "initial_state clamps commit to the snapshot index (got {})",
+            state.hard_state.commit
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn compact_drops_entries_and_answers_term_at_the_snapshot_index() {
         let dir = temp_dir();
@@ -2991,6 +3224,72 @@ mod tests {
         let replayed = storage.entries(9, 10, None).unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].data, b"d");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// MF-3: the follower catch-up crash window. A lagging follower's WAL only
+    /// reaches M < N when it installs a snapshot at N. With the fixed order,
+    /// META names N *before* the hard-state bump; a crash before that bump is
+    /// durable leaves `META=N, commit=N-1`, which `open` repairs. The old
+    /// bump-before-META order could leave `META=O, commit=N > last_entry=M`,
+    /// an unrecoverable upper-bound violation.
+    #[test]
+    fn install_snapshot_crash_window_between_meta_and_hard_state_is_repaired() {
+        const N: LogIndex = 8;
+        let dir = temp_dir();
+        let opts = test_opts();
+        {
+            let mut storage = WalStorage::open(&dir, opts.clone()).unwrap();
+            // Local log is far behind the incoming snapshot (M = 3 < N = 8).
+            storage
+                .append(&[
+                    make_entry(1, 1, b"a"),
+                    make_entry(2, 1, b"b"),
+                    make_entry(3, 1, b"c"),
+                ])
+                .unwrap();
+            storage.sync_entries().unwrap();
+
+            storage
+                .install_snapshot(&make_snapshot(N, 3, b"state@8"))
+                .unwrap();
+            // META now names N and the bump made commit >= N.
+            assert_eq!(storage.snapshot().unwrap().unwrap().meta.index, N);
+            assert_eq!(storage.first_index().unwrap(), N + 1);
+            let state = storage.initial_state().unwrap();
+            assert!(state.hard_state.commit >= N);
+
+            // Simulate a crash after META became durable but before the
+            // hard-state bump was: rewind only the persisted commit.
+            storage
+                .set_hard_state(&HardState {
+                    term: state.hard_state.term,
+                    vote: state.hard_state.vote,
+                    commit: N - 1,
+                })
+                .unwrap();
+        }
+
+        let reopened = WalStorage::open(&dir, opts.clone()).unwrap();
+        assert_eq!(
+            reopened.stats().hard_state_repairs(),
+            1,
+            "open must repair the META=N / commit=N-1 window"
+        );
+        let state = reopened.initial_state().unwrap();
+        assert!(
+            state.hard_state.commit >= N,
+            "the repaired commit covers the installed snapshot index (got {})",
+            state.hard_state.commit
+        );
+        assert_eq!(reopened.snapshot().unwrap().unwrap().meta.index, N);
+        assert_eq!(reopened.first_index().unwrap(), N + 1);
+        drop(reopened);
+
+        // The repair was persisted: a second restart needs no repair.
+        let reopened = WalStorage::open(&dir, opts).unwrap();
+        assert_eq!(reopened.stats().hard_state_repairs(), 0);
+        assert!(reopened.initial_state().unwrap().hard_state.commit >= N);
         let _ = fs::remove_dir_all(&dir);
     }
 

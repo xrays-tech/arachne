@@ -6,6 +6,42 @@
 
 ---
 
+## 0.7.1 — 2026-11-09
+
+主题：**P0 重启修复——快照 index 不得领先于持久化 hard state commit**。
+
+### 修复
+
+- `WalStorage::save_snapshot` 顺序：快照文件 durable（write/fsync/rename/dir-fsync）
+  → **写 META** → 将持久化 hard state `commit` 提升到快照 index 并 fsync → 更新内存
+  snapshot。消除 `snapshot_index > hard_state.commit` 的持久化状态；唯一剩余崩溃窗口
+  `META=N / commit=N-1` 由 `open` 修复。
+- `WalStorage::open`：`commit < snapshot_index` 时提升到 snapshot index 并持久化；
+  新增 `StorageStats::hard_state_repairs()` 观测，`Runtime::new` 打 warn；
+  `initial_state` 再做防御性 clamp；`commit > last_entry` 仍是硬错误。
+- `start_multi_node`：装配线程 `catch_unwind`，panic → typed
+  `ArachneError::Unrecoverable`；`RecvError` 不再 panic 调用线程。装配后的
+  actor 线程 panic 仍是既有未隔离行为。
+- 回归：3 节点 snapshot→kill→commit N-1→restart→converge；
+  `install_snapshot` META=N/commit=N-1 崩溃窗口；save_snapshot bump / open repair /
+  initial_state clamp；m2 snapshot/trailing keep；facade。
+
+### 兼容性
+
+- **无格式/线协议变更**；0.7.0 数据目录可直接启动 0.7.1，首次打开会修复滞后
+  commit（`hard_state_repairs` + warn）。
+- `StorageStats` 新增 `hard_state_repairs()` getter（additive；0.7.0 无该字段，无 break）。
+- 0.7.1 为 patch。
+
+### 已知限制
+
+- 快照体积：KV 快照序列化整个 live map；Hydra 未删除旧的 content-addressed shard，
+  504 MiB vs ~75 MiB live 属应用层保留，不是编码 bug。follow-up：Hydra GC（逐 key
+  `delete`）或 Arachne range-delete API。快照越大，fsync/rename 崩溃窗口越宽，
+  建议优先做 Hydra GC。
+
+---
+
 ## 0.6.0 — 2026-11-09
 
 主题：**session payload 冲突显式化**。

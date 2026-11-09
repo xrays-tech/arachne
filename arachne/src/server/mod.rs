@@ -735,7 +735,19 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
         // The async closure must NOT capture `arc` (it is already borrowed by
         // `arc.block_on` as &self); instead it returns `(thread, handle,
         // factory)` and we wrap `arc` into the sent tuple below.
-        let result = arc.block_on(async move {
+        //
+        // A panic anywhere in **assembly** used to drop the channel, and the
+        // caller turned that into a main-thread `RecvError` panic. Catch it
+        // here and send a typed error instead: one bad node must not take down
+        // the embedding process. This is defense in depth; the storage-level
+        // hard-state repair prevents the known `hs.commit` panic upstream.
+        //
+        // Scope: this contains panics while the node is being assembled. A
+        // panic later inside the dedicated actor thread is **not** contained by
+        // this catch (pre-existing behavior; the actor runs on its own OS
+        // thread after assembly returns).
+        let assembly = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arc.block_on(async move {
             // Bind *only* this node's listener and start serving it. The self
             // node id is guaranteed to be in the factory's address map (the
             // map holds every `initial_cluster` member, and this node is one
@@ -794,18 +806,36 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
                 .map_err(|e| format!("facade init: cannot spawn actor thread: {e}"))?;
 
             Ok((thread, handle, factory))
-        });
+            })
+        }));
+
+        // A panic in assembly is a typed failure, not a dropped channel.
+        let result = match assembly {
+            Ok(result) => result,
+            Err(payload) => Err(format!(
+                "multi-node assembly panicked: {}",
+                panic_payload_message(payload)
+            )),
+        };
 
         // Wrap the (now-untouched) `arc` around the result before sending.
         // The channel's type is Result<(RuntimeThread, Handle, Arc<Runtime>,
         // TonicTransportFactory), String>, so the order must match exactly.
-        tx.send(
+        // The main thread is waiting; a send failure must not panic this thread.
+        let _ = tx.send(
             result.map(|(thread, handle, factory)| (thread, handle, arc, factory)),
-        )
-        .expect("send multi-node assembly result");
+        );
     });
 
-    match ch.1.recv().expect("multi-node assembly thread exited without sending a result") {
+    let result = match ch.1.recv() {
+        Ok(result) => result,
+        Err(e) => {
+            return Err(ArachneError::Unrecoverable(format!(
+                "multi-node assembly thread exited without sending a result: {e}"
+            )));
+        }
+    };
+    match result {
         Ok((thread, handle, rt_arc, factory)) => {
             Ok(FacadeState {
                 handle,
@@ -814,6 +844,18 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
             })
         }
         Err(err) => Err(ArachneError::Unrecoverable(err)),
+    }
+}
+
+/// Extract a human-readable message from a caught panic payload.
+#[cfg(feature = "transport-tonic")]
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
