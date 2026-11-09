@@ -49,7 +49,7 @@ use arachne_kv_seam::TransportFactory;
 
 use crate::consensus::RaftNodeConfig;
 use crate::metrics::Metrics;
-use crate::profile::Profile;
+use crate::profile::{Profile, ProfileConfig};
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeThread};
 use crate::storage::{WalOptions, WalStorage};
 
@@ -422,7 +422,25 @@ pub struct ClusterConfig {
     /// every other member carries the address under which it listens.
     pub addresses: HashMap<NodeId, SocketAddr>,
     /// Propsol §7 tuning preset.
+    ///
+    /// This remains the default/provenance: when [`Self::profile_config`] is
+    /// `None`, the assembly converts this preset with [`Profile::config`].
     pub profile: Profile,
+    /// Optional full [`ProfileConfig`] **override**.
+    ///
+    /// * `None` (the default) = use [`Self::profile`]'s preset.
+    /// * `Some(pc)` = **wholesale replacement** of the preset — no per-field
+    ///   merge with `profile`, which only remains as provenance. The override
+    ///   takes precedence over `profile`.
+    ///
+    /// The effective profile is validated by [`Self::effective_profile`]
+    /// before the WAL is opened, so an invalid override fails with
+    /// [`ArachneError::InvalidConfig`] and opens nothing.
+    ///
+    /// Note: [`Self::wal`] is currently **ignored** by the facade assembly
+    /// (the WAL options are derived from the effective profile). New storage
+    /// knobs therefore flow through `profile_config` / `profile`, not `wal`.
+    pub profile_config: Option<ProfileConfig>,
     /// WAL storage configuration.
     pub wal: WalConfig,
 }
@@ -447,6 +465,7 @@ impl ClusterConfig {
             initial_cluster: Vec::new(),
             addresses: HashMap::new(),
             profile: Profile::Lan,
+            profile_config: None,
             wal,
         }
     }
@@ -470,6 +489,7 @@ impl ClusterConfig {
             initial_cluster,
             addresses,
             profile: Profile::Lan,
+            profile_config: None,
             wal: WalConfig::default(),
         }
     }
@@ -494,6 +514,69 @@ impl ClusterConfig {
                 .unwrap_or(1)
         }
     }
+
+    /// The unvalidated effective profile: the explicit override when present,
+    /// otherwise the [`Self::profile`] preset.
+    fn profile_config_or_preset(&self) -> ProfileConfig {
+        self.profile_config
+            .clone()
+            .unwrap_or_else(|| self.profile.config())
+    }
+
+    /// The effective profile, validated at the assembly boundary.
+    ///
+    /// Returns the explicit [`Self::profile_config`] override, or the
+    /// [`Self::profile`] preset when no override is set, after checking it
+    /// with [`ProfileConfig::validate`]. An invalid override is reported as
+    /// [`ArachneError::InvalidConfig`] **before** anything is opened.
+    pub fn effective_profile(&self) -> Result<ProfileConfig, ArachneError> {
+        let profile = self.profile_config_or_preset();
+        profile
+            .validate()
+            .map_err(|e| ArachneError::InvalidConfig(format!("invalid profile config: {e}")))?;
+        Ok(profile)
+    }
+
+    /// Set a **wholesale** profile override, replacing [`Self::profile`]'s
+    /// preset for assembly.
+    ///
+    /// This does not merge with the preset: every field comes from
+    /// `profile_config`. [`Self::profile`] remains as the default/provenance
+    /// value used when no override is set. Validation happens later in
+    /// [`Self::effective_profile`].
+    pub fn with_profile_config(mut self, profile_config: ProfileConfig) -> Self {
+        self.profile_config = Some(profile_config);
+        self
+    }
+
+    /// Convenience override for [`ProfileConfig::snapshot_threshold_bytes`].
+    ///
+    /// Derives from the **current effective** profile (the existing override,
+    /// or the [`Self::profile`] preset when none is set), changes only this
+    /// field, and stores the result as the override — so it composes with the
+    /// other convenience builders in either order.
+    ///
+    /// `0` disables the local snapshot trigger (the existing semantics).
+    pub fn with_snapshot_threshold_bytes(mut self, bytes: u64) -> Self {
+        let mut profile = self.profile_config_or_preset();
+        profile.snapshot_threshold_bytes = bytes;
+        self.profile_config = Some(profile);
+        self
+    }
+
+    /// Convenience override for [`ProfileConfig::wal_trailing_keep_bytes`].
+    ///
+    /// Derives from the **current effective** profile and changes only this
+    /// field, so chained builders retain each other's changes. `0` is the
+    /// escape hatch that compacts everything covered by the snapshot (the
+    /// existing semantics); a non-zero value retains that many WAL bytes
+    /// behind the compaction watermark.
+    pub fn with_wal_trailing_keep_bytes(mut self, bytes: u64) -> Self {
+        let mut profile = self.profile_config_or_preset();
+        profile.wal_trailing_keep_bytes = bytes;
+        self.profile_config = Some(profile);
+        self
+    }
 }
 
 impl ClusterConfig {
@@ -508,19 +591,33 @@ impl ClusterConfig {
     }
 }
 
-/// Assemble one **peerless** (singleton) node: configure it, open the WAL,
-/// build the node and runtime, and spawn the actor thread. The caller holds the
-/// facade lock across this fully-synchronous sequence (no awaits, so no
-/// deadlock).
-fn assemble_peerless(config: &ClusterConfig) -> Result<FacadeState, ArachneError> {
-    let profile = config.profile.config();
-    let raft = RaftNodeConfig::from_profile(&profile);
-
-    let created_at_millis = ClusterConfig::now_millis();
-
+/// Open the WAL for one facade assembly path with the effective profile's
+/// storage knobs.
+///
+/// Builds [`WalOptions`] from the profile (`fsync_policy`,
+/// `wal_segment_bytes`), opens the storage, then applies
+/// `wal_trailing_keep_bytes`.
+///
+/// **Ordering invariant:** [`WalStorage::open`] is recovery-only and never
+/// compacts; compaction is runtime-driven after a snapshot. Setting the
+/// trailing keep here, after open but before [`Runtime::new`], is therefore
+/// equivalent to setting it at open time (no compaction can run in between).
+/// This is why there is no `WalOptions.trailing_keep_bytes` /
+/// `open_with_trailing_keep`.
+///
+/// `context` prefixes the error so each assembly path keeps its existing
+/// diagnostics (`"facade init: ..."` / `"assemble_cluster: ..."`).
+fn open_storage(
+    context: &str,
+    cluster_id: &str,
+    node_id: &str,
+    data_dir: &Path,
+    profile: &ProfileConfig,
+    created_at_millis: u64,
+) -> Result<WalStorage, ArachneError> {
     let opts = WalOptions {
-        cluster_id: config.cluster_id.clone(),
-        node_id: config.node_id.to_string(),
+        cluster_id: cluster_id.to_string(),
+        node_id: node_id.to_string(),
         config: WalConfig {
             fsync_policy: profile.fsync_policy,
             segment_bytes: profile.wal_segment_bytes,
@@ -528,8 +625,32 @@ fn assemble_peerless(config: &ClusterConfig) -> Result<FacadeState, ArachneError
         created_at_millis,
         fsync_observer: None,
     };
-    let storage = WalStorage::open(&config.data_dir, opts)
-        .map_err(|e| ArachneError::Unrecoverable(format!("facade init: cannot open WAL: {e}")))?;
+    let mut storage = WalStorage::open(data_dir, opts)
+        .map_err(|e| ArachneError::Unrecoverable(format!("{context}: cannot open WAL: {e}")))?;
+    // See the ordering invariant above: no compaction can run between open and
+    // runtime assembly, so applying the trailing keep here is safe.
+    storage.set_trailing_keep_bytes(profile.wal_trailing_keep_bytes);
+    Ok(storage)
+}
+
+/// Assemble one **peerless** (singleton) node: configure it, open the WAL,
+/// build the node and runtime, and spawn the actor thread. The caller holds the
+/// facade lock across this fully-synchronous sequence (no awaits, so no
+/// deadlock).
+fn assemble_peerless(config: &ClusterConfig) -> Result<FacadeState, ArachneError> {
+    let profile = config.effective_profile()?;
+    let raft = RaftNodeConfig::from_profile(&profile);
+
+    let created_at_millis = ClusterConfig::now_millis();
+
+    let storage = open_storage(
+        "facade init",
+        &config.cluster_id,
+        &config.node_id.to_string(),
+        &config.data_dir,
+        &profile,
+        created_at_millis,
+    )?;
 
     let config = RuntimeConfig {
         self_raft_id: config.raft_id(),
@@ -571,7 +692,7 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
     // `config` is owned here so the values the spawned thread needs escape to
     // a 'static'-sized closure (the thread outlives `start`). The &ClusterConfig
     // reference captured earlier would otherwise escape the function.
-    let profile = config.profile.config();
+    let profile = config.effective_profile()?;
     let node_id = config.node_id;
     let listen = config.listen;
     let addresses = config.addresses;
@@ -590,19 +711,14 @@ fn start_multi_node(config: ClusterConfig) -> Result<FacadeState, ArachneError> 
     factory.snapshot_provider(snapshot_source::DataDirSnapshots::new(data_dir.clone()));
     factory.snapshot_rate_bps(profile.snapshot_transfer_rate_bps);
 
-    let opts = WalOptions {
-        cluster_id,
-        node_id: node_id_str,
-        config: WalConfig {
-            fsync_policy: profile.fsync_policy,
-            segment_bytes: profile.wal_segment_bytes,
-        },
-        created_at_millis: ClusterConfig::now_millis(),
-        fsync_observer: None,
-    };
-    let mut wal = WalStorage::open(&data_dir, opts)
-        .map_err(|e| ArachneError::Unrecoverable(format!("facade init: cannot open WAL: {e}")))?;
-    wal.set_trailing_keep_bytes(profile.wal_trailing_keep_bytes);
+    let mut wal = open_storage(
+        "facade init",
+        &cluster_id,
+        &node_id_str,
+        &data_dir,
+        &profile,
+        ClusterConfig::now_millis(),
+    )?;
     wal.enable_offloaded_durability()
         .map_err(|e| ArachneError::Unrecoverable(format!("facade init: cannot enable offloaded durability: {e}")))?;
 
@@ -728,7 +844,7 @@ pub struct AssembledClusterNode {
 pub async fn assemble_cluster(
     config: ClusterConfig,
 ) -> Result<AssembledClusterNode, ArachneError> {
-    let profile = config.profile.config();
+    let profile = config.effective_profile()?;
     let cluster_id = config.cluster_id;
     let node_id = config.node_id;
     let listen = config.listen;
@@ -747,19 +863,14 @@ pub async fn assemble_cluster(
         .snapshot_provider(snapshot_source::DataDirSnapshots::new(data_dir.clone()));
     factory.snapshot_rate_bps(profile.snapshot_transfer_rate_bps);
 
-    let opts = WalOptions {
-        cluster_id,
-        node_id: node_id.to_string(),
-        config: WalConfig {
-            fsync_policy: profile.fsync_policy,
-            segment_bytes: profile.wal_segment_bytes,
-        },
-        created_at_millis: ClusterConfig::now_millis(),
-        fsync_observer: None,
-    };
-    let mut wal = WalStorage::open(&data_dir, opts)
-        .map_err(|e| ArachneError::Unrecoverable(format!("assemble_cluster: cannot open WAL: {e}")))?;
-    wal.set_trailing_keep_bytes(profile.wal_trailing_keep_bytes);
+    let mut wal = open_storage(
+        "assemble_cluster",
+        &cluster_id,
+        &node_id.to_string(),
+        &data_dir,
+        &profile,
+        ClusterConfig::now_millis(),
+    )?;
     wal.enable_offloaded_durability()
         .map_err(|e| ArachneError::Unrecoverable(format!("assemble_cluster: cannot enable offloaded durability: {e}")))?;
 
@@ -889,5 +1000,147 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(cfg3.raft_id(), 3, "third member is raft id 3");
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "arachne-server-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn effective_profile_none_uses_lan_preset() {
+        let cfg = ClusterConfig::single_node(1, "/tmp/arachne-eff-none", WalConfig::default());
+        let effective = cfg.effective_profile().expect("preset must validate");
+        let preset = Profile::Lan.config();
+        assert_eq!(
+            effective.snapshot_threshold_bytes,
+            preset.snapshot_threshold_bytes,
+            "None must use the profile preset"
+        );
+        assert_eq!(
+            effective.wal_trailing_keep_bytes,
+            preset.wal_trailing_keep_bytes,
+            "None must use the profile preset"
+        );
+    }
+
+    #[test]
+    fn effective_profile_some_overrides_preset() {
+        let mut override_profile = Profile::Lan.config();
+        override_profile.snapshot_threshold_bytes = 256 * 1024 * 1024;
+        override_profile.wal_trailing_keep_bytes = 256 * 1024 * 1024;
+
+        let cfg = ClusterConfig::single_node(1, "/tmp/arachne-eff-some", WalConfig::default())
+            .with_profile_config(override_profile);
+
+        let effective = cfg.effective_profile().expect("override must validate");
+        assert_eq!(effective.snapshot_threshold_bytes, 256 * 1024 * 1024);
+        assert_eq!(effective.wal_trailing_keep_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn effective_profile_invalid_override_is_invalid_config() {
+        let mut override_profile = Profile::Lan.config();
+        // `rpc_timeout_ms` must be strictly below `election_timeout_ms`.
+        override_profile.rpc_timeout_ms = override_profile.election_timeout_ms;
+
+        let cfg = ClusterConfig::single_node(1, "/tmp/arachne-eff-invalid", WalConfig::default())
+            .with_profile_config(override_profile);
+
+        match cfg.effective_profile() {
+            Err(ArachneError::InvalidConfig(message)) => {
+                assert!(
+                    message.contains("invalid profile config"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convenience_builders_compose_from_effective_profile() {
+        let cfg = ClusterConfig::single_node(1, "/tmp/arachne-builders", WalConfig::default())
+            .with_snapshot_threshold_bytes(1)
+            .with_wal_trailing_keep_bytes(2);
+
+        let effective = cfg.effective_profile().expect("builder profile must validate");
+        assert_eq!(effective.snapshot_threshold_bytes, 1);
+        assert_eq!(
+            effective.wal_trailing_keep_bytes, 2,
+            "the second builder must retain the first builder's change"
+        );
+    }
+
+    #[test]
+    fn with_profile_config_is_wholesale_then_builders_compose() {
+        let wan = Profile::Wan.config();
+        let cfg = ClusterConfig::single_node(1, "/tmp/arachne-wholesale", WalConfig::default())
+            .with_profile_config(wan.clone())
+            .with_snapshot_threshold_bytes(123);
+
+        let effective = cfg.effective_profile().expect("override must validate");
+        assert_eq!(
+            effective.heartbeat_interval_ms, wan.heartbeat_interval_ms,
+            "with_profile_config must replace the preset wholesale, not merge it"
+        );
+        assert_eq!(
+            effective.election_timeout_ms, wan.election_timeout_ms,
+            "with_profile_config must replace the preset wholesale, not merge it"
+        );
+        assert_eq!(
+            effective.snapshot_threshold_bytes, 123,
+            "a later convenience builder must derive from the current effective profile"
+        );
+        assert_eq!(effective.wal_trailing_keep_bytes, wan.wal_trailing_keep_bytes);
+    }
+
+    #[test]
+    fn open_storage_applies_trailing_keep() {
+        let mut profile = Profile::Lan.config();
+        profile.wal_trailing_keep_bytes = 12_345;
+        let dir = unique_temp_dir("open-keep");
+        {
+            let storage = open_storage("test", "c", "n1", &dir, &profile, 1)
+                .expect("open storage");
+            assert_eq!(storage.trailing_keep_bytes(), 12_345);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_storage_zero_trailing_keep_is_escape_hatch() {
+        let mut profile = Profile::Lan.config();
+        profile.wal_trailing_keep_bytes = 0;
+        let dir = unique_temp_dir("open-keep-zero");
+        {
+            let storage = open_storage("test", "c", "n1", &dir, &profile, 1)
+                .expect("open storage");
+            assert_eq!(
+                storage.trailing_keep_bytes(),
+                0,
+                "0 must mean compact everything"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_storage_peerless_default_keeps_lan_64_mib() {
+        // Regression for the old peerless path, which left the trailing keep at
+        // its 0 default; the shared helper must apply the profile's value.
+        let profile = Profile::Lan.config();
+        let dir = unique_temp_dir("open-keep-default");
+        {
+            let storage = open_storage("test", "c", "n1", &dir, &profile, 1)
+                .expect("open storage");
+            assert_eq!(storage.trailing_keep_bytes(), 64 * 1024 * 1024);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

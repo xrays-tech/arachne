@@ -6,6 +6,62 @@
 
 ---
 
+## 0.6.0 — 2026-11-09
+
+主题：**session payload 冲突显式化**。
+
+### `SessionConflict`（payload hash）
+
+- 复用完全相同的 `(client_id, seq_no)` 但携带**不同 payload** 时，不再静默 dedup
+  成旧结果，而是返回 `ArachneError::SessionConflict { client_id, seq_no }`。冲突命令
+  **未执行**（known-not-applied）：原 session 的缓存结果、origin index 与 KV 状态均不变；
+  同 payload 重试仍是真正的 dedup（exactly-once 保持）。
+- state machine 的 `SessionRecord` 增加整条命令的 FNV-64 digest；冲突检查是纯确定性函数，
+  返回 `ApplyOutcome::Conflict` 且不修改状态；applied 仍推进（index 连续）。
+- **破坏性格式升级**：`KV_SNAPSHOT_VERSION` 3 → 4（digest 必须随快照恢复），storage
+  `FORMAT_VERSION` 4 → 5；旧目录 fail-stop，步骤见
+  `dev-docs/runbook-format-v5-upgrade.md`。
+
+---
+
+## 0.7.0 — 2026-11-09
+
+主题：**`ClusterConfig` profile / snapshot-threshold 覆盖**。
+
+### `ClusterConfig` profile / snapshot-threshold 覆盖
+
+- `ClusterConfig` 新增 `pub profile_config: Option<ProfileConfig>`：`None` = 使用
+  `profile` preset；`Some` = **整体替换** preset（不与 `profile` 逐字段合并），优先级
+  高于 `profile`。
+- 新增 builder：`with_profile_config`、`with_snapshot_threshold_bytes`、
+  `with_wal_trailing_keep_bytes`。convenience builder 从**当前 effective** profile
+  派生，链式组合互不覆盖。
+- `effective_profile()` 在 WAL open 前校验；无效配置返回
+  `ArachneError::InvalidConfig`，数据目录不会创建/打开。`ArachneError` 现共 **19**
+  个变体（0.6.0 的 `SessionConflict` + 本版新增的 `InvalidConfig`）。
+- **peerless 行为变化**：单节点路径现在也会应用 `wal_trailing_keep_bytes`（此前为
+  0 = compact everything；现默认跟随 profile，Lan 为 64 MiB）。
+  `with_wal_trailing_keep_bytes(0)` 恢复 compact-everything。peerless 无 follower，
+  保留日志没有功能用途，只是入口一致性。
+- `arachne-node` TOML 新增可选顶层字段 `snapshot_threshold_bytes` /
+  `wal_trailing_keep_bytes`；`to_cluster_config` 把验证后的 `ProfileConfig`
+  整体传给 facade。
+- **调参 trade-off**：snapshot 触发按“上次 snapshot 以来 apply 的字节数”，不是物理
+  WAL 大小；磁盘上界**近似**为 `threshold + trailing_keep + snapshot_size`（记录开销 +
+  每 term 约 1 个 segment 的取整 slack 使物理 WAL 更大）。`snapshot_threshold_bytes
+  == 0` 禁用本地 snapshot 触发；`wal_trailing_keep_bytes == 0` compact 掉 snapshot
+  覆盖的全部日志。threshold 高于稳态写入量时 snapshot 可能永不触发（WAL 由总写入量
+  而非 threshold 约束）。
+- Hydra 150k 配置树（~74.5 MiB）：64 MiB 默认触发点下 drill 失败（leader flips 11、
+  publish errors 16、follower 传播 >180 s）；256 MiB 覆盖后通过（flips 5、errors 5、
+  传播 7 s）。注意：单次 snapshot 仍会阻塞 apply，本项只降低 snapshot **频率**，
+  不消除单次阻塞。
+- **迁移**：`ClusterConfig` 结构体字面量需补 `profile_config: None`（仓内仅 1 处，
+  下游字面量同理）；使用 `single_node` / `member` / builder 的调用方无需改动。
+  Hydra 本地实验的 `profile_override` 字段名对应最终的 `profile_config`。
+
+---
+
 ## 0.5.1 — 2026-11-06
 
 主题：**P0 修复——写入 index 回退 / 静默丢写（跨主机 `client_id` 冲突）**。

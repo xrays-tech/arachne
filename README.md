@@ -54,6 +54,17 @@ returns `AlreadyInitialized`; static reads before `start` (or after
 `NotInitialized`. For multi-node clusters or membership control, use `Runtime`
 / `Handle` directly.
 
+`ClusterConfig` also exposes `profile_config: Option<ProfileConfig>`: `None`
+uses the `profile` preset, while `Some` replaces it **wholesale** (no per-field
+merge). The `with_profile_config` / `with_snapshot_threshold_bytes` /
+`with_wal_trailing_keep_bytes` builders derive from the current effective
+profile and compose. Overrides are validated before the WAL opens; an invalid
+combination returns `InvalidConfig` without creating the data directory. The
+peerless path now applies the profile's WAL trailing keep (Lan: 64 MiB;
+`with_wal_trailing_keep_bytes(0)` restores compact-everything). The reference
+node accepts optional `snapshot_threshold_bytes` / `wal_trailing_keep_bytes`
+TOML keys.
+
 `Handle` is the full client surface: `put` / `get` / `get_stale` / `get_stale_range` / `get_stale_with_index` / `delete`, `multi_get` (batched exact-key reads sharing one applied index), index-returning writes (`put_with_index` / `multi_put_with_index` / `delete_with_index`), `wait_applied` (local applied-index wait), `watch` (prefix snapshot + events), membership operations (`add_learner`, `promote_learner`, `remove_member`, `transfer_leader`, `membership`), raw proposal hooks, and `leader_hint` for redirects. The four membership operations take a **`RaftId`** (`u64`) — the member's **1-based ordinal in `initial_cluster`** (the i-th member ⇒ raft id = i+1) — whereas `leader_hint()` / the `NotLeader` hint return the leader's **address identity** (`NodeId` string + `SocketAddr`), *not* a `RaftId`; to derive the hinted leader's `RaftId` look up its `NodeId`'s position in `initial_cluster` (1-based). The complete assembly — including how to wire the tonic transport and an HTTP front-end — is the `arachne-node` binary's `node.rs`, which serves as the reference integration.
 
 ## Consistency semantics
@@ -72,7 +83,7 @@ The operation set is deliberately small, and the consistency story is stated up 
 
 Arachne is a **CP** system: at most one leader at a time, writes and linearizable reads require a quorum, and when the quorum is lost every linearizable operation fails (`QuorumUnavailable`) rather than degrading to read-mostly or splitting the brain. `get_stale` keeps working in that state, with the staleness caveat above.
 
-Errors are explicit and typed: `NotLeader` (with a leader hint when known), `QuorumUnavailable`, `Busy` (proposal/read queue full), `Timeout` (bounded wait elapsed, result unknown), `SessionTableFull` / `SessionExpired` for the write-session machinery, `Unsupported` (an old peer cannot serve `multi_get`/indexed writes; terminal, not executed), `ShuttingDown`, and `Unrecoverable` for fatal storage errors.
+Errors are explicit and typed: `NotLeader` (with a leader hint when known), `QuorumUnavailable`, `Busy` (proposal/read queue full), `Timeout` (bounded wait elapsed, result unknown), `SessionTableFull` / `SessionExpired` / `SessionConflict` (a reused `(client_id, seq_no)` with a different payload; the conflicting write is known-not-applied) for the write-session machinery, `InvalidConfig` (an invalid profile override before assembly), `Unsupported` (an old peer cannot serve `multi_get`/indexed writes; terminal, not executed), `ShuttingDown`, and `Unrecoverable` for fatal storage errors.
 
 ## Persistence
 

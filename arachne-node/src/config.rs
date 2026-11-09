@@ -109,6 +109,12 @@ struct RawConfig {
     election_timeout_ms: Option<u64>,
     #[serde(default)]
     rpc_timeout_ms: Option<u64>,
+    /// WAL bytes that trigger a snapshot + compaction; absent = profile value.
+    #[serde(default)]
+    snapshot_threshold_bytes: Option<u64>,
+    /// WAL bytes retained after compaction; absent = profile value.
+    #[serde(default)]
+    wal_trailing_keep_bytes: Option<u64>,
 }
 
 fn default_profile() -> String {
@@ -287,6 +293,12 @@ pub fn parse_config(toml_text: &str) -> Result<Config, ConfigError> {
     if let Some(v) = raw.rpc_timeout_ms {
         profile_config.rpc_timeout_ms = v;
     }
+    if let Some(v) = raw.snapshot_threshold_bytes {
+        profile_config.snapshot_threshold_bytes = v;
+    }
+    if let Some(v) = raw.wal_trailing_keep_bytes {
+        profile_config.wal_trailing_keep_bytes = v;
+    }
     profile_config
         .validate()
         .map_err(|e| ConfigError::ProfileInvalid { message: e.to_string() })?;
@@ -323,6 +335,10 @@ impl Config {
             initial_cluster: self.initial_cluster.clone(),
             addresses: self.addresses.clone(),
             profile: self.profile,
+            // The validated node config already folds the preset plus any TOML
+            // overrides; pass it wholesale so the facade applies exactly the
+            // same profile the node binary would have used.
+            profile_config: Some(self.profile_config.clone()),
             wal: WalConfig {
                 fsync_policy: self.profile_config.fsync_policy,
                 segment_bytes: self.profile_config.wal_segment_bytes,
@@ -632,6 +648,92 @@ mod tests {
         assert!(
             err.to_string().contains("rpc_timeout_ms"),
             "error: {err}"
+        );
+    }
+
+    #[test]
+    fn honors_snapshot_threshold_and_trailing_keep_overrides() {
+        let toml = format!(
+            "snapshot_threshold_bytes = 268435456\nwal_trailing_keep_bytes = 268435456\n{VALID}"
+        );
+        let config = parse_config(&toml).expect("config with snapshot overrides");
+        assert_eq!(
+            config.profile_config.snapshot_threshold_bytes,
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            config.profile_config.wal_trailing_keep_bytes,
+            256 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn absent_snapshot_knobs_keep_profile_defaults() {
+        let config = parse_config(VALID).expect("valid config");
+        let profile = Profile::Lan.config();
+        assert_eq!(
+            config.profile_config.snapshot_threshold_bytes, profile.snapshot_threshold_bytes,
+            "an absent snapshot_threshold_bytes must keep the profile value"
+        );
+        assert_eq!(
+            config.profile_config.wal_trailing_keep_bytes, profile.wal_trailing_keep_bytes,
+            "an absent wal_trailing_keep_bytes must keep the profile value"
+        );
+    }
+
+    #[test]
+    fn to_cluster_config_passes_the_validated_profile_override() {
+        let toml =
+            format!("snapshot_threshold_bytes = 1024\nwal_trailing_keep_bytes = 2048\n{VALID}");
+        let config = parse_config(&toml).expect("config");
+        let cluster = config.to_cluster_config();
+        let override_profile = cluster
+            .profile_config
+            .clone()
+            .expect("to_cluster_config must pass Some(profile_config)");
+        assert_eq!(override_profile.snapshot_threshold_bytes, 1024);
+        assert_eq!(override_profile.wal_trailing_keep_bytes, 2048);
+        assert_eq!(
+            override_profile.heartbeat_interval_ms,
+            config.profile_config.heartbeat_interval_ms
+        );
+    }
+
+    #[test]
+    fn to_cluster_config_effective_profile_matches_node_profile_config() {
+        let toml = format!(
+            "profile = \"wan\"\n\
+             heartbeat_interval_ms = 550\n\
+             election_timeout_ms = 3000\n\
+             rpc_timeout_ms = 1000\n\
+             snapshot_threshold_bytes = 123456\n\
+             wal_trailing_keep_bytes = 654321\n\
+             {VALID}"
+        );
+        let config = parse_config(&toml).expect("config");
+        let effective = config
+            .to_cluster_config()
+            .effective_profile()
+            .expect("the node config is already validated");
+        assert_eq!(
+            effective.heartbeat_interval_ms,
+            config.profile_config.heartbeat_interval_ms
+        );
+        assert_eq!(
+            effective.election_timeout_ms,
+            config.profile_config.election_timeout_ms
+        );
+        assert_eq!(
+            effective.rpc_timeout_ms,
+            config.profile_config.rpc_timeout_ms
+        );
+        assert_eq!(
+            effective.snapshot_threshold_bytes,
+            config.profile_config.snapshot_threshold_bytes
+        );
+        assert_eq!(
+            effective.wal_trailing_keep_bytes,
+            config.profile_config.wal_trailing_keep_bytes
         );
     }
 }

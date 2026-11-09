@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Arachne API Reference —— server::Arachne 全方法、client::Handle 全客户端 API、WalConfig、ArachneError 17 变体、HTTP 接口表。">
+<meta name="description" content="Arachne API Reference —— server::Arachne 全方法、client::Handle 全客户端 API、WalConfig、ArachneError 19 变体、HTTP 接口表。">
 <title>API Reference · Arachne 文档</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -93,6 +93,50 @@
         <div class="desc">
           <p>唯一入口，按 <code>ClusterConfig</code> 引导节点：<code>single_node</code> 为 N=1 集群（peerless，自选主、免仲裁轮），<code>member</code> 加入真实集群（tonic 传输，专用多线程 runtime）。<code>data_dir</code> 按需创建；WAL 数据目录锁被获取并持有到节点生命周期结束。第二次调用返回 <code>ArachneError::AlreadyInitialized</code>。</p>
         </div>
+      </div>
+
+      <h3>ClusterConfig —— profile / snapshot 覆盖</h3>
+      <p>
+        <code>ClusterConfig</code> 由 <code>single_node</code> / <code>member</code> 构造。
+        除既有的 <code>profile: Profile</code> preset 外，新增
+        <code>profile_config: Option&lt;ProfileConfig&gt;</code> 与三个 builder，用于在
+        WAL open / runtime assembly 之前覆盖存储调参。
+      </p>
+      <div class="table-wrap">
+        <table class="doc-table">
+          <thead>
+            <tr><th>字段 / 方法</th><th>语义</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>profile: Profile</code></td><td>preset（<code>Lan</code> / <code>Wan</code>）；<code>profile_config: None</code> 时使用其 <code>config()</code>，仍是默认值与来源。</td></tr>
+            <tr><td><code>profile_config: Option&lt;ProfileConfig&gt;</code></td><td><code>None</code> = <code>profile.config()</code>；<code>Some</code> = <strong>整体替换</strong> preset（不逐字段合并），优先级高于 <code>profile</code>。装配前由 <code>effective_profile()</code> 校验。</td></tr>
+            <tr><td><code>with_profile_config(pc) -&gt; Self</code></td><td>设置完整覆盖（整体替换 preset）。</td></tr>
+            <tr><td><code>with_snapshot_threshold_bytes(bytes) -&gt; Self</code></td><td>从<strong>当前 effective</strong> profile 派生，仅覆盖 <code>snapshot_threshold_bytes</code>；与下一个 builder 链式组合时不会互相覆盖。</td></tr>
+            <tr><td><code>with_wal_trailing_keep_bytes(bytes) -&gt; Self</code></td><td>从当前 effective profile 派生，仅覆盖 <code>wal_trailing_keep_bytes</code>；<code>0</code> = compact everything（escape hatch）。</td></tr>
+            <tr><td><code>effective_profile() -&gt; Result&lt;ProfileConfig, ArachneError&gt;</code></td><td>返回校验后的 effective profile；无效组合返回 <code>ArachneError::InvalidConfig</code>，且在 WAL open 前失败（数据目录不会创建/打开）。</td></tr>
+            <tr><td><code>wal: WalConfig</code></td><td>facade 装配当前从 effective profile 派生 WAL 选项；该字段<strong>不参与</strong>装配。新 knob 请走 <code>profile_config</code> / <code>profile</code>。</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <span class="callout-ico">i</span>
+        <p>
+          <strong>peerless 行为变化</strong>：单节点装配现在也应用 profile 的
+          <code>wal_trailing_keep_bytes</code>（此前为 0 = compact everything；Lan 默认
+          64 MiB）。<code>with_wal_trailing_keep_bytes(0)</code> 恢复旧行为。
+        </p>
+        <p>
+          <strong>调参 trade-off</strong>：<code>snapshot_threshold_bytes</code> 按“上次
+          snapshot 以来 apply 的字节数”触发，不是物理 WAL 大小；磁盘上界<strong>近似</strong>为
+          <code>threshold + trailing_keep + snapshot_size</code>（记录开销 + segment 取整使物理
+          WAL 更大）。<code>threshold == 0</code> 禁用本地 snapshot 触发；
+          <code>keep == 0</code> compact 掉 snapshot 覆盖的全部日志；threshold 高于稳态写入量时
+          snapshot 可能永不触发。
+        </p>
+        <p>
+          <strong>arachne-node TOML</strong>（可选，缺省 = profile）：
+          <code>snapshot_threshold_bytes</code> / <code>wal_trailing_keep_bytes</code>。
+        </p>
       </div>
 
       <div class="api-method">
@@ -442,7 +486,7 @@
         </table>
       </div>
 
-      <h2>5. ArachneError —— 全部 17 个变体</h2>
+      <h2>5. ArachneError —— 全部 19 个变体</h2>
       <p>
         每个客户端操作（<code>put</code> / <code>delete</code> / <code>get</code> /
         <code>get_stale</code> / <code>multi_get</code> / <code>wait_applied</code>）都解析为一个值或
@@ -459,8 +503,10 @@
             <tr><td><code>Timeout</code></td><td>有界等待耗尽，<strong>结果未知</strong>（写可能已落）。</td><td><span class="nowrap">503</span></td></tr>
             <tr><td><code>Busy</code></td><td>背压：提议队列或读等待队列满。非致命，稍后重试。</td><td><span class="nowrap">503</span></td></tr>
             <tr><td><code>InvalidArgument(String)</code></td><td>键/值超限等。提议<strong>前</strong>拒绝，绝不进日志。</td><td><span class="nowrap">400 Bad Request</span></td></tr>
+            <tr><td><code>InvalidConfig(String)</code></td><td>配置在装配前校验失败（如无效的 <code>ProfileConfig</code> 覆盖）。WAL 未打开、未执行任何操作；修正配置后重启。</td><td><span class="nowrap">—</span></td></tr>
             <tr><td><code>SessionExpired</code></td><td>会话过期或缓存结果被逐出，结果未知。</td><td><span class="nowrap">—</span></td></tr>
             <tr><td><code>SessionTableFull</code></td><td>会话表满，拒绝新会话（已有会话不受影响）。</td><td><span class="nowrap">—</span></td></tr>
+            <tr><td><code>SessionConflict { client_id: u64, seq_no: u64 }</code></td><td>同一 <code>(client_id, seq_no)</code> 被<strong>不同 payload</strong> 复用。冲突命令<strong>未执行</strong>（known-not-applied），原 session 缓存结果、origin index 与 KV 状态均不变；同 payload 重试仍是正常 dedup。</td><td><span class="nowrap">500</span></td></tr>
             <tr><td><code>ConfChangePending</code></td><td>已有成员变更在飞行（单步 ConfChange 纪律）。重试<strong>同一请求</strong>即可。</td><td><span class="nowrap">409 Conflict</span></td></tr>
             <tr><td><code>LeaderRemovalRequiresTransfer</code></td><td>移除当前 leader 需要先移交领导权，未获授权。</td><td><span class="nowrap">409 Conflict</span></td></tr>
             <tr><td><code>LearnerNotCaughtUp { behind: u64, threshold: u64 }</code></td><td>learner 落后超过 <code>threshold</code> 或从未应答，提升被拒（防不完整日志入仲裁）。</td><td><span class="nowrap">412 Precondition Failed</span></td></tr>

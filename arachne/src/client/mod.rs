@@ -105,6 +105,12 @@ pub enum ArachneError {
     /// propose, so it never enters the log (fail-stop discipline, propsol §3.2).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// A configuration value failed validation before assembly (e.g. an
+    /// invalid [`crate::ProfileConfig`] override on
+    /// [`ClusterConfig`](crate::server::ClusterConfig)). Nothing is opened or
+    /// proposed: the caller must fix the config and start again.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
     /// The session expired or its cached result was evicted. Result **unknown**
     /// (propsol N2); the client must accept possible duplicate execution.
     /// (Session dedup is M3; M1 does not yet surface this from the happy path.)
@@ -202,6 +208,7 @@ mod tests {
             ArachneError::Timeout,
             ArachneError::Busy,
             ArachneError::InvalidArgument("too big".into()),
+            ArachneError::InvalidConfig("bad profile".into()),
             ArachneError::SessionExpired,
             ArachneError::SessionTableFull,
             ArachneError::SessionConflict {
@@ -224,7 +231,7 @@ mod tests {
 
     #[test]
     fn variant_names_are_distinct() {
-        // The full variant list is present (18 variants, exhaustive: every
+        // The full variant list is present (19 variants, exhaustive: every
         // `ArachneError` variant is named here so an added variant cannot
         // slip through without this test catching it).
         let variants = vec![
@@ -233,6 +240,7 @@ mod tests {
             ArachneError::Timeout,
             ArachneError::Busy,
             ArachneError::InvalidArgument(String::new()),
+            ArachneError::InvalidConfig(String::new()),
             ArachneError::SessionExpired,
             ArachneError::SessionTableFull,
             ArachneError::SessionConflict {
@@ -254,6 +262,6 @@ mod tests {
         for v in &variants {
             assert!(seen.insert(format!("{v:?}")), "duplicate variant name");
         }
-        assert_eq!(seen.len(), 18, "the full variant list must be present");
+        assert_eq!(seen.len(), 19, "the full variant list must be present");
     }
 }
